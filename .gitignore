@@ -7,3 +7,4 @@ coverage/
 services/*/generated/
 *.log
 scripts/.e2e-state.json
+.claude/

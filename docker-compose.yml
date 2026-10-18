@@ -112,7 +112,9 @@ services:
       timeout: 5s
       retries: 10
 
-  # Single-node Kafka in KRaft mode (no ZooKeeper)
+  # Single-node Kafka in KRaft mode (no ZooKeeper), SASL-authenticated with per-service ACLs:
+  # every service has its own SCRAM-SHA-512 user and may only produce/consume its own topics.
+  # The PLAIN "admin" principal exists only inside the broker and the kafka-init job.
   kafka:
     image: apache/kafka:3.8.1@sha256:22c4bea38875408e8f9fe52aca8e3a6ee67f9aa0090db59af99a2f6647558db5
     restart: always
@@ -123,10 +125,22 @@ services:
       KAFKA_PROCESS_ROLES: broker,controller
       KAFKA_LISTENERS: INTERNAL://:29092,EXTERNAL://:9092,CONTROLLER://:9093
       KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:SASL_PLAINTEXT,EXTERNAL:SASL_PLAINTEXT,CONTROLLER:SASL_PLAINTEXT
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
       KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_SASL_ENABLED_MECHANISMS: PLAIN,SCRAM-SHA-512
+      KAFKA_SASL_MECHANISM_INTER_BROKER_PROTOCOL: PLAIN
+      KAFKA_SASL_MECHANISM_CONTROLLER_PROTOCOL: PLAIN
+      KAFKA_LISTENER_NAME_CONTROLLER_SASL_ENABLED_MECHANISMS: PLAIN
+      KAFKA_LISTENER_NAME_CONTROLLER_PLAIN_SASL_JAAS_CONFIG: org.apache.kafka.common.security.plain.PlainLoginModule required username="admin" password="${KAFKA_ADMIN_PASSWORD:?set KAFKA_ADMIN_PASSWORD in .env}" user_admin="${KAFKA_ADMIN_PASSWORD}";
+      KAFKA_LISTENER_NAME_INTERNAL_PLAIN_SASL_JAAS_CONFIG: org.apache.kafka.common.security.plain.PlainLoginModule required username="admin" password="${KAFKA_ADMIN_PASSWORD}" user_admin="${KAFKA_ADMIN_PASSWORD}";
+      KAFKA_LISTENER_NAME_INTERNAL_SCRAM___SHA___512_SASL_JAAS_CONFIG: org.apache.kafka.common.security.scram.ScramLoginModule required;
+      KAFKA_LISTENER_NAME_EXTERNAL_PLAIN_SASL_JAAS_CONFIG: org.apache.kafka.common.security.plain.PlainLoginModule required user_admin="${KAFKA_ADMIN_PASSWORD}";
+      KAFKA_LISTENER_NAME_EXTERNAL_SCRAM___SHA___512_SASL_JAAS_CONFIG: org.apache.kafka.common.security.scram.ScramLoginModule required;
+      KAFKA_AUTHORIZER_CLASS_NAME: org.apache.kafka.metadata.authorizer.StandardAuthorizer
+      KAFKA_SUPER_USERS: User:admin
+      KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND: "false"
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
@@ -134,31 +148,34 @@ services:
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false" # topics are created explicitly by kafka-init
       KAFKA_LOG_RETENTION_HOURS: 168
       KAFKA_HEAP_OPTS: -Xms384m -Xmx512m
+      # Deliberately not KAFKA_-prefixed: the image would copy it into server.properties
+      BROKER_ADMIN_PASSWORD: ${KAFKA_ADMIN_PASSWORD}
     volumes:
       - kafka_data:/var/lib/kafka/data
     healthcheck:
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      test: ["CMD-SHELL", "printf 'security.protocol=SASL_PLAINTEXT\\nsasl.mechanism=PLAIN\\nsasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username=\"admin\" password=\"%s\";\\n' \"$$BROKER_ADMIN_PASSWORD\" > /tmp/admin.properties && /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:29092 --command-config /tmp/admin.properties >/dev/null 2>&1"]
       interval: 10s
-      timeout: 10s
+      timeout: 15s
       retries: 15
-      start_period: 20s
+      start_period: 30s
 
+  # Creates topics, per-service SCRAM users and least-privilege ACLs (idempotent)
   kafka-init:
     image: apache/kafka:3.8.1@sha256:22c4bea38875408e8f9fe52aca8e3a6ee67f9aa0090db59af99a2f6647558db5
     networks: [backend]
     depends_on:
       kafka:
         condition: service_healthy
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        set -e
-        for t in user.registered.v1 account.created.v1 account.status.changed.v1 transaction.completed.v1 fraud.alert.created.v1; do
-          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists --topic $$t --partitions 3 --replication-factor 1
-          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists --topic $$t.dlq --partitions 1 --replication-factor 1
-        done
-        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists --topic notifications.dlq --partitions 1 --replication-factor 1
-        echo "Kafka topics ready"
+    environment:
+      KAFKA_ADMIN_PASSWORD: ${KAFKA_ADMIN_PASSWORD}
+      KAFKA_AUTH_PASSWORD: ${KAFKA_AUTH_PASSWORD:?set KAFKA_AUTH_PASSWORD in .env}
+      KAFKA_ACCOUNT_PASSWORD: ${KAFKA_ACCOUNT_PASSWORD:?set KAFKA_ACCOUNT_PASSWORD in .env}
+      KAFKA_LEDGER_PASSWORD: ${KAFKA_LEDGER_PASSWORD:?set KAFKA_LEDGER_PASSWORD in .env}
+      KAFKA_FRAUD_PASSWORD: ${KAFKA_FRAUD_PASSWORD:?set KAFKA_FRAUD_PASSWORD in .env}
+      KAFKA_NOTIFICATION_PASSWORD: ${KAFKA_NOTIFICATION_PASSWORD:?set KAFKA_NOTIFICATION_PASSWORD in .env}
+    volumes:
+      - ./docker/kafka/init.sh:/init.sh:ro
+    entrypoint: ["/bin/bash", "/init.sh"]
 
   # One-shot job: applies every service's migrations as that schema's OWNER role
   migrate:
@@ -220,6 +237,8 @@ services:
     build: { context: ., args: { SERVICE: auth-service } }
     environment:
       <<: *service-env
+      KAFKA_USERNAME: auth-svc
+      KAFKA_PASSWORD: ${KAFKA_AUTH_PASSWORD}
       PORT: 8001
       KAFKA_CLIENT_ID: auth-service
       DATABASE_URL: postgresql://auth_app:${AUTH_DB_APP_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=auth_schema
@@ -252,6 +271,8 @@ services:
     build: { context: ., args: { SERVICE: account-service } }
     environment:
       <<: *service-env
+      KAFKA_USERNAME: account-svc
+      KAFKA_PASSWORD: ${KAFKA_ACCOUNT_PASSWORD}
       PORT: 8003
       KAFKA_CLIENT_ID: account-service
       LEDGER_SERVICE_URL: http://transaction-service:8004
@@ -265,6 +286,8 @@ services:
     build: { context: ., args: { SERVICE: transaction-service } }
     environment:
       <<: *service-env
+      KAFKA_USERNAME: ledger-svc
+      KAFKA_PASSWORD: ${KAFKA_LEDGER_PASSWORD}
       PORT: 8004
       KAFKA_CLIENT_ID: transaction-service
       DATABASE_URL: postgresql://ledger_app:${LEDGER_DB_APP_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=ledger_schema
@@ -275,6 +298,8 @@ services:
     build: { context: ., args: { SERVICE: notification-service } }
     environment:
       <<: *service-env
+      KAFKA_USERNAME: notification-svc
+      KAFKA_PASSWORD: ${KAFKA_NOTIFICATION_PASSWORD}
       PORT: 8005
       KAFKA_CLIENT_ID: notification-service
       DATABASE_URL: postgresql://notification_app:${NOTIFICATION_DB_APP_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=notification_schema
@@ -293,6 +318,8 @@ services:
     build: { context: ., args: { SERVICE: fraud-service } }
     environment:
       <<: *service-env
+      KAFKA_USERNAME: fraud-svc
+      KAFKA_PASSWORD: ${KAFKA_FRAUD_PASSWORD}
       PORT: 8006
       KAFKA_CLIENT_ID: fraud-service
       DATABASE_URL: postgresql://fraud_app:${FRAUD_DB_APP_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=fraud_schema

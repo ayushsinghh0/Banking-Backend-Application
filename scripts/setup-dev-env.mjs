@@ -53,6 +53,12 @@ JWT_ACCESS_EXPIRATION=15m
 JWT_REFRESH_EXPIRATION_DAYS=7
 MFA_ENCRYPTION_KEY=${secret()}
 LEDGER_INTERNAL_TOKEN=${token()}
+KAFKA_ADMIN_PASSWORD=${secret()}
+KAFKA_AUTH_PASSWORD=${secret()}
+KAFKA_ACCOUNT_PASSWORD=${secret()}
+KAFKA_LEDGER_PASSWORD=${secret()}
+KAFKA_FRAUD_PASSWORD=${secret()}
+KAFKA_NOTIFICATION_PASSWORD=${secret()}
 CUSTOMER_INTERNAL_TOKEN=${token()}
 APP_BASE_URL=http://localhost:3000
 CORS_ORIGINS=http://localhost:3000
@@ -100,13 +106,15 @@ SMTP_REQUIRE_TLS=false
 MAIL_FROM="${env.MAIL_FROM}"
 `;
 
+const kafka = (user, pw) => `KAFKA_USERNAME=${user}\nKAFKA_PASSWORD=${env[pw]}\n`;
+
 const services = {
-  'auth-service': `PORT=8001\nKAFKA_CLIENT_ID=auth-service\n${db('AUTH', 'auth_schema')}\nJWT_SIGNING_KEY="${env.JWT_SIGNING_KEY}"\nJWT_SIGNING_KEY_ID=${env.JWT_SIGNING_KEY_ID}\nJWT_ACCESS_EXPIRATION=${env.JWT_ACCESS_EXPIRATION}\nJWT_REFRESH_EXPIRATION_DAYS=${env.JWT_REFRESH_EXPIRATION_DAYS}\nMFA_ENCRYPTION_KEY=${env.MFA_ENCRYPTION_KEY}\nAPP_BASE_URL=${env.APP_BASE_URL}\n${smtp}# Relaxed per-IP limits so the local e2e suite can be re-run (production defaults: 30 / 10 per 15 min)\nAUTH_RATE_LIMIT_MAX=500\nAUTH_RECOVERY_RATE_LIMIT_MAX=500\n`,
+  'auth-service': `PORT=8001\nKAFKA_CLIENT_ID=auth-service\n${kafka('auth-svc', 'KAFKA_AUTH_PASSWORD')}${db('AUTH', 'auth_schema')}\nJWT_SIGNING_KEY="${env.JWT_SIGNING_KEY}"\nJWT_SIGNING_KEY_ID=${env.JWT_SIGNING_KEY_ID}\nJWT_ACCESS_EXPIRATION=${env.JWT_ACCESS_EXPIRATION}\nJWT_REFRESH_EXPIRATION_DAYS=${env.JWT_REFRESH_EXPIRATION_DAYS}\nMFA_ENCRYPTION_KEY=${env.MFA_ENCRYPTION_KEY}\nAPP_BASE_URL=${env.APP_BASE_URL}\n${smtp}# Relaxed per-IP limits so the local e2e suite can be re-run (production defaults: 30 / 10 per 15 min)\nAUTH_RATE_LIMIT_MAX=500\nAUTH_RECOVERY_RATE_LIMIT_MAX=500\n`,
   'customer-service': `PORT=8002\n${db('CUSTOMER', 'customer_schema')}\nCUSTOMER_INTERNAL_TOKEN="${env.CUSTOMER_INTERNAL_TOKEN}"\n`,
-  'account-service': `PORT=8003\nKAFKA_CLIENT_ID=account-service\nLEDGER_SERVICE_URL=http://localhost:8004\nCUSTOMER_SERVICE_URL=http://localhost:8002\n${db('ACCOUNT', 'account_schema')}\nLEDGER_INTERNAL_TOKEN="${env.LEDGER_INTERNAL_TOKEN}"\nCUSTOMER_INTERNAL_TOKEN="${env.CUSTOMER_INTERNAL_TOKEN}"\n`,
-  'transaction-service': `PORT=8004\nKAFKA_CLIENT_ID=transaction-service\n${db('LEDGER', 'ledger_schema')}\nLEDGER_INTERNAL_TOKEN="${env.LEDGER_INTERNAL_TOKEN}"\n`,
-  'notification-service': `PORT=8005\nKAFKA_CLIENT_ID=notification-service\nSECURITY_ALERT_EMAIL=${env.SECURITY_ALERT_EMAIL}\n${db('NOTIFICATION', 'notification_schema')}\n${smtp}`,
-  'fraud-service': `PORT=8006\nKAFKA_CLIENT_ID=fraud-service\n${db('FRAUD', 'fraud_schema')}\n`,
+  'account-service': `PORT=8003\nKAFKA_CLIENT_ID=account-service\n${kafka('account-svc', 'KAFKA_ACCOUNT_PASSWORD')}LEDGER_SERVICE_URL=http://localhost:8004\nCUSTOMER_SERVICE_URL=http://localhost:8002\n${db('ACCOUNT', 'account_schema')}\nLEDGER_INTERNAL_TOKEN="${env.LEDGER_INTERNAL_TOKEN}"\nCUSTOMER_INTERNAL_TOKEN="${env.CUSTOMER_INTERNAL_TOKEN}"\n`,
+  'transaction-service': `PORT=8004\nKAFKA_CLIENT_ID=transaction-service\n${kafka('ledger-svc', 'KAFKA_LEDGER_PASSWORD')}${db('LEDGER', 'ledger_schema')}\nLEDGER_INTERNAL_TOKEN="${env.LEDGER_INTERNAL_TOKEN}"\n`,
+  'notification-service': `PORT=8005\nKAFKA_CLIENT_ID=notification-service\n${kafka('notification-svc', 'KAFKA_NOTIFICATION_PASSWORD')}SECURITY_ALERT_EMAIL=${env.SECURITY_ALERT_EMAIL}\n${db('NOTIFICATION', 'notification_schema')}\n${smtp}`,
+  'fraud-service': `PORT=8006\nKAFKA_CLIENT_ID=fraud-service\n${kafka('fraud-svc', 'KAFKA_FRAUD_PASSWORD')}${db('FRAUD', 'fraud_schema')}\n`,
 };
 
 for (const [svc, specific] of Object.entries(services)) {
