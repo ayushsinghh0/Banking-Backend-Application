@@ -106,8 +106,17 @@ export class CustomerController {
     try {
       const { userId } = userIdParamsSchema.parse(req.params);
       const { kycStatus } = kycSchema.parse(req.body);
-      const profile = await this.customerService.updateKycStatus(userId, kycStatus);
+      const profile = await this.customerService.updateKycStatus(getAuthenticatedUser(req), userId, kycStatus);
       res.status(200).json({ success: true, data: profile });
+    } catch (error) {
+      next(error);
+    }
+  };
+
+  public getKycHistory = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    try {
+      const { userId } = userIdParamsSchema.parse(req.params);
+      res.status(200).json({ success: true, data: await this.customerService.getKycHistory(userId) });
     } catch (error) {
       next(error);
     }

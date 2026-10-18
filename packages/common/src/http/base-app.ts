@@ -33,14 +33,15 @@ export function isSwaggerEnabled(): boolean {
  */
 export function parsePagination(
   query: Record<string, unknown>,
-  defaults = { limit: 20, maxLimit: 100 }
+  defaults = { limit: 20, maxLimit: 100, maxOffset: 10_000 }
 ): { limit: number; offset: number } {
   const rawLimit = Number.parseInt(String(query.limit ?? ''), 10);
   const rawOffset = Number.parseInt(String(query.offset ?? ''), 10);
   const limit = Number.isFinite(rawLimit)
     ? Math.min(Math.max(rawLimit, 1), defaults.maxLimit)
     : defaults.limit;
-  const offset = Number.isFinite(rawOffset) ? Math.max(rawOffset, 0) : 0;
+  // Deep offsets force the database to scan and discard rows; cap them (use filters for older data)
+  const offset = Number.isFinite(rawOffset) ? Math.min(Math.max(rawOffset, 0), defaults.maxOffset) : 0;
   return { limit, offset };
 }
 

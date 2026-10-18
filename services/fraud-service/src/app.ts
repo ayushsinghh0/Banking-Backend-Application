@@ -8,7 +8,9 @@ import {
   createBaseApp,
   createEventPublisher,
   errorHandlerMiddleware,
-  getJwtAccessSecret,
+  assertJwtVerificationConfigured,
+  KafkaService,
+  OutboxRelay,
   isSwaggerEnabled,
   logger,
   notFoundHandler,
@@ -16,8 +18,9 @@ import {
   setupSwagger,
   startHttpServer,
   TokenStateStore,
+  prismaClientOptions,
 } from '@banksphere/common';
-import { FraudService, KafkaAlertPublisher } from './services/fraud.service';
+import { FraudService } from './services/fraud.service';
 import { FraudController } from './controllers/fraud.controller';
 import { createFraudRouter } from './routes/fraud.routes';
 import { KafkaFraudConsumer } from './consumers/kafka-fraud.consumer';
@@ -29,15 +32,16 @@ import { KafkaFraudConsumer } from './consumers/kafka-fraud.consumer';
 
 export interface FraudAppDeps {
   tokenState: TokenStateStore;
-  alertPublisher?: KafkaAlertPublisher | null;
   redis?: Redis;
+  /** When set, /health also reports Kafka consumer liveness */
+  kafka?: KafkaService | null;
 }
 
 export function createApp(prisma: PrismaClient, deps: FraudAppDeps) {
-  getJwtAccessSecret(); // Fail fast on a missing/weak signing secret
+  assertJwtVerificationConfigured(); // Fail fast on missing/invalid JWT public keys
   const app = createBaseApp();
 
-  const fraudService = new FraudService(prisma, deps.alertPublisher ?? undefined);
+  const fraudService = new FraudService(prisma);
   const fraudController = new FraudController(fraudService);
 
   // Routes
@@ -68,6 +72,7 @@ export function createApp(prisma: PrismaClient, deps: FraudAppDeps) {
     try {
       await prisma.$queryRaw`SELECT 1`;
       if (deps.redis) await deps.redis.ping();
+      if (deps.kafka && !deps.kafka.consumersHealthy()) throw new Error('Kafka consumer is not running');
       res.json({
         status: 'UP',
         service: 'fraud-service',
@@ -88,24 +93,21 @@ export function createApp(prisma: PrismaClient, deps: FraudAppDeps) {
 }
 
 async function main(): Promise<void> {
-  const prisma = new PrismaClient();
+  const prisma = new PrismaClient(prismaClientOptions());
   const redis = await connectRedis();
   const { publisher, kafka } = createEventPublisher(process.env.KAFKA_CLIENT_ID || 'fraud-service');
   const { app, fraudService } = createApp(prisma, {
     tokenState: new RedisTokenStateStore(redis),
-    alertPublisher: publisher,
     redis,
+    kafka,
   });
 
-  let consumer: KafkaFraudConsumer | null = null;
-  if (kafka) {
-    consumer = new KafkaFraudConsumer(kafka, fraudService);
-    // Kafka being unavailable must not take the API down; KafkaJS keeps retrying the connection
-    consumer.start().catch((err) => logger.error({ err }, 'Fraud consumer failed to start'));
-  }
+  const relay = publisher ? new OutboxRelay(prisma, publisher) : null;
+  relay?.start(Number(process.env.OUTBOX_POLL_INTERVAL_MS || 1000));
+  if (kafka) new KafkaFraudConsumer(kafka, fraudService).start();
 
   startHttpServer(app, process.env.PORT || 8006, 'fraud-service', [
-    () => consumer?.stop(),
+    () => relay?.stop(),
     () => kafka?.disconnect(),
     () => prisma.$disconnect(),
     () => redis.quit(),

@@ -112,24 +112,24 @@ export class IdempotencyService {
    */
   public async execute(
     ctx: IdempotencyContext,
-    work: (tx: TxClient) => Promise<unknown>
+    work: (tx: TxClient) => Promise<{ statusCode: number; data: unknown }>
   ): Promise<CachedResponse & { replayed: boolean }> {
     const replay = await this.findReplay(ctx);
     if (replay) return { ...replay, replayed: true };
 
     try {
-      const responseBody = await this.prisma.$transaction(
+      const { statusCode, body: responseBody } = await this.prisma.$transaction(
         async (tx) => {
           await this.claim(tx, ctx);
-          const data = await work(tx);
+          const result = await work(tx);
           // Normalise to plain JSON (Dates -> ISO strings) so the replayed body is byte-identical
-          const body = JSON.parse(JSON.stringify({ success: true, data }));
-          await this.complete(tx, ctx, 201, body);
-          return body;
+          const body = JSON.parse(JSON.stringify({ success: true, data: result.data }));
+          await this.complete(tx, ctx, result.statusCode, body);
+          return { statusCode: result.statusCode, body };
         },
         { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, maxWait: 10_000, timeout: 15_000 }
       );
-      return { statusCode: 201, responseBody, replayed: false };
+      return { statusCode, responseBody, replayed: false };
     } catch (err: any) {
       if (err?.code === 'P2002') {
         // A concurrent request with the same key committed first

@@ -8,8 +8,8 @@ import {
   createBaseApp,
   createEventPublisher,
   errorHandlerMiddleware,
-  getInternalServiceToken,
-  getJwtAccessSecret,
+  assertJwtVerificationConfigured,
+  getInternalToken,
   isSwaggerEnabled,
   logger,
   notFoundHandler,
@@ -18,6 +18,7 @@ import {
   setupSwagger,
   startHttpServer,
   TokenStateStore,
+  prismaClientOptions,
 } from '@banksphere/common';
 import { AccountService } from './services/account.service';
 import { AccountController } from './controllers/account.controller';
@@ -33,8 +34,9 @@ export interface AccountAppDeps {
 }
 
 export function createApp(prisma: PrismaClient, deps: AccountAppDeps) {
-  getJwtAccessSecret(); // Fail fast on a missing/weak signing secret
-  getInternalServiceToken();
+  assertJwtVerificationConfigured(); // Fail fast on missing/invalid JWT public keys
+  getInternalToken('LEDGER_INTERNAL_TOKEN');
+  getInternalToken('CUSTOMER_INTERNAL_TOKEN');
   const app = createBaseApp();
 
   const accountService = new AccountService(
@@ -86,19 +88,23 @@ export function createApp(prisma: PrismaClient, deps: AccountAppDeps) {
   app.use(notFoundHandler);
   app.use(errorHandlerMiddleware);
 
-  return { app, prisma };
+  return { app, prisma, accountService };
 }
 
 async function main(): Promise<void> {
-  const prisma = new PrismaClient();
+  const prisma = new PrismaClient(prismaClientOptions());
   const redis = await connectRedis();
-  const { app } = createApp(prisma, { tokenState: new RedisTokenStateStore(redis), redis });
+  const { app, accountService } = createApp(prisma, { tokenState: new RedisTokenStateStore(redis), redis });
+  const reconcileTimer = setInterval(() => {
+    accountService.reconcileWithLedger().catch((err) => logger.error({ err }, 'Account/ledger reconciliation failed'));
+  }, Number(process.env.RECONCILE_INTERVAL_MS || 5 * 60 * 1000));
 
   const { publisher, kafka } = createEventPublisher(process.env.KAFKA_CLIENT_ID || 'account-service');
   const relay = publisher ? new OutboxRelay(prisma, publisher) : null;
   relay?.start(Number(process.env.OUTBOX_POLL_INTERVAL_MS || 2000));
 
   startHttpServer(app, process.env.PORT || 8003, 'account-service', [
+    () => clearInterval(reconcileTimer),
     () => relay?.stop(),
     () => kafka?.disconnect(),
     () => prisma.$disconnect(),

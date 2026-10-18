@@ -1,7 +1,8 @@
 import {
   BadGatewayError,
   INTERNAL_TOKEN_HEADER,
-  getInternalServiceToken,
+  HttpError,
+  getInternalToken,
 } from '@banksphere/common';
 
 export interface LedgerAccountProvisioning {
@@ -21,7 +22,9 @@ export interface LedgerAccountUpdate {
 export interface LedgerAccountSnapshot {
   id: string;
   balanceInPaise: string;
+  dailyLimitPaise: string;
   isActive: boolean;
+  closed: boolean;
 }
 
 /**
@@ -33,6 +36,9 @@ export interface LedgerClient {
   provisionAccount(input: LedgerAccountProvisioning): Promise<void>;
   updateAccount(accountId: string, input: LedgerAccountUpdate): Promise<void>;
   getAccount(accountId: string): Promise<LedgerAccountSnapshot>;
+  getAccounts(accountIds: string[]): Promise<LedgerAccountSnapshot[]>;
+  /** Ledger-side close: refuses (409 BALANCE_NOT_ZERO) unless the balance is zero, checked under lock */
+  closeAccount(accountId: string): Promise<void>;
 }
 
 export class HttpLedgerClient implements LedgerClient {
@@ -57,6 +63,15 @@ export class HttpLedgerClient implements LedgerClient {
     return body.data as LedgerAccountSnapshot;
   }
 
+  public async getAccounts(accountIds: string[]): Promise<LedgerAccountSnapshot[]> {
+    const body = await this.request('POST', '/internal/v1/ledger-accounts/snapshots', { ids: accountIds });
+    return body.data as LedgerAccountSnapshot[];
+  }
+
+  public async closeAccount(accountId: string): Promise<void> {
+    await this.request('POST', `/internal/v1/ledger-accounts/${encodeURIComponent(accountId)}/close`);
+  }
+
   private async request(method: string, path: string, body?: unknown): Promise<any> {
     let response: globalThis.Response;
     try {
@@ -64,7 +79,7 @@ export class HttpLedgerClient implements LedgerClient {
         method,
         headers: {
           'content-type': 'application/json',
-          [INTERNAL_TOKEN_HEADER]: getInternalServiceToken(),
+          [INTERNAL_TOKEN_HEADER]: getInternalToken('LEDGER_INTERNAL_TOKEN'),
         },
         body: body === undefined ? undefined : JSON.stringify(body),
         signal: AbortSignal.timeout(this.timeoutMs),
@@ -74,6 +89,11 @@ export class HttpLedgerClient implements LedgerClient {
     }
 
     const text = await response.text();
+    if (response.status === 409) {
+      // Business rule from the ledger (e.g. BALANCE_NOT_ZERO): surface it to the caller as-is
+      const err = JSON.parse(text || '{}')?.error;
+      throw new HttpError(409, err?.code || 'CONFLICT', err?.message || 'Ledger refused the change');
+    }
     if (!response.ok) {
       throw new BadGatewayError(`Ledger service rejected the request (HTTP ${response.status})`);
     }

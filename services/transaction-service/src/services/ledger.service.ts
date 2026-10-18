@@ -1,9 +1,14 @@
 import crypto from 'crypto';
 import { PrismaClient, Prisma } from '../../generated/client';
-import { AuthenticatedUser, ConflictError, isStaff } from '@banksphere/common';
 import {
-  DepositDTO,
-  WithdrawDTO,
+  AuthenticatedUser,
+  ConflictError,
+  ForbiddenError,
+  HttpError,
+  isStaff,
+  logger,
+} from '@banksphere/common';
+import {
   TransferDTO,
   TransactionResult,
   TransactionType,
@@ -11,6 +16,8 @@ import {
   EntryType,
   LedgerAccountProvisionDTO,
   LedgerAccountUpdateDTO,
+  CashOperationDTO,
+  CashOperationResult,
 } from '../types';
 import {
   NotFoundError,
@@ -28,11 +35,30 @@ interface LockedAccount {
   id: string;
   balance: bigint;
   is_active: boolean;
+  closed_at: Date | null;
   account_number: string;
   customer_id: string;
   currency: string;
   daily_limit: bigint;
 }
+
+export interface CashPolicy {
+  /** Teller cash operations above this need a second BANK_ADMIN's approval */
+  singleApprovalLimit: bigint;
+  /** A teller's single-approval cash total per IST day; beyond it everything needs approval */
+  tellerDailyLimit: bigint;
+  /** Maximum outflow per customer per IST day across all their accounts */
+  customerDailyOutflowLimit: bigint;
+  /** Pending approvals expire after this many hours */
+  approvalTtlHours: number;
+}
+
+export const defaultCashPolicy = (): CashPolicy => ({
+  singleApprovalLimit: BigInt(process.env.CASH_SINGLE_APPROVAL_LIMIT_PAISE || '20000000'), // ₹2,00,000
+  tellerDailyLimit: BigInt(process.env.TELLER_DAILY_LIMIT_PAISE || '100000000'), // ₹10,00,000
+  customerDailyOutflowLimit: BigInt(process.env.CUSTOMER_DAILY_OUTFLOW_LIMIT_PAISE || '50000000'), // ₹5,00,000
+  approvalTtlHours: Number(process.env.CASH_APPROVAL_TTL_HOURS || 24),
+});
 
 const IST_OFFSET_MS = 330 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -45,8 +71,15 @@ export function startOfIstDay(now = new Date()): Date {
   return new Date(Math.floor(istMs / DAY_MS) * DAY_MS - IST_OFFSET_MS);
 }
 
+/** The one answer for "this destination can't receive money", whatever the reason */
+const invalidDestination = () =>
+  new HttpError(422, 'INVALID_DESTINATION', 'The destination account cannot receive this transfer');
+
 export class LedgerService {
-  constructor(private readonly prisma: PrismaClient) {}
+  constructor(
+    private readonly prisma: PrismaClient,
+    private readonly policy: CashPolicy = defaultCashPolicy()
+  ) {}
 
   /**
    * Human-readable unique reference ID built from a CSPRNG suffix
@@ -64,13 +97,18 @@ export class LedgerService {
     });
   }
 
+  /** Transaction-scoped advisory lock: serialises all debits of one customer / one teller */
+  private async advisoryLock(tx: TxClient, key: string): Promise<void> {
+    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${key}, 0))::text`;
+  }
+
   private async lockAccounts(tx: TxClient, ids: string[]): Promise<LockedAccount[]> {
     // DEADLOCK PREVENTION: rows are always locked in ascending id order
     const sorted = [...new Set(ids)].sort();
     // Don't queue forever behind a hot account: give up after 5s and let the client retry (503)
     await tx.$executeRaw`SET LOCAL lock_timeout = '5s'`;
     return tx.$queryRaw<LockedAccount[]>`
-      SELECT id, balance, is_active, account_number, customer_id, currency, daily_limit
+      SELECT id, balance, is_active, closed_at, account_number, customer_id, currency, daily_limit
       FROM ledger_accounts
       WHERE id IN (${Prisma.join(sorted)})
       ORDER BY id ASC
@@ -78,34 +116,34 @@ export class LedgerService {
     `;
   }
 
-  private assertCanDebit(account: LockedAccount, actor: AuthenticatedUser): void {
-    // Only the owner (or a bank administrator acting as teller) may move money out of an account.
-    // A non-owner gets the same "not found" as a missing account so IDs can't be probed.
-    if (account.customer_id !== actor.id && actor.role !== 'BANK_ADMIN') {
-      throw new NotFoundError('Account not found');
-    }
-  }
-
-  private async assertWithinDailyLimit(
+  private async assertWithinDailyLimits(
     tx: TxClient,
     account: LockedAccount,
     amountInPaise: bigint
   ): Promise<void> {
-    // Runs while the account row is locked, so concurrent debits are serialized and can't race past the limit
-    const spent = await tx.ledgerEntry.aggregate({
-      _sum: { amount: true },
-      where: {
-        accountId: account.id,
-        entryType: EntryType.DEBIT,
-        createdAt: { gte: startOfIstDay() },
-      },
-    });
-    const spentToday = spent._sum.amount ?? 0n;
-    if (spentToday + amountInPaise > account.daily_limit) {
-      const remaining = account.daily_limit - spentToday;
+    // Called with the customer's advisory lock and the account row lock held, so concurrent debits are
+    // serialised and can't race past either limit
+    const since = startOfIstDay();
+    const [accountSpent, customerSpent] = await Promise.all([
+      tx.ledgerEntry.aggregate({
+        _sum: { amount: true },
+        where: { accountId: account.id, entryType: EntryType.DEBIT, createdAt: { gte: since } },
+      }),
+      tx.ledgerEntry.aggregate({
+        _sum: { amount: true },
+        where: { entryType: EntryType.DEBIT, createdAt: { gte: since }, account: { customerId: account.customer_id } },
+      }),
+    ]);
+    const spentOnAccount = accountSpent._sum.amount ?? 0n;
+    if (spentOnAccount + amountInPaise > account.daily_limit) {
+      const remaining = account.daily_limit - spentOnAccount;
       throw new DailyLimitExceededError(
         `Daily outgoing limit exceeded. Remaining today: ${(remaining > 0n ? remaining : 0n).toString()} paise`
       );
+    }
+    const spentByCustomer = customerSpent._sum.amount ?? 0n;
+    if (spentByCustomer + amountInPaise > this.policy.customerDailyOutflowLimit) {
+      throw new DailyLimitExceededError('Daily outgoing limit across all your accounts exceeded');
     }
   }
 
@@ -154,9 +192,21 @@ export class LedgerService {
     });
   }
 
+  private async audit(tx: TxClient, actorId: string, action: string, targetId: string, details?: Record<string, unknown>) {
+    await tx.auditLog.create({
+      data: { actorId, action, targetId, details: details as Prisma.InputJsonValue | undefined },
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Customer transfers
+  // ---------------------------------------------------------------------------
+
   /**
-   * Executes a transfer between two accounts using strict double-entry ledgering,
-   * deterministic row-level locking, and transactional outbox event insertion.
+   * Transfers between two accounts with strict double-entry ledgering, deterministic row locking and a
+   * transactional outbox event. Only the owner of the source account can move its money (no staff
+   * override). Checks run in an order that leaks nothing about other customers' accounts: the caller's
+   * own account is validated first, and every unusable destination gets the same INVALID_DESTINATION.
    */
   public async executeTransfer(
     dto: TransferDTO,
@@ -172,54 +222,46 @@ export class LedgerService {
     const referenceId = dto.referenceId || this.generateReferenceId('TXN-TRF');
 
     return this.inTransaction(txClient, async (tx) => {
-      let destinationAccountId = dto.destinationAccountId;
+      let destinationAccountId = dto.destinationAccountId ?? null;
       if (!destinationAccountId && dto.destinationAccountNumber) {
         const dest = await tx.ledgerAccount.findUnique({
           where: { accountNumber: dto.destinationAccountNumber },
           select: { id: true },
         });
-        if (!dest) {
-          throw new NotFoundError('Destination account not found');
-        }
-        destinationAccountId = dest.id;
+        destinationAccountId = dest?.id ?? null;
       }
-      if (!destinationAccountId) {
-        throw new NotFoundError('Destination account not found');
-      }
-
-      if (sourceAccountId === destinationAccountId) {
+      if (destinationAccountId === sourceAccountId) {
         throw new SameAccountTransferError();
       }
 
-      const accounts = await this.lockAccounts(tx, [sourceAccountId, destinationAccountId]);
-      const sourceAccount = accounts.find((a) => a.id === sourceAccountId);
-      const destAccount = accounts.find((a) => a.id === destinationAccountId);
-
-      if (!sourceAccount) {
+      const source0 = await tx.ledgerAccount.findUnique({ where: { id: sourceAccountId }, select: { customerId: true } });
+      if (!source0 || source0.customerId !== actor.id) {
+        // Not yours (or missing): indistinguishable, so account ids can't be probed
         throw new NotFoundError('Account not found');
       }
-      this.assertCanDebit(sourceAccount, actor);
-      if (!destAccount) {
-        throw new NotFoundError('Destination account not found');
-      }
+      await this.advisoryLock(tx, `customer-outflow:${actor.id}`);
 
-      // Inactive account validation
-      if (!sourceAccount.is_active || !destAccount.is_active) {
-        throw new AccountInactiveError();
-      }
+      const accounts = await this.lockAccounts(tx, destinationAccountId ? [sourceAccountId, destinationAccountId] : [sourceAccountId]);
+      const sourceAccount = accounts.find((a) => a.id === sourceAccountId)!;
+      const destAccount = destinationAccountId ? accounts.find((a) => a.id === destinationAccountId) : undefined;
 
-      if (sourceAccount.currency !== destAccount.currency) {
-        throw new CurrencyMismatchError();
+      // 1. Everything about the caller's own account first
+      if (!sourceAccount.is_active || sourceAccount.closed_at) {
+        throw new AccountInactiveError('Your account is frozen or closed');
       }
-
-      // Authoritative balance check within the locked row boundary
       if (sourceAccount.balance < amountInPaise) {
         throw new InsufficientFundsError();
       }
+      await this.assertWithinDailyLimits(tx, sourceAccount, amountInPaise);
 
-      await this.assertWithinDailyLimit(tx, sourceAccount, amountInPaise);
+      // 2. Only then the destination, with a single uniform error
+      if (!destAccount || !destAccount.is_active || destAccount.closed_at || destAccount.currency !== sourceAccount.currency) {
+        if (destAccount && destAccount.currency !== sourceAccount.currency && destAccount.customer_id === actor.id) {
+          throw new CurrencyMismatchError();
+        }
+        throw invalidDestination();
+      }
 
-      // 1. Create the Transaction record
       const transaction = await tx.transaction.create({
         data: {
           referenceId,
@@ -228,7 +270,7 @@ export class LedgerService {
           amount: amountInPaise,
           currency: sourceAccount.currency,
           sourceAccountId,
-          destinationAccountId,
+          destinationAccountId: destAccount.id,
           initiatedBy: actor.id,
           description: description || `Transfer to account ${destAccount.account_number}`,
         },
@@ -237,8 +279,7 @@ export class LedgerService {
       const newSourceBalance = sourceAccount.balance - amountInPaise;
       const newDestBalance = destAccount.balance + amountInPaise;
 
-      // 2. DOUBLE-ENTRY BOOKKEEPING:
-      // Source Account is DEBITED (decrease in bank's liability to account holder)
+      // DOUBLE-ENTRY: source DEBITED, destination CREDITED
       await tx.ledgerEntry.create({
         data: {
           transactionId: transaction.id,
@@ -249,12 +290,10 @@ export class LedgerService {
           balanceAfter: newSourceBalance,
         },
       });
-
-      // Destination Account is CREDITED (increase in bank's liability to account holder)
       await tx.ledgerEntry.create({
         data: {
           transactionId: transaction.id,
-          accountId: destinationAccountId,
+          accountId: destAccount.id,
           entryType: EntryType.CREDIT,
           amount: amountInPaise,
           currency: destAccount.currency,
@@ -262,25 +301,16 @@ export class LedgerService {
         },
       });
 
-      // 3. Atomically update operational account balances
-      await tx.ledgerAccount.update({
-        where: { id: sourceAccountId },
-        data: { balance: newSourceBalance },
-      });
+      await tx.ledgerAccount.update({ where: { id: sourceAccountId }, data: { balance: newSourceBalance } });
+      await tx.ledgerAccount.update({ where: { id: destAccount.id }, data: { balance: newDestBalance } });
 
-      await tx.ledgerAccount.update({
-        where: { id: destinationAccountId },
-        data: { balance: newDestBalance },
-      });
-
-      // 4. TRANSACTIONAL OUTBOX
       await this.stageOutboxEvent(tx, transaction.id, {
         referenceId: transaction.referenceId,
         type: transaction.type,
         amountInPaise: amountInPaise.toString(),
         currency: transaction.currency,
         sourceAccountId,
-        destinationAccountId,
+        destinationAccountId: destAccount.id,
         sourceCustomerId: sourceAccount.customer_id,
         destinationCustomerId: destAccount.customer_id,
         initiatedBy: actor.id,
@@ -290,158 +320,226 @@ export class LedgerService {
     });
   }
 
+  // ---------------------------------------------------------------------------
+  // Teller cash operations (maker-checker)
+  // ---------------------------------------------------------------------------
+
   /**
-   * Executes a deposit into an account. Route-level authorization restricts this to BANK_ADMIN (teller).
+   * A teller (BANK_ADMIN) records a cash deposit or withdrawal. Small amounts within the teller's daily
+   * single-approval budget execute immediately; anything else waits for a different administrator.
+   * Staff can never operate on accounts they own.
    */
-  public async executeDeposit(
-    dto: DepositDTO,
+  public async requestCashOperation(
+    dto: CashOperationDTO,
     actor: AuthenticatedUser,
     txClient?: TxClient
-  ): Promise<TransactionResult> {
-    const { accountId, amountInPaise, description } = dto;
-
-    if (amountInPaise <= 0n) {
-      throw new InvalidAmountError();
-    }
-
-    const referenceId = dto.referenceId || this.generateReferenceId('TXN-DEP');
+  ): Promise<CashOperationResult> {
+    if (dto.amountInPaise <= 0n) throw new InvalidAmountError();
 
     return this.inTransaction(txClient, async (tx) => {
-      const [account] = await this.lockAccounts(tx, [accountId]);
-
-      if (!account) {
-        throw new NotFoundError('Account not found');
+      const account = await tx.ledgerAccount.findUnique({ where: { id: dto.accountId } });
+      if (!account) throw new NotFoundError('Account not found');
+      if (account.customerId === actor.id) {
+        throw new ForbiddenError('Staff cannot perform cash operations on their own accounts');
       }
+      if (!account.isActive || account.closedAt) throw new AccountInactiveError();
 
-      if (!account.is_active) {
-        throw new AccountInactiveError();
-      }
-
-      const transaction = await tx.transaction.create({
-        data: {
-          referenceId,
-          type: TransactionType.DEPOSIT,
-          status: TransactionStatus.COMPLETED,
-          amount: amountInPaise,
-          currency: account.currency,
-          destinationAccountId: accountId,
-          initiatedBy: actor.id,
-          description: description || 'Account cash/credit deposit',
+      await this.advisoryLock(tx, `teller:${actor.id}`);
+      const executedToday = await tx.cashOperation.aggregate({
+        _sum: { amount: true },
+        where: {
+          requestedBy: actor.id,
+          status: 'EXECUTED',
+          approvedBy: null,
+          createdAt: { gte: startOfIstDay() },
         },
       });
+      const usedBudget = executedToday._sum.amount ?? 0n;
+      const needsApproval =
+        dto.amountInPaise > this.policy.singleApprovalLimit ||
+        usedBudget + dto.amountInPaise > this.policy.tellerDailyLimit;
 
-      const newBalance = account.balance + amountInPaise;
+      if (needsApproval) {
+        const pending = await tx.cashOperation.create({
+          data: {
+            type: dto.type,
+            status: 'PENDING_APPROVAL',
+            accountId: dto.accountId,
+            amount: dto.amountInPaise,
+            description: dto.description,
+            requestedBy: actor.id,
+          },
+        });
+        await this.audit(tx, actor.id, `CASH_${dto.type}_REQUESTED`, pending.id, {
+          accountId: dto.accountId,
+          amountInPaise: dto.amountInPaise.toString(),
+        });
+        return { status: 'PENDING_APPROVAL', cashOperationId: pending.id };
+      }
 
-      // Credit entry in ledger
-      await tx.ledgerEntry.create({
+      const operation = await tx.cashOperation.create({
         data: {
-          transactionId: transaction.id,
-          accountId,
-          entryType: EntryType.CREDIT,
-          amount: amountInPaise,
-          currency: account.currency,
-          balanceAfter: newBalance,
+          type: dto.type,
+          status: 'EXECUTED',
+          accountId: dto.accountId,
+          amount: dto.amountInPaise,
+          description: dto.description,
+          requestedBy: actor.id,
+          decidedAt: new Date(),
         },
       });
-
-      await tx.ledgerAccount.update({
-        where: { id: accountId },
-        data: { balance: newBalance },
+      const transaction = await this.postCash(tx, operation.id, dto, actor.id);
+      await tx.cashOperation.update({ where: { id: operation.id }, data: { transactionId: transaction.transactionId } });
+      await this.audit(tx, actor.id, `CASH_${dto.type}_EXECUTED`, operation.id, {
+        accountId: dto.accountId,
+        amountInPaise: dto.amountInPaise.toString(),
+        transactionId: transaction.transactionId,
       });
-
-      await this.stageOutboxEvent(tx, transaction.id, {
-        referenceId: transaction.referenceId,
-        type: transaction.type,
-        amountInPaise: amountInPaise.toString(),
-        currency: transaction.currency,
-        destinationAccountId: accountId,
-        destinationCustomerId: account.customer_id,
-        initiatedBy: actor.id,
-      });
-
-      return this.toResult(transaction);
+      return { status: 'EXECUTED', cashOperationId: operation.id, transaction };
     });
   }
 
   /**
-   * Executes a withdrawal from an account (owner or BANK_ADMIN only)
+   * Second administrator approves a pending cash operation. The approver must differ from the requester
+   * and must not own the account. Balance and limits are (re)checked at execution time.
    */
-  public async executeWithdrawal(
-    dto: WithdrawDTO,
-    actor: AuthenticatedUser,
+  public async approveCashOperation(
+    cashOperationId: string,
+    approver: AuthenticatedUser,
     txClient?: TxClient
-  ): Promise<TransactionResult> {
-    const { accountId, amountInPaise, description } = dto;
-
-    if (amountInPaise <= 0n) {
-      throw new InvalidAmountError();
-    }
-
-    const referenceId = dto.referenceId || this.generateReferenceId('TXN-WTH');
-
+  ): Promise<CashOperationResult> {
     return this.inTransaction(txClient, async (tx) => {
-      const [account] = await this.lockAccounts(tx, [accountId]);
+      const [op] = await tx.$queryRaw<Array<{ id: string }>>`
+        SELECT id FROM cash_operations WHERE id = ${cashOperationId} FOR UPDATE
+      `;
+      if (!op) throw new NotFoundError('Cash operation not found');
+      const operation = await tx.cashOperation.findUniqueOrThrow({ where: { id: cashOperationId } });
 
-      if (!account) {
-        throw new NotFoundError('Account not found');
+      if (operation.status !== 'PENDING_APPROVAL') {
+        throw new ConflictError(`Cash operation is already ${operation.status}`);
       }
-      this.assertCanDebit(account, actor);
-
-      if (!account.is_active) {
-        throw new AccountInactiveError();
+      if (operation.requestedBy === approver.id) {
+        throw new ForbiddenError('A cash operation must be approved by a different administrator');
+      }
+      const account = await tx.ledgerAccount.findUnique({ where: { id: operation.accountId } });
+      if (account?.customerId === approver.id) {
+        throw new ForbiddenError('Staff cannot approve cash operations on their own accounts');
+      }
+      if (operation.createdAt.getTime() < Date.now() - this.policy.approvalTtlHours * 3600_000) {
+        throw new ConflictError('This approval request has expired; reject it and ask the teller to submit a new one');
       }
 
-      if (account.balance < amountInPaise) {
-        throw new InsufficientFundsError();
-      }
-
-      await this.assertWithinDailyLimit(tx, account, amountInPaise);
-
-      const transaction = await tx.transaction.create({
-        data: {
-          referenceId,
-          type: TransactionType.WITHDRAWAL,
-          status: TransactionStatus.COMPLETED,
-          amount: amountInPaise,
-          currency: account.currency,
-          sourceAccountId: accountId,
-          initiatedBy: actor.id,
-          description: description || 'Account cash withdrawal',
+      const transaction = await this.postCash(
+        tx,
+        operation.id,
+        {
+          type: operation.type,
+          accountId: operation.accountId,
+          amountInPaise: operation.amount,
+          description: operation.description ?? undefined,
         },
+        operation.requestedBy
+      );
+      await tx.cashOperation.update({
+        where: { id: operation.id },
+        data: { status: 'EXECUTED', approvedBy: approver.id, decidedAt: new Date(), transactionId: transaction.transactionId },
       });
-
-      const newBalance = account.balance - amountInPaise;
-
-      // Debit entry in ledger
-      await tx.ledgerEntry.create({
-        data: {
-          transactionId: transaction.id,
-          accountId,
-          entryType: EntryType.DEBIT,
-          amount: amountInPaise,
-          currency: account.currency,
-          balanceAfter: newBalance,
-        },
+      await this.audit(tx, approver.id, `CASH_${operation.type}_APPROVED`, operation.id, {
+        requestedBy: operation.requestedBy,
+        transactionId: transaction.transactionId,
       });
-
-      await tx.ledgerAccount.update({
-        where: { id: accountId },
-        data: { balance: newBalance },
-      });
-
-      await this.stageOutboxEvent(tx, transaction.id, {
-        referenceId: transaction.referenceId,
-        type: transaction.type,
-        amountInPaise: amountInPaise.toString(),
-        currency: transaction.currency,
-        sourceAccountId: accountId,
-        sourceCustomerId: account.customer_id,
-        initiatedBy: actor.id,
-      });
-
-      return this.toResult(transaction);
+      return { status: 'EXECUTED', cashOperationId: operation.id, transaction };
     });
   }
+
+  public async rejectCashOperation(cashOperationId: string, actor: AuthenticatedUser): Promise<void> {
+    await this.prisma.$transaction(async (tx) => {
+      const result = await tx.cashOperation.updateMany({
+        where: { id: cashOperationId, status: 'PENDING_APPROVAL' },
+        data: { status: 'REJECTED', approvedBy: actor.id, decidedAt: new Date() },
+      });
+      if (result.count !== 1) throw new ConflictError('Cash operation is not pending');
+      await this.audit(tx, actor.id, 'CASH_OPERATION_REJECTED', cashOperationId);
+    });
+  }
+
+  public async listCashOperations(
+    status: 'PENDING_APPROVAL' | 'EXECUTED' | 'REJECTED' | undefined,
+    limit: number,
+    offset: number
+  ) {
+    const rows = await this.prisma.cashOperation.findMany({
+      where: status ? { status } : undefined,
+      orderBy: { createdAt: 'desc' },
+      take: limit,
+      skip: offset,
+    });
+    return rows.map(({ amount, ...rest }) => ({ ...rest, amountInPaise: amount.toString() }));
+  }
+
+  /** Posts the ledger side of a cash operation (row lock, balance/limit checks, entry, outbox) */
+  private async postCash(
+    tx: TxClient,
+    cashOperationId: string,
+    dto: CashOperationDTO,
+    tellerId: string
+  ): Promise<TransactionResult> {
+    const isDeposit = dto.type === 'DEPOSIT';
+    const owner = await tx.ledgerAccount.findUnique({ where: { id: dto.accountId }, select: { customerId: true } });
+    if (!owner) throw new NotFoundError('Account not found');
+    if (!isDeposit) await this.advisoryLock(tx, `customer-outflow:${owner.customerId}`);
+
+    const [account] = await this.lockAccounts(tx, [dto.accountId]);
+    if (!account.is_active || account.closed_at) throw new AccountInactiveError();
+    if (!isDeposit) {
+      if (account.balance < dto.amountInPaise) throw new InsufficientFundsError();
+      await this.assertWithinDailyLimits(tx, account, dto.amountInPaise);
+    }
+
+    const transaction = await tx.transaction.create({
+      data: {
+        referenceId: this.generateReferenceId(isDeposit ? 'TXN-DEP' : 'TXN-WTH'),
+        type: isDeposit ? TransactionType.DEPOSIT : TransactionType.WITHDRAWAL,
+        status: TransactionStatus.COMPLETED,
+        amount: dto.amountInPaise,
+        currency: account.currency,
+        ...(isDeposit ? { destinationAccountId: account.id } : { sourceAccountId: account.id }),
+        initiatedBy: tellerId,
+        description: dto.description || (isDeposit ? 'Cash deposit at branch' : 'Cash withdrawal at branch'),
+      },
+    });
+
+    const newBalance = isDeposit ? account.balance + dto.amountInPaise : account.balance - dto.amountInPaise;
+    await tx.ledgerEntry.create({
+      data: {
+        transactionId: transaction.id,
+        accountId: account.id,
+        entryType: isDeposit ? EntryType.CREDIT : EntryType.DEBIT,
+        amount: dto.amountInPaise,
+        currency: account.currency,
+        balanceAfter: newBalance,
+      },
+    });
+    await tx.ledgerAccount.update({ where: { id: account.id }, data: { balance: newBalance } });
+
+    await this.stageOutboxEvent(tx, transaction.id, {
+      referenceId: transaction.referenceId,
+      type: transaction.type,
+      amountInPaise: dto.amountInPaise.toString(),
+      currency: transaction.currency,
+      ...(isDeposit
+        ? { destinationAccountId: account.id, destinationCustomerId: account.customer_id }
+        : { sourceAccountId: account.id, sourceCustomerId: account.customer_id }),
+      initiatedBy: tellerId,
+      cashOperationId,
+    });
+
+    return this.toResult(transaction);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Reads
+  // ---------------------------------------------------------------------------
 
   private async getReadableAccount(accountId: string, actor: AuthenticatedUser) {
     const account = await this.prisma.ledgerAccount.findUnique({ where: { id: accountId } });
@@ -469,12 +567,7 @@ export class LedgerService {
   /**
    * Returns paginated transaction history for an account (owner or staff)
    */
-  public async getTransactionHistory(
-    accountId: string,
-    actor: AuthenticatedUser,
-    limit = 20,
-    offset = 0
-  ) {
+  public async getTransactionHistory(accountId: string, actor: AuthenticatedUser, limit = 20, offset = 0) {
     await this.getReadableAccount(accountId, actor);
 
     const entries = await this.prisma.ledgerEntry.findMany({
@@ -526,24 +619,46 @@ export class LedgerService {
   }
 
   public async updateAccount(accountId: string, dto: LedgerAccountUpdateDTO) {
-    const existing = await this.prisma.ledgerAccount.findUnique({ where: { id: accountId } });
-    if (!existing) {
-      throw new NotFoundError('Ledger account not found');
-    }
-    return this.prisma.ledgerAccount.update({
-      where: { id: accountId },
-      data: {
-        ...(dto.isActive !== undefined && { isActive: dto.isActive }),
-        ...(dto.dailyLimitPaise !== undefined && { dailyLimit: dto.dailyLimitPaise }),
-      },
+    return this.prisma.$transaction(async (tx) => {
+      const [account] = await this.lockAccounts(tx, [accountId]);
+      if (!account) throw new NotFoundError('Ledger account not found');
+      if (account.closed_at) throw new ConflictError('Ledger account is closed');
+      return tx.ledgerAccount.update({
+        where: { id: accountId },
+        data: {
+          ...(dto.isActive !== undefined && { isActive: dto.isActive }),
+          ...(dto.dailyLimitPaise !== undefined && { dailyLimit: dto.dailyLimitPaise }),
+        },
+      });
     });
   }
 
-  public async getAccountSnapshot(accountId: string) {
-    const account = await this.prisma.ledgerAccount.findUnique({ where: { id: accountId } });
-    if (!account) {
-      throw new NotFoundError('Ledger account not found');
-    }
+  /**
+   * Closes an account. The ledger is the authority: the zero-balance check and the close happen under
+   * the row lock, so a transfer can't land between "balance is 0" and "closed". Idempotent.
+   */
+  public async closeAccount(accountId: string): Promise<void> {
+    await this.prisma.$transaction(async (tx) => {
+      const [account] = await this.lockAccounts(tx, [accountId]);
+      if (!account) throw new NotFoundError('Ledger account not found');
+      if (account.closed_at) return;
+      if (account.balance !== 0n) {
+        throw new HttpError(409, 'BALANCE_NOT_ZERO', 'Account balance must be zero before the account can be closed');
+      }
+      await tx.ledgerAccount.update({ where: { id: accountId }, data: { isActive: false, closedAt: new Date() } });
+    });
+  }
+
+  private snapshot(account: {
+    id: string;
+    accountNumber: string;
+    customerId: string;
+    balance: bigint;
+    dailyLimit: bigint;
+    currency: string;
+    isActive: boolean;
+    closedAt: Date | null;
+  }) {
     return {
       id: account.id,
       accountNumber: account.accountNumber,
@@ -552,6 +667,47 @@ export class LedgerService {
       dailyLimitPaise: account.dailyLimit.toString(),
       currency: account.currency,
       isActive: account.isActive,
+      closed: Boolean(account.closedAt),
     };
+  }
+
+  public async getAccountSnapshot(accountId: string) {
+    const account = await this.prisma.ledgerAccount.findUnique({ where: { id: accountId } });
+    if (!account) {
+      throw new NotFoundError('Ledger account not found');
+    }
+    return this.snapshot(account);
+  }
+
+  public async getAccountSnapshots(ids: string[]) {
+    const accounts = await this.prisma.ledgerAccount.findMany({ where: { id: { in: ids } } });
+    return accounts.map((a) => this.snapshot(a));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Integrity
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Ledger invariant check: every account's balance must equal the net of its entries. Any mismatch
+   * indicates tampering or a bug and is logged as an alert-level error.
+   */
+  public async reconcileBalances(): Promise<{ checked: number; mismatches: string[] }> {
+    const rows = await this.prisma.$queryRaw<Array<{ id: string }>>`
+      SELECT a.id
+      FROM ledger_accounts a
+      LEFT JOIN (
+        SELECT account_id,
+               SUM(CASE WHEN entry_type = 'CREDIT' THEN amount ELSE -amount END) AS net
+        FROM ledger_entries GROUP BY account_id
+      ) e ON e.account_id = a.id
+      WHERE a.balance <> COALESCE(e.net, 0)
+    `;
+    const [{ count }] = await this.prisma.$queryRaw<Array<{ count: bigint }>>`SELECT count(*)::bigint AS count FROM ledger_accounts`;
+    const mismatches = rows.map((r) => r.id);
+    if (mismatches.length) {
+      logger.error({ mismatches, alert: 'LEDGER_RECONCILIATION_FAILED' }, 'Ledger balances do not match their entries');
+    }
+    return { checked: Number(count), mismatches };
   }
 }

@@ -8,7 +8,7 @@ import {
   UserRegisteredEvent,
   EmailDispatchOptions,
 } from '../types';
-import { MoneyUtil, logger } from '@banksphere/common';
+import { MoneyUtil, TransientError, isTransientError, logger } from '@banksphere/common';
 
 export interface KafkaDLQPublisher {
   publish(topic: string, key: string, payload: any): Promise<void>;
@@ -20,6 +20,9 @@ export interface KafkaDLQPublisher {
 function maskAccountNumber(accountNumber: string): string {
   return accountNumber.length > 4 ? `${'X'.repeat(accountNumber.length - 4)}${accountNumber.slice(-4)}` : accountNumber;
 }
+
+/** How long to keep retrying an event whose recipient's contact details haven't arrived yet */
+const CONTACT_WAIT_MS = 15 * 60 * 1000;
 
 export class NotificationService {
   constructor(
@@ -69,14 +72,36 @@ export class NotificationService {
   }
 
   /**
-   * Handles 'user.registered.v1': maintains the local email directory (no email is sent)
+   * Events travel on different topics, so a transaction alert can arrive before the owner's
+   * user.registered event. Retry for a while (transient) rather than silently dropping a mandatory alert.
+   */
+  private contactMissing(eventId: string, eventTimestamp: string | undefined): void {
+    const age = Date.now() - new Date(eventTimestamp ?? Date.now()).getTime();
+    if (age < CONTACT_WAIT_MS) {
+      throw new TransientError(`Contact details not yet available for event ${eventId}`);
+    }
+    logger.error({ eventId, alert: 'NOTIFICATION_RECIPIENT_UNKNOWN' }, 'No contact on file for recipient; notification skipped');
+  }
+
+  /**
+   * Handles 'user.registered.v1': maintains the local email directory (no email is sent).
+   * Insert-only: an event can never overwrite an existing user's address (a forged or replayed event
+   * must not be able to redirect someone's bank notifications).
    */
   public async handleUserRegistered(event: UserRegisteredEvent): Promise<boolean> {
-    await this.prisma.userContact.upsert({
-      where: { userId: event.userId },
-      create: { userId: event.userId, email: event.email },
-      update: { email: event.email },
+    if (typeof event.userId !== 'string' || typeof event.email !== 'string' || !/^[^\s@]+@[^\s@]+$/.test(event.email)) {
+      throw new Error('Malformed user.registered.v1 event');
+    }
+    const result = await this.prisma.userContact.createMany({
+      data: [{ userId: event.userId, email: event.email }],
+      skipDuplicates: true,
     });
+    if (result.count === 0) {
+      const existing = await this.prisma.userContact.findUnique({ where: { userId: event.userId } });
+      if (existing && existing.email !== event.email) {
+        logger.warn({ userId: event.userId, alert: 'CONTACT_OVERWRITE_ATTEMPT' }, 'Ignored user.registered.v1 with a different email');
+      }
+    }
     return true;
   }
 
@@ -107,7 +132,7 @@ export class NotificationService {
 
     for (const party of parties) {
       if (!party.email) {
-        logger.warn({ eventId: event.eventId }, 'No contact on file for transaction party; notification skipped');
+        this.contactMissing(event.eventId, event.timestamp);
         continue;
       }
       await this.dispatchWithRetryAndDLQ(event.eventId, event.eventType, {
@@ -126,15 +151,10 @@ export class NotificationService {
    * Handles 'account.created.v1' Kafka event idempotently
    */
   public async handleAccountCreated(event: AccountCreatedEvent): Promise<boolean> {
-    // Always refresh the read model, even for a duplicate event (upsert is idempotent)
-    await this.prisma.accountOwner.upsert({
-      where: { accountId: event.accountId },
-      create: {
-        accountId: event.accountId,
-        customerId: event.customerId,
-        accountNumber: event.accountNumber,
-      },
-      update: {},
+    // Always refresh the read model, even for a duplicate event (insert-only, idempotent)
+    await this.prisma.accountOwner.createMany({
+      data: [{ accountId: event.accountId, customerId: event.customerId, accountNumber: event.accountNumber }],
+      skipDuplicates: true,
     });
 
     if (await this.isEventProcessed(event.eventId)) {
@@ -151,7 +171,7 @@ export class NotificationService {
         metadata: { accountId: event.accountId },
       });
     } else {
-      logger.warn({ eventId: event.eventId }, 'No contact on file for account owner; welcome email skipped');
+      this.contactMissing(event.eventId, event.timestamp);
     }
 
     await this.markEventProcessed(event.eventId, event.eventType);
@@ -174,6 +194,8 @@ export class NotificationService {
         body: `Dear Customer,\n\nThe status of one of your accounts changed from ${event.previousStatus} to ${event.status}.\n\nIf you did not request this change, contact BankSphere immediately.`,
         metadata: { accountId: event.accountId },
       });
+    } else {
+      this.contactMissing(event.eventId, event.timestamp);
     }
 
     await this.markEventProcessed(event.eventId, event.eventType);
@@ -202,48 +224,68 @@ export class NotificationService {
   }
 
   /**
-   * Dispatches notifications with bounded exponential backoff retries and Dead-Letter Queue (DLQ) routing
+   * Sends one email for (event, recipient) at most once across retries and redeliveries, with bounded
+   * in-process retries. Outcomes:
+   * - sent                         -> SENT log + delivery record
+   * - transient failure (SMTP down / 4xx / network) -> TransientError: the Kafka message is retried later
+   * - permanent failure (e.g. 5xx rejected recipient) -> DEAD_LETTER log + notifications.dlq
    */
   public async dispatchWithRetryAndDLQ(
     eventId: string,
     eventType: string,
     options: EmailDispatchOptions
   ): Promise<void> {
+    const delivered = await this.prisma.notificationDelivery.findUnique({
+      where: { eventId_recipient: { eventId, recipient: options.recipient } },
+    });
+    if (delivered) {
+      logger.info({ eventId }, 'Notification already delivered to this recipient; not resending');
+      return;
+    }
+
     let attempt = 0;
-    let lastErrorMsg = '';
+    let lastError: any;
 
     while (attempt < this.maxRetries) {
       attempt++;
       try {
         await this.emailProvider.sendEmail(options);
-
-        // Record successful dispatch
-        await this.prisma.notificationLog.create({
-          data: {
-            recipient: options.recipient,
-            channel: NotificationChannel.EMAIL,
-            subject: options.subject,
-            body: options.body,
-            status: NotificationStatus.SENT,
-            retryCount: attempt - 1,
-            metadata: options.metadata,
-          },
-        });
-        return; // Success!
+        await this.prisma.$transaction([
+          this.prisma.notificationDelivery.create({ data: { eventId, recipient: options.recipient } }),
+          this.prisma.notificationLog.create({
+            data: {
+              recipient: options.recipient,
+              channel: NotificationChannel.EMAIL,
+              subject: options.subject,
+              body: options.body,
+              status: NotificationStatus.SENT,
+              retryCount: attempt - 1,
+              metadata: options.metadata,
+            },
+          }),
+        ]);
+        return;
       } catch (err: any) {
-        lastErrorMsg = err?.message || 'Email delivery failure';
-        logger.warn({ eventId, attempt, maxRetries: this.maxRetries }, `Notification attempt failed: ${lastErrorMsg}`);
-
+        if (err?.code === 'P2002') return; // a concurrent consumer recorded the same delivery
+        lastError = err;
+        logger.warn(
+          { eventId, attempt, maxRetries: this.maxRetries, transient: isTransientError(err) },
+          `Notification attempt failed: ${err?.message || 'Email delivery failure'}`
+        );
         if (attempt < this.maxRetries) {
-          // Exponential backoff delay: 100ms * 2^attempt
           const backoffMs = 100 * Math.pow(2, attempt);
           await new Promise((resolve) => setTimeout(resolve, backoffMs));
         }
       }
     }
 
-    // RETRIES EXHAUSTED: Route to Dead-Letter Log & DLQ Topic
-    logger.error({ eventId }, 'Max notification retries exhausted. Routing to Dead-Letter Queue.');
+    if (isTransientError(lastError)) {
+      // The mail server (not the message) is the problem: let Kafka redeliver later, never dead-letter
+      throw new TransientError(`Email provider unavailable: ${lastError?.message}`);
+    }
+
+    const lastErrorMsg = lastError?.message || 'Email delivery failure';
+    logger.error({ eventId }, 'Permanent notification failure. Routing to Dead-Letter Queue.');
 
     await this.prisma.notificationLog.create({
       data: {
@@ -264,7 +306,8 @@ export class NotificationService {
           originalEventId: eventId,
           originalEventType: eventType,
           failureReason: lastErrorMsg,
-          payload: options,
+          recipient: options.recipient,
+          subject: options.subject,
           failedAt: new Date().toISOString(),
         });
       } catch (dlqErr) {

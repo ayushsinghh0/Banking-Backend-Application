@@ -1,4 +1,3 @@
-import { Consumer } from 'kafkajs';
 import { KafkaService, logger } from '@banksphere/common';
 import { NotificationService } from '../services/notification.service';
 import {
@@ -10,15 +9,13 @@ import {
 } from '../types';
 
 export class KafkaNotificationConsumer {
-  private consumer: Consumer | null = null;
-
   constructor(
     private readonly kafkaService: KafkaService,
     private readonly notificationService: NotificationService,
     private readonly groupId = process.env.KAFKA_CONSUMER_GROUP || 'notification-service-group'
   ) {}
 
-  public async start(): Promise<void> {
+  public start(): void {
     const topics = [
       'user.registered.v1',
       'transaction.completed.v1',
@@ -27,14 +24,13 @@ export class KafkaNotificationConsumer {
       'fraud.alert.created.v1',
     ];
 
-    this.consumer = await this.kafkaService.subscribe(
+    this.kafkaService.subscribe(
       this.groupId,
       topics,
       async (topic: string, payload: any) => {
         if (typeof payload?.eventId !== 'string') {
-          // Poison message: skip (offset is committed) rather than block the partition forever
-          logger.error({ topic }, 'Event without eventId skipped');
-          return;
+          // Poison message: non-transient error -> retried a few times, then dead-lettered
+          throw new Error(`Event without eventId on ${topic}`);
         }
 
         switch (topic) {
@@ -73,10 +69,4 @@ export class KafkaNotificationConsumer {
     );
   }
 
-  public async stop(): Promise<void> {
-    if (this.consumer) {
-      await this.consumer.disconnect();
-      this.consumer = null;
-    }
-  }
 }

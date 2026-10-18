@@ -10,7 +10,7 @@
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "test": "jest --runInBand",
-    "prisma:deploy": "prisma migrate deploy",
+    "prisma:deploy": "node ../../scripts/migrate.mjs",
     "pretest": "prisma generate"
   },
   "dependencies": {

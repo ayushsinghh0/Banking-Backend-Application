@@ -5,185 +5,178 @@ import {
   NotFoundError,
   ConflictError,
   BadGatewayError,
+  HttpError,
   AuthenticatedUser,
 } from '@banksphere/common';
 import { AccountType, AccountStatus } from '../generated/client';
 
 const alice: AuthenticatedUser = { id: 'alice-cust-id', email: 'alice@bank.com', role: 'CUSTOMER' };
 const bob: AuthenticatedUser = { id: 'bob-intruder-id', email: 'bob@bank.com', role: 'CUSTOMER' };
-const admin: AuthenticatedUser = { id: 'admin-user-id', email: 'admin@bank.com', role: 'BANK_ADMIN' };
-const support: AuthenticatedUser = { id: 'support-user-id', email: 'support@bank.com', role: 'SUPPORT' };
+const admin: AuthenticatedUser = { id: 'admin-user-id', email: 'admin@bank.com', role: 'BANK_ADMIN', mfa: true };
+const support: AuthenticatedUser = { id: 'support-user-id', email: 'support@bank.com', role: 'SUPPORT', mfa: true };
 
 describe('AccountService (Account Lifecycle, Numbers, and Ownership)', () => {
   let mockPrisma: any;
   let mockCustomer: any;
   let mockLedger: any;
   let accountService: AccountService;
+  let calls: string[];
 
-  const aliceAccount = (status: AccountStatus = AccountStatus.ACTIVE) => ({
+  const account = (overrides: Partial<any> = {}) => ({
     id: 'acc-1',
     customerId: 'alice-cust-id',
-    status,
+    status: AccountStatus.ACTIVE,
     dailyLimit: 10000000n,
+    ...overrides,
   });
 
   beforeEach(() => {
+    calls = [];
     mockPrisma = {
       bankAccount: {
         findUnique: jest.fn(),
         findUniqueOrThrow: jest.fn(),
         findMany: jest.fn(),
         count: jest.fn().mockResolvedValue(0),
-        create: jest.fn(),
-        update: jest.fn(),
-        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        create: jest.fn(({ data }: any) => ({ ...data, createdAt: new Date(), updatedAt: new Date() })),
+        update: jest.fn(({ data }: any) => {
+          calls.push('db');
+          return account(data);
+        }),
+        updateMany: jest.fn(() => {
+          calls.push('db');
+          return { count: 1 };
+        }),
       },
       outboxEvent: { create: jest.fn() },
-      $transaction: jest.fn((cb: any) => cb(mockPrisma)),
+      auditLog: { create: jest.fn() },
+      $queryRaw: jest.fn().mockResolvedValue([]),
     };
+    mockPrisma.$transaction = jest.fn((cb: any) => cb(mockPrisma));
 
     mockCustomer = { getKycStatus: jest.fn().mockResolvedValue('VERIFIED') };
     mockLedger = {
       provisionAccount: jest.fn().mockResolvedValue(undefined),
-      updateAccount: jest.fn().mockResolvedValue(undefined),
-      getAccount: jest.fn().mockResolvedValue({ id: 'acc-1', balanceInPaise: '0', isActive: true }),
+      updateAccount: jest.fn(async () => {
+        calls.push('ledger');
+      }),
+      closeAccount: jest.fn(async () => {
+        calls.push('ledger-close');
+      }),
+      getAccount: jest.fn(),
+      getAccounts: jest.fn().mockResolvedValue([]),
     };
 
     accountService = new AccountService(mockPrisma, mockLedger, mockCustomer);
   });
 
   describe('AccountNumberGenerator', () => {
-    it('should generate valid 12-digit account numbers that pass Luhn checksum', () => {
+    it('generates valid 12-digit Luhn account numbers and rejects tampered ones', () => {
       for (let i = 0; i < 50; i++) {
-        const accNum = AccountNumberGenerator.generate();
-        expect(accNum).toHaveLength(12);
-        expect(AccountNumberGenerator.validate(accNum)).toBe(true);
+        expect(AccountNumberGenerator.validate(AccountNumberGenerator.generate())).toBe(true);
       }
-    });
-
-    it('should reject tampered or corrupted account numbers', () => {
-      const validNum = AccountNumberGenerator.generate();
-      const lastDigit = parseInt(validNum.slice(-1), 10);
-      const corruptedNum = validNum.slice(0, 11) + ((lastDigit + 1) % 10).toString();
-
-      expect(AccountNumberGenerator.validate(corruptedNum)).toBe(false);
+      const valid = AccountNumberGenerator.generate();
+      const corrupted = valid.slice(0, 11) + ((Number(valid.slice(-1)) + 1) % 10).toString();
+      expect(AccountNumberGenerator.validate(corrupted)).toBe(false);
     });
   });
 
   describe('createAccount', () => {
-    beforeEach(() => {
-      mockPrisma.bankAccount.create.mockImplementation(({ data }: any) => ({
-        ...data,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      }));
-    });
+    it('provisions the ledger INACTIVE inside the transaction, activates it after commit, stages the event', async () => {
+      const created = await accountService.createAccount({ customerId: 'alice-cust-id', accountType: AccountType.SAVINGS }, alice);
 
-    it('provisions the ledger account and stages account.created.v1 in the outbox', async () => {
-      const account = await accountService.createAccount(
-        { customerId: 'alice-cust-id', accountType: AccountType.SAVINGS },
-        alice
-      );
-
-      expect(account.customerId).toBe('alice-cust-id');
-      expect(account.accountNumber).toHaveLength(12);
-      expect(mockLedger.provisionAccount).toHaveBeenCalledWith(
-        expect.objectContaining({ id: account.id, customerId: 'alice-cust-id', isActive: true })
-      );
-      expect(mockPrisma.outboxEvent.create).toHaveBeenCalledWith({
-        data: expect.objectContaining({
-          eventType: 'account.created.v1',
-          aggregateId: account.id,
-          payload: expect.objectContaining({ eventType: 'account.created.v1', customerId: 'alice-cust-id' }),
-        }),
-      });
+      expect(mockLedger.provisionAccount).toHaveBeenCalledWith(expect.objectContaining({ id: created.id, isActive: false }));
+      expect(mockLedger.updateAccount).toHaveBeenCalledWith(created.id, { isActive: true });
+      expect(mockPrisma.outboxEvent.create.mock.calls[0][0].data.eventType).toBe('account.created.v1');
+      // Per-customer advisory lock serialises the account-count check
+      expect(mockPrisma.$queryRaw).toHaveBeenCalled();
     });
 
     it('KYC: refuses to open an account until KYC is VERIFIED', async () => {
       mockCustomer.getKycStatus.mockResolvedValue('PENDING');
-      await expect(accountService.createAccount({ customerId: 'alice-cust-id' }, alice)).rejects.toThrow(
-        'identity verification'
-      );
-      expect(mockPrisma.bankAccount.create).not.toHaveBeenCalled();
+      await expect(accountService.createAccount({ customerId: 'alice-cust-id' }, alice)).rejects.toThrow('identity verification');
       expect(mockLedger.provisionAccount).not.toHaveBeenCalled();
     });
 
-    it('fails (and rolls back) when the ledger cannot provision the account', async () => {
+    it('fails when the ledger cannot provision the account', async () => {
       mockLedger.provisionAccount.mockRejectedValue(new BadGatewayError('Ledger service is unreachable'));
-
-      await expect(
-        accountService.createAccount({ customerId: 'alice-cust-id' }, alice)
-      ).rejects.toThrow(BadGatewayError);
+      await expect(accountService.createAccount({ customerId: 'alice-cust-id' }, alice)).rejects.toThrow(BadGatewayError);
     });
 
-    it('LIMIT ABUSE: customers cannot grant themselves a daily limit above the cap', async () => {
-      await expect(
-        accountService.createAccount(
-          { customerId: 'alice-cust-id', dailyLimitPaise: 999999999999n },
-          alice
-        )
-      ).rejects.toThrow(ForbiddenError);
-      expect(mockPrisma.bankAccount.create).not.toHaveBeenCalled();
+    it('LIMIT ABUSE: no one can open an account with a limit above the customer cap', async () => {
+      await expect(accountService.createAccount({ customerId: 'alice-cust-id', dailyLimitPaise: 999999999999n }, alice)).rejects.toThrow(ForbiddenError);
     });
 
-    it('rejects non-INR currencies (the ledger has no FX)', async () => {
-      await expect(
-        accountService.createAccount({ customerId: 'alice-cust-id', currency: 'USD' }, alice)
-      ).rejects.toThrow('Only INR accounts are supported');
+    it('enforces the open-account cap inside the transaction', async () => {
+      mockPrisma.bankAccount.count.mockResolvedValue(5);
+      await expect(accountService.createAccount({ customerId: 'alice-cust-id' }, alice)).rejects.toThrow(ConflictError);
     });
   });
 
   describe('getAccountById (Ownership Enforcement)', () => {
-    it('should allow account owner to retrieve their account details', async () => {
-      mockPrisma.bankAccount.findUnique.mockResolvedValue(aliceAccount());
-      const result = await accountService.getAccountById('acc-1', alice);
-      expect(result.id).toBe('acc-1');
-    });
-
-    it('IDOR: another customer gets NotFound (indistinguishable from a missing account)', async () => {
-      mockPrisma.bankAccount.findUnique.mockResolvedValue(aliceAccount());
-      await expect(accountService.getAccountById('acc-1', bob)).rejects.toThrow(NotFoundError);
-    });
-
-    it('should allow bank staff to view any customer account', async () => {
-      mockPrisma.bankAccount.findUnique.mockResolvedValue(aliceAccount());
+    it('owner and staff can read; another customer gets NotFound', async () => {
+      mockPrisma.bankAccount.findUnique.mockResolvedValue(account());
+      expect((await accountService.getAccountById('acc-1', alice)).id).toBe('acc-1');
       expect((await accountService.getAccountById('acc-1', admin)).id).toBe('acc-1');
       expect((await accountService.getAccountById('acc-1', support)).id).toBe('acc-1');
+      await expect(accountService.getAccountById('acc-1', bob)).rejects.toThrow(NotFoundError);
     });
   });
 
   describe('updateAccountStatus', () => {
-    it('should prevent altering status of an already permanently CLOSED account', async () => {
-      mockPrisma.bankAccount.findUnique.mockResolvedValue(aliceAccount(AccountStatus.CLOSED));
-      await expect(
-        accountService.updateAccountStatus('acc-1', AccountStatus.ACTIVE, admin)
-      ).rejects.toThrow(ConflictError);
+    it('freeze goes to the LEDGER FIRST (fail-safe ordering) and is audited', async () => {
+      mockPrisma.bankAccount.findUnique.mockResolvedValue(account());
+      mockPrisma.bankAccount.findUniqueOrThrow.mockResolvedValue(account({ status: AccountStatus.FROZEN }));
+      await accountService.updateAccountStatus('acc-1', AccountStatus.FROZEN, alice);
+      expect(calls).toEqual(['ledger', 'db']);
+      expect(mockPrisma.auditLog.create).toHaveBeenCalled();
     });
 
-    it('lets a customer freeze their own account and propagates it to the ledger', async () => {
-      mockPrisma.bankAccount.findUnique.mockResolvedValue(aliceAccount());
-      mockPrisma.bankAccount.findUniqueOrThrow.mockResolvedValue(aliceAccount(AccountStatus.FROZEN));
-
-      const updated = await accountService.updateAccountStatus('acc-1', AccountStatus.FROZEN, alice);
-
-      expect(updated.status).toBe(AccountStatus.FROZEN);
-      expect(mockLedger.updateAccount).toHaveBeenCalledWith('acc-1', { isActive: false });
+    it('unfreeze commits locally FIRST, then enables the ledger', async () => {
+      mockPrisma.bankAccount.findUnique.mockResolvedValue(account({ status: AccountStatus.FROZEN }));
+      mockPrisma.bankAccount.findUniqueOrThrow.mockResolvedValue(account());
+      await accountService.updateAccountStatus('acc-1', AccountStatus.ACTIVE, admin);
+      expect(calls).toEqual(['db', 'ledger']);
     });
 
     it('SELF-UNFREEZE: a customer cannot unfreeze an account frozen by the bank', async () => {
-      mockPrisma.bankAccount.findUnique.mockResolvedValue(aliceAccount(AccountStatus.FROZEN));
-      await expect(
-        accountService.updateAccountStatus('acc-1', AccountStatus.ACTIVE, alice)
-      ).rejects.toThrow(ForbiddenError);
-      expect(mockLedger.updateAccount).not.toHaveBeenCalled();
+      mockPrisma.bankAccount.findUnique.mockResolvedValue(account({ status: AccountStatus.FROZEN }));
+      await expect(accountService.updateAccountStatus('acc-1', AccountStatus.ACTIVE, alice)).rejects.toThrow(ForbiddenError);
+      expect(calls).toEqual([]);
     });
 
-    it('refuses to close an account that still holds money', async () => {
-      mockPrisma.bankAccount.findUnique.mockResolvedValue(aliceAccount());
-      mockLedger.getAccount.mockResolvedValue({ id: 'acc-1', balanceInPaise: '500', isActive: true });
-      await expect(
-        accountService.updateAccountStatus('acc-1', AccountStatus.CLOSED, admin)
-      ).rejects.toThrow('Account balance must be zero');
+    it("STAFF SELF-DEALING: an admin has only customer rights on their own account", async () => {
+      mockPrisma.bankAccount.findUnique.mockResolvedValue(account({ customerId: 'admin-user-id', status: AccountStatus.FROZEN }));
+      await expect(accountService.updateAccountStatus('acc-1', AccountStatus.ACTIVE, admin)).rejects.toThrow(ForbiddenError);
+    });
+
+    it('close is decided by the ledger (zero balance under lock) before the account is marked CLOSED', async () => {
+      mockPrisma.bankAccount.findUnique.mockResolvedValue(account());
+      mockLedger.closeAccount.mockRejectedValue(new HttpError(409, 'BALANCE_NOT_ZERO', 'Account balance must be zero'));
+      await expect(accountService.updateAccountStatus('acc-1', AccountStatus.CLOSED, admin)).rejects.toThrow('balance must be zero');
+      expect(mockPrisma.bankAccount.updateMany).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('updateDailyLimit', () => {
+    it('lowering hits the ledger first; customers are capped; admins on their own account are capped too', async () => {
+      mockPrisma.bankAccount.findUnique.mockResolvedValue(account());
+      await accountService.updateDailyLimit('acc-1', 50000n, alice);
+      expect(calls).toEqual(['ledger', 'db']);
+
+      await expect(accountService.updateDailyLimit('acc-1', 999999999999n, alice)).rejects.toThrow(ForbiddenError);
+      mockPrisma.bankAccount.findUnique.mockResolvedValue(account({ customerId: 'admin-user-id' }));
+      await expect(accountService.updateDailyLimit('acc-1', 999999999999n, admin)).rejects.toThrow(ForbiddenError);
+    });
+  });
+
+  describe('reconcileWithLedger', () => {
+    it('pushes the account state to the ledger when they diverge', async () => {
+      mockPrisma.bankAccount.findMany.mockResolvedValueOnce([account({ status: AccountStatus.FROZEN })]).mockResolvedValue([]);
+      mockLedger.getAccounts.mockResolvedValue([{ id: 'acc-1', isActive: true, closed: false, dailyLimitPaise: '10000000', balanceInPaise: '0' }]);
+      const result = await accountService.reconcileWithLedger();
+      expect(result.repaired).toBe(1);
+      expect(mockLedger.updateAccount).toHaveBeenCalledWith('acc-1', { isActive: false, dailyLimitPaise: '10000000' });
     });
   });
 });

@@ -27,6 +27,7 @@ const updateSchema = z
   .strict();
 
 const idParams = z.object({ accountId: z.string().uuid() });
+const snapshotsSchema = z.object({ ids: z.array(z.string().uuid()).min(1).max(500) }).strict();
 
 /**
  * Service-to-service API used by account-service to keep the ledger in sync with account lifecycle.
@@ -34,13 +35,32 @@ const idParams = z.object({ accountId: z.string().uuid() });
  */
 export function createInternalRouter(ledgerService: LedgerService): Router {
   const router = Router();
-  router.use(requireInternalService);
+  router.use(requireInternalService('LEDGER_INTERNAL_TOKEN'));
 
   router.post('/ledger-accounts', async (req: Request, res: Response, next: NextFunction) => {
     try {
       const dto = provisionSchema.parse(req.body);
       await ledgerService.provisionAccount(dto);
       res.status(201).json({ success: true, data: await ledgerService.getAccountSnapshot(dto.id) });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  router.post('/ledger-accounts/snapshots', async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { ids } = snapshotsSchema.parse(req.body);
+      res.json({ success: true, data: await ledgerService.getAccountSnapshots(ids) });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  router.post('/ledger-accounts/:accountId/close', async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { accountId } = idParams.parse(req.params);
+      await ledgerService.closeAccount(accountId);
+      res.json({ success: true, data: await ledgerService.getAccountSnapshot(accountId) });
     } catch (error) {
       next(error);
     }

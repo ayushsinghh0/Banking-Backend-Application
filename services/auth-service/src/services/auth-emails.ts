@@ -56,3 +56,16 @@ export function passwordChangedEmail(to: string, when: Date): MailMessage {
   });
   return { to, subject: 'Your BankSphere password was changed', ...body };
 }
+
+export function mfaChangedEmail(to: string, enabled: boolean): MailMessage {
+  const body = renderEmail({
+    paragraphs: [
+      enabled
+        ? 'Two-factor authentication was turned on for your BankSphere account. You will be asked for a code from your authenticator app when you sign in.'
+        : 'Two-factor authentication was turned off for your BankSphere account.',
+      'For your security, you have been signed out of all devices.',
+    ],
+    footer: 'If you did not make this change, contact BankSphere support immediately to secure your account.',
+  });
+  return { to, subject: `Two-factor authentication ${enabled ? 'enabled' : 'disabled'} on your BankSphere account`, ...body };
+}

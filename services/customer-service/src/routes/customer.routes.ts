@@ -17,6 +17,7 @@ export function createCustomerRouter(controller: CustomerController, authenticat
   // Staff endpoints: profile lookup and KYC review
   router.get('/:userId', requireRoles('BANK_ADMIN', 'SUPPORT'), controller.getByUserId);
   router.patch('/:userId/kyc', requireRoles('BANK_ADMIN'), controller.updateKycStatus);
+  router.get('/:userId/kyc/history', requireRoles('BANK_ADMIN', 'SUPPORT'), controller.getKycHistory);
 
   return router;
 }
@@ -28,7 +29,7 @@ const userIdParams = z.object({ userId: z.string().uuid() });
  */
 export function createInternalCustomerRouter(customerService: CustomerService): Router {
   const router = Router();
-  router.use(requireInternalService);
+  router.use(requireInternalService('CUSTOMER_INTERNAL_TOKEN'));
 
   router.get('/customers/:userId/kyc', async (req: Request, res: Response, next: NextFunction) => {
     try {

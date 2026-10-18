@@ -7,11 +7,15 @@ export function createTransactionRouter(controller: TransactionController, authe
 
   router.use(authenticate);
 
-  // Financial write endpoints requiring Idempotency-Key
-  router.post('/transfer', controller.transfer);
-  router.post('/withdraw', controller.withdraw);
-  // Deposits create money in the ledger: teller (BANK_ADMIN) only
+  // Customer money movement (owner of the source account only); requires Idempotency-Key
+  router.post('/transfer', requireRoles('CUSTOMER'), controller.transfer);
+
+  // Teller cash operations: BANK_ADMIN only, never on their own accounts, maker-checker above limits
   router.post('/deposit', requireRoles('BANK_ADMIN'), controller.deposit);
+  router.post('/withdraw', requireRoles('BANK_ADMIN'), controller.withdraw);
+  router.get('/cash-operations', requireRoles('BANK_ADMIN', 'SUPPORT'), controller.listCashOperations);
+  router.post('/cash-operations/:cashOperationId/approve', requireRoles('BANK_ADMIN'), controller.approveCashOperation);
+  router.post('/cash-operations/:cashOperationId/reject', requireRoles('BANK_ADMIN'), controller.rejectCashOperation);
 
   // Read-only ledger queries (owner or staff)
   router.get('/accounts/:accountId/balance', controller.getBalance);

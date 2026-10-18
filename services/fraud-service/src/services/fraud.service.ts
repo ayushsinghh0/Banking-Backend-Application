@@ -1,6 +1,6 @@
 import crypto from 'crypto';
-import { NotFoundError, logger } from '@banksphere/common';
-import { PrismaClient, RiskLevel, AlertStatus, FraudAlert } from '../../generated/client';
+import { AuthenticatedUser, NotFoundError, logger } from '@banksphere/common';
+import { PrismaClient, RiskLevel, AlertStatus, FraudAlert, Prisma } from '../../generated/client';
 import { IRiskRule } from '../rules/risk-rule.interface';
 import { AmountThresholdRule } from '../rules/amount-threshold.rule';
 import { VelocityRule } from '../rules/velocity.rule';
@@ -10,16 +10,11 @@ import {
   RiskEvaluationSummary,
 } from '../types';
 
-export interface KafkaAlertPublisher {
-  publish(topic: string, key: string, payload: any): Promise<void>;
-}
-
 export class FraudService {
   private readonly rules: IRiskRule[];
 
   constructor(
     private readonly prisma: PrismaClient,
-    private readonly alertPublisher?: KafkaAlertPublisher,
     rules?: IRiskRule[]
   ) {
     this.rules = rules || [
@@ -32,26 +27,60 @@ export class FraudService {
     ];
   }
 
-  /**
-   * Evaluates if a Kafka event was already processed to guarantee consumer idempotency
-   */
-  public async isEventProcessed(eventId: string): Promise<boolean> {
-    const existing = await this.prisma.processedEvent.findUnique({
-      where: { eventId },
-    });
-    return !!existing;
+  public static scoreToRiskLevel(riskScore: number): RiskLevel {
+    if (riskScore >= 80) return RiskLevel.CRITICAL;
+    if (riskScore >= 40) return RiskLevel.HIGH;
+    if (riskScore >= 20) return RiskLevel.MEDIUM;
+    return RiskLevel.LOW;
+  }
+
+  /** Dedupe key: one assessment per (event, account, direction) */
+  private static processedKey(eventId: string, context: TransactionEvaluationContext): string {
+    return `${eventId}:${context.accountId}:${context.direction}`;
+  }
+
+  public async isEventProcessed(key: string): Promise<boolean> {
+    return Boolean(await this.prisma.processedEvent.findUnique({ where: { eventId: key } }));
+  }
+
+  private async score(context: TransactionEvaluationContext) {
+    const triggeredRules: RiskRuleResult[] = [];
+    let totalScore = 0;
+    for (const rule of this.rules) {
+      const result = await rule.evaluate(context);
+      if (result.triggered) {
+        triggeredRules.push(result);
+        totalScore += result.scoreContribution;
+      }
+    }
+    const riskScore = Math.min(100, totalScore);
+    return { triggeredRules, riskScore, riskLevel: FraudService.scoreToRiskLevel(riskScore) };
   }
 
   /**
-   * Evaluates transaction risk across all configured rules.
-   * The processed-event marker, assessment and alert are written in one DB transaction, and the
-   * marker insert is unique on eventId, so a redelivered or concurrently consumed Kafka message
-   * can never produce a second assessment or alert.
+   * Scores a transaction without recording anything (staff "what if" tool). It cannot create
+   * assessments, so it can't be used to skew velocity counts or inject alerts.
    */
-  public async evaluateTransaction(
-    context: TransactionEvaluationContext,
-    eventId?: string
-  ): Promise<RiskEvaluationSummary> {
+  public async previewTransaction(context: TransactionEvaluationContext): Promise<RiskEvaluationSummary> {
+    const { triggeredRules, riskScore, riskLevel } = await this.score(context);
+    return {
+      transactionId: context.transactionId,
+      accountId: context.accountId,
+      riskScore,
+      riskLevel,
+      triggeredRules,
+      alertCreated: false,
+    };
+  }
+
+  /**
+   * Evaluates one side of a completed transaction from Kafka. The processed-event marker, the
+   * assessment, the alert and its fraud.alert.created.v1 outbox event are written in ONE transaction,
+   * and the marker is unique, so a redelivered or concurrently consumed message can never produce a
+   * second assessment or alert, and an alert's notification can never be lost.
+   */
+  public async evaluateTransaction(context: TransactionEvaluationContext, eventId: string): Promise<RiskEvaluationSummary> {
+    const key = FraudService.processedKey(eventId, context);
     const duplicate: RiskEvaluationSummary = {
       transactionId: context.transactionId,
       accountId: context.accountId,
@@ -61,38 +90,19 @@ export class FraudService {
       alertCreated: false,
     };
 
-    // 1. Consumer Idempotency fast-path
-    if (eventId && (await this.isEventProcessed(eventId))) {
-      logger.info({ eventId }, 'Duplicate fraud evaluation event skipped');
+    if (await this.isEventProcessed(key)) {
+      logger.info({ eventId, accountId: context.accountId }, 'Duplicate fraud evaluation event skipped');
       return duplicate;
     }
 
-    const triggeredRules: RiskRuleResult[] = [];
-    let totalScore = 0;
-
-    // 2. Evaluate each rule in sequence
-    for (const rule of this.rules) {
-      const result = await rule.evaluate(context);
-      if (result.triggered) {
-        triggeredRules.push(result);
-        totalScore += result.scoreContribution;
-      }
-    }
-
-    const riskScore = Math.min(100, totalScore);
-    const riskLevel = FraudService.scoreToRiskLevel(riskScore);
+    const { triggeredRules, riskScore, riskLevel } = await this.score(context);
     const shouldAlert = riskLevel === RiskLevel.HIGH || riskLevel === RiskLevel.CRITICAL;
 
     let alert: FraudAlert | null = null;
     try {
       alert = await this.prisma.$transaction(async (tx) => {
-        if (eventId) {
-          await tx.processedEvent.create({
-            data: { eventId, eventType: 'transaction.completed.v1' },
-          });
-        }
+        await tx.processedEvent.create({ data: { eventId: key, eventType: 'transaction.completed.v1' } });
 
-        // 3. Record Risk Assessment
         await tx.riskAssessment.create({
           data: {
             transactionId: context.transactionId,
@@ -100,23 +110,41 @@ export class FraudService {
             amountInPaise: context.amountInPaise,
             riskScore,
             riskLevel,
-            triggeredRules: triggeredRules as any,
+            direction: context.direction,
+            triggeredRules: triggeredRules as unknown as Prisma.InputJsonValue,
             assessedAt: context.timestamp,
           },
         });
 
-        // 4. Raise FraudAlert for High or Critical risk
         if (!shouldAlert) return null;
         const reasons = triggeredRules.map((r) => r.reason).join(' | ');
-        return tx.fraudAlert.create({
+        const created = await tx.fraudAlert.create({
           data: {
             transactionId: context.transactionId,
             accountId: context.accountId,
             severity: riskLevel,
-            reason: reasons || 'Multiple risk anomalies detected',
+            reason: `[${context.direction}] ${reasons || 'Multiple risk anomalies detected'}`,
             status: AlertStatus.OPEN,
           },
         });
+        await tx.outboxEvent.create({
+          data: {
+            aggregateType: 'FRAUD_ALERT',
+            aggregateId: created.id,
+            eventType: 'fraud.alert.created.v1',
+            payload: {
+              eventId: crypto.randomUUID(),
+              eventType: 'fraud.alert.created.v1',
+              timestamp: new Date().toISOString(),
+              alertId: created.id,
+              transactionId: created.transactionId,
+              accountId: created.accountId,
+              severity: created.severity,
+              reason: created.reason,
+            },
+          },
+        });
+        return created;
       });
     } catch (err: any) {
       if (err?.code === 'P2002') {
@@ -124,26 +152,6 @@ export class FraudService {
         return duplicate;
       }
       throw err;
-    }
-
-    // 5. Publish fraud.alert.created.v1 for Notification & Audit (after commit)
-    if (alert && this.alertPublisher) {
-      const alertEvent = {
-        eventId: crypto.randomUUID(),
-        eventType: 'fraud.alert.created.v1',
-        timestamp: new Date().toISOString(),
-        alertId: alert.id,
-        transactionId: alert.transactionId,
-        accountId: alert.accountId,
-        severity: alert.severity,
-        reason: alert.reason,
-      };
-
-      try {
-        await this.alertPublisher.publish('fraud.alert.created.v1', alert.accountId, alertEvent);
-      } catch (err) {
-        logger.error({ err, alertId: alert.id }, 'Failed to emit fraud.alert.created.v1 to Kafka');
-      }
     }
 
     return {
@@ -157,26 +165,32 @@ export class FraudService {
     };
   }
 
-  public static scoreToRiskLevel(riskScore: number): RiskLevel {
-    if (riskScore >= 80) return RiskLevel.CRITICAL;
-    if (riskScore >= 40) return RiskLevel.HIGH;
-    if (riskScore >= 20) return RiskLevel.MEDIUM;
-    return RiskLevel.LOW;
-  }
-
   /**
-   * Analyst triage of an alert
+   * Analyst triage of an alert; every change is attributed and kept in fraud_alert_events
    */
-  public async updateAlertStatus(alertId: string, status: AlertStatus) {
-    const existing = await this.prisma.fraudAlert.findUnique({ where: { id: alertId } });
-    if (!existing) {
-      throw new NotFoundError('Fraud alert not found');
-    }
-    return this.prisma.fraudAlert.update({ where: { id: alertId }, data: { status } });
+  public async updateAlertStatus(actor: AuthenticatedUser, alertId: string, status: AlertStatus, note?: string) {
+    return this.prisma.$transaction(async (tx) => {
+      const existing = await tx.fraudAlert.findUnique({ where: { id: alertId } });
+      if (!existing) {
+        throw new NotFoundError('Fraud alert not found');
+      }
+      const updated = await tx.fraudAlert.update({
+        where: { id: alertId },
+        data: { status, reviewedBy: actor.id },
+      });
+      await tx.fraudAlertEvent.create({
+        data: { alertId, actorId: actor.id, fromStatus: existing.status, toStatus: status, note },
+      });
+      return updated;
+    });
+  }
+
+  public async getAlertHistory(alertId: string) {
+    return this.prisma.fraudAlertEvent.findMany({ where: { alertId }, orderBy: { createdAt: 'asc' } });
   }
 
   /**
-   * Retrieves active open fraud alerts for compliance officers
+   * Retrieves fraud alerts for compliance officers
    */
   public async getAlerts(status?: AlertStatus, limit = 20, offset = 0) {
     return this.prisma.fraudAlert.findMany({

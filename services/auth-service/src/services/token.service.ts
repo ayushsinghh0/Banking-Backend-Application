@@ -6,6 +6,7 @@ export interface TokenPayload {
   email: string;
   role: string;
   tokenVersion: number;
+  mfa: boolean;
 }
 
 export interface GeneratedTokens {
@@ -46,6 +47,7 @@ export class TokenService {
         email: payload.email,
         role: payload.role as UserRole,
         tokenVersion: payload.tokenVersion,
+        mfa: payload.mfa,
       },
       this.accessExpiration
     );

@@ -11,7 +11,7 @@
     "prisma:migrate": "prisma migrate dev",
     "test": "jest --runInBand",
     "create-admin": "node dist/scripts/create-admin.js",
-    "prisma:deploy": "prisma migrate deploy",
+    "prisma:deploy": "node ../../scripts/migrate.mjs",
     "pretest": "prisma generate"
   },
   "dependencies": {

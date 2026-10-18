@@ -1,51 +1,45 @@
-import { Consumer } from 'kafkajs';
 import { KafkaService, logger } from '@banksphere/common';
 import { FraudService } from '../services/fraud.service';
+import { TransactionEvaluationContext } from '../types';
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export class KafkaFraudConsumer {
-  private consumer: Consumer | null = null;
-
   constructor(
     private readonly kafkaService: KafkaService,
     private readonly fraudService: FraudService,
     private readonly groupId = process.env.KAFKA_CONSUMER_GROUP || 'fraud-service-group'
   ) {}
 
-  public async start(): Promise<void> {
-    this.consumer = await this.kafkaService.subscribe(
-      this.groupId,
-      ['transaction.completed.v1'],
-      async (_topic: string, payload: any) => {
-        const accountId = payload?.sourceAccountId || payload?.destinationAccountId;
-        if (
-          typeof payload?.eventId !== 'string' ||
-          typeof payload?.transactionId !== 'string' ||
-          typeof accountId !== 'string' ||
-          !/^\d{1,18}$/.test(String(payload?.amountInPaise))
-        ) {
-          // Poison message: skip (offset is committed) rather than block the partition forever
-          logger.error({ eventId: payload?.eventId }, 'Malformed transaction.completed.v1 event skipped');
-          return;
-        }
-        const amountInPaise = BigInt(payload.amountInPaise);
-
-        await this.fraudService.evaluateTransaction(
-          {
-            transactionId: payload.transactionId,
-            accountId,
-            amountInPaise,
-            timestamp: new Date(payload.timestamp || Date.now()),
-          },
-          payload.eventId
-        );
+  /**
+   * Scores both sides of every completed transaction: the account money left (OUTBOUND) and the
+   * account it arrived in (INBOUND), so mule accounts receiving bursts of funds are flagged too.
+   */
+  public start(): void {
+    this.kafkaService.subscribe(this.groupId, ['transaction.completed.v1'], async (_topic: string, payload: any) => {
+      const valid =
+        typeof payload?.eventId === 'string' &&
+        UUID.test(String(payload?.transactionId)) &&
+        /^\d{1,18}$/.test(String(payload?.amountInPaise)) &&
+        (UUID.test(String(payload?.sourceAccountId)) || UUID.test(String(payload?.destinationAccountId)));
+      if (!valid) {
+        // A malformed event will never succeed: throw a non-transient error so it ends in the DLQ
+        logger.error({ eventId: payload?.eventId }, 'Malformed transaction.completed.v1 event');
+        throw new Error('Malformed transaction.completed.v1 event');
       }
-    );
-  }
 
-  public async stop(): Promise<void> {
-    if (this.consumer) {
-      await this.consumer.disconnect();
-      this.consumer = null;
-    }
+      const base = {
+        transactionId: payload.transactionId as string,
+        amountInPaise: BigInt(payload.amountInPaise),
+        timestamp: new Date(payload.timestamp || Date.now()),
+      };
+      const sides: TransactionEvaluationContext[] = [];
+      if (payload.sourceAccountId) sides.push({ ...base, accountId: payload.sourceAccountId, direction: 'OUTBOUND' });
+      if (payload.destinationAccountId) sides.push({ ...base, accountId: payload.destinationAccountId, direction: 'INBOUND' });
+
+      for (const context of sides) {
+        await this.fraudService.evaluateTransaction(context, payload.eventId);
+      }
+    });
   }
 }

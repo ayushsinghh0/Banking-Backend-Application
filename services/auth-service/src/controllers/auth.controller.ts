@@ -1,6 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
-import { getAuthenticatedUser, readBearerToken, verifyAccessToken } from '@banksphere/common';
+import { clientIpKey, getAuthenticatedUser, readBearerToken, verifyAccessToken } from '@banksphere/common';
 import { AuthService } from '../services/auth.service';
 
 const emailSchema = z
@@ -18,9 +18,8 @@ export const passwordSchema = z
   .regex(/[a-z]/, { message: 'Password must contain at least one lowercase letter' })
   .regex(/[0-9]/, { message: 'Password must contain at least one number' });
 
-const oneTimeTokenSchema = z
-  .string()
-  .regex(/^[A-Za-z0-9_-]{20,128}$/, { message: 'Invalid token' });
+const oneTimeTokenSchema = z.string().regex(/^[A-Za-z0-9_-]{20,128}$/, { message: 'Invalid token' });
+const totpCodeSchema = z.string().regex(/^\d{6}$/, { message: 'Code must be 6 digits' });
 
 // .strict() rejects unknown keys, so a client sending { role: 'BANK_ADMIN' } gets a 400
 const registerSchema = z.object({ email: emailSchema, password: passwordSchema }).strict();
@@ -37,6 +36,9 @@ const loginSchema = z.object({
   email: z.string().trim().max(254),
   password: z.string().min(1).max(128),
 });
+const mfaLoginSchema = z.object({ challengeToken: oneTimeTokenSchema, code: totpCodeSchema }).strict();
+const mfaCodeSchema = z.object({ code: totpCodeSchema }).strict();
+const mfaDisableSchema = z.object({ password: z.string().min(1).max(128), code: totpCodeSchema }).strict();
 
 const refreshSchema = z.object({
   refreshToken: z.string().min(1, { message: 'refreshToken is required' }).max(256),
@@ -81,7 +83,13 @@ export class AuthController {
 
   public login = wrap(async (req, res) => {
     const validated = loginSchema.parse(req.body);
-    const result = await this.authService.login(validated);
+    const result = await this.authService.login(validated, { network: clientIpKey(req.ip) });
+    res.status(200).json({ success: true, data: result });
+  });
+
+  public loginMfa = wrap(async (req, res) => {
+    const { challengeToken, code } = mfaLoginSchema.parse(req.body);
+    const result = await this.authService.completeMfaLogin(challengeToken, code);
     res.status(200).json({ success: true, data: result });
   });
 
@@ -105,6 +113,23 @@ export class AuthController {
     }
     await this.authService.logout(validated.refreshToken, accessToken);
     res.status(200).json({ success: true, message: 'Successfully logged out and session revoked' });
+  });
+
+  public mfaSetup = wrap(async (req, res) => {
+    const result = await this.authService.beginMfaSetup(getAuthenticatedUser(req));
+    res.status(200).json({ success: true, data: result });
+  });
+
+  public mfaEnable = wrap(async (req, res) => {
+    const { code } = mfaCodeSchema.parse(req.body);
+    const tokens = await this.authService.enableMfa(getAuthenticatedUser(req), code);
+    res.status(200).json({ success: true, data: { tokens } });
+  });
+
+  public mfaDisable = wrap(async (req, res) => {
+    const { password, code } = mfaDisableSchema.parse(req.body);
+    await this.authService.disableMfa(getAuthenticatedUser(req), password, code);
+    res.status(200).json({ success: true, message: 'Two-factor authentication disabled; please sign in again.' });
   });
 
   public forgotPassword = wrap(async (req, res) => {
@@ -134,14 +159,20 @@ export class AuthController {
 
   public createStaffUser = wrap(async (req, res) => {
     const validated = createStaffSchema.parse(req.body);
-    const user = await this.authService.createStaffUser(validated);
+    const user = await this.authService.createStaffUser(validated, getAuthenticatedUser(req).id);
     res.status(201).json({ success: true, data: user });
   });
 
   public setUserStatus = wrap(async (req, res) => {
     const { userId } = userIdParamsSchema.parse(req.params);
     const { isActive } = userStatusSchema.parse(req.body);
-    const user = await this.authService.setUserActive(userId, isActive);
+    const user = await this.authService.setUserActive(getAuthenticatedUser(req), userId, isActive);
     res.status(200).json({ success: true, data: user });
+  });
+
+  public resetUserMfa = wrap(async (req, res) => {
+    const { userId } = userIdParamsSchema.parse(req.params);
+    await this.authService.adminResetMfa(getAuthenticatedUser(req), userId);
+    res.status(200).json({ success: true, message: 'MFA reset; the user must re-enrol at next sign-in.' });
   });
 }

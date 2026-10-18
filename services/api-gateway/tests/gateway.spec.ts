@@ -66,6 +66,18 @@ describe('API Gateway', () => {
     expect(headers['x-correlation-id']).toBeDefined();
   });
 
+  it('IP SPOOFING: a client-supplied X-Forwarded-For is replaced by the real client address', async () => {
+    await request(gateway())
+      .get('/api/v1/transactions/accounts/x/balance')
+      .set('x-forwarded-for', '6.6.6.6')
+      .set('forwarded', 'for=6.6.6.6')
+      .set('x-real-ip', '6.6.6.6');
+    const headers = seen[0].headers;
+    expect(headers['x-forwarded-for']).not.toContain('6.6.6.6');
+    expect(headers['forwarded']).toBeUndefined();
+    expect(headers['x-real-ip']).toBeUndefined();
+  });
+
   it('only allows configured CORS origins', async () => {
     const allowed = await request(gateway())
       .options('/api/v1/transactions/transfer')

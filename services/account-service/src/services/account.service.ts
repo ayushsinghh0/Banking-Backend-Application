@@ -8,6 +8,7 @@ import {
   AuthenticatedUser,
   HttpError,
   isStaff,
+  logger,
 } from '@banksphere/common';
 import { AccountNumberGenerator } from '../utils/account-number.generator';
 import { LedgerClient } from '../clients/ledger.client';
@@ -38,7 +39,8 @@ export class AccountService {
    */
   public async createAccount(dto: CreateAccountDTO, actor: AuthenticatedUser): Promise<BankAccount> {
     const dailyLimit = dto.dailyLimitPaise ?? DEFAULT_DAILY_LIMIT_PAISE;
-    this.assertDailyLimitAllowed(dailyLimit, actor);
+    // Accounts are always opened by their owner, so the customer cap applies
+    this.assertDailyLimitAllowed(dailyLimit, false);
 
     const currency = dto.currency || 'INR';
     if (currency !== 'INR') {
@@ -56,19 +58,21 @@ export class AccountService {
       );
     }
 
-    const existingCount = await this.prisma.bankAccount.count({
-      where: { customerId: dto.customerId, status: { not: AccountStatus.CLOSED } },
-    });
-    if (existingCount >= MAX_ACCOUNTS_PER_CUSTOMER) {
-      throw new ConflictError(`A customer may hold at most ${MAX_ACCOUNTS_PER_CUSTOMER} open accounts`);
-    }
-
     let account: BankAccount | null = null;
     for (let attempt = 0; attempt < 5 && !account; attempt++) {
       const accountNumber = AccountNumberGenerator.generate();
       try {
         account = await this.prisma.$transaction(
           async (tx) => {
+            // Serialise account opening per customer so concurrent requests can't exceed the cap
+            await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${'open-account:' + dto.customerId}, 0))::text`;
+            const existingCount = await tx.bankAccount.count({
+              where: { customerId: dto.customerId, status: { not: AccountStatus.CLOSED } },
+            });
+            if (existingCount >= MAX_ACCOUNTS_PER_CUSTOMER) {
+              throw new ConflictError(`A customer may hold at most ${MAX_ACCOUNTS_PER_CUSTOMER} open accounts`);
+            }
+
             const created = await tx.bankAccount.create({
               data: {
                 id: crypto.randomUUID(),
@@ -81,14 +85,15 @@ export class AccountService {
               },
             });
 
-            // Ledger provisioning happens inside the DB transaction: if it fails, the account row is rolled back
+            // Provisioned INACTIVE inside our transaction: if our commit then fails, the orphan ledger
+            // account can't send or receive money. It is activated only after the commit below.
             await this.ledgerClient.provisionAccount({
               id: created.id,
               accountNumber: created.accountNumber,
               customerId: created.customerId,
               currency: created.currency,
               dailyLimitPaise: created.dailyLimit.toString(),
-              isActive: true,
+              isActive: false,
             });
 
             await this.stageEvent(tx, 'account.created.v1', created.id, {
@@ -115,6 +120,8 @@ export class AccountService {
       throw new ConflictError('Failed to allocate unique account number. Please retry.');
     }
 
+    // If this fails the account stays unusable until reconcileWithLedger() activates it
+    await this.ledgerClient.updateAccount(account.id, { isActive: true });
     return account;
   }
 
@@ -145,9 +152,21 @@ export class AccountService {
   }
 
   /**
+   * Admin powers apply only to other people's accounts: on their own account a staff member has
+   * exactly the rights of a customer.
+   */
+  private actsAsAdmin(actor: AuthenticatedUser, account: BankAccount): boolean {
+    return actor.role === 'BANK_ADMIN' && account.customerId !== actor.id;
+  }
+
+  /**
    * Updates an account's lifecycle status.
-   * Customers may only freeze their own account (e.g. lost card). Unfreezing and closing
-   * are BANK_ADMIN decisions, and closing requires a zero ledger balance.
+   * Customers may only freeze their own account (e.g. lost card). Unfreezing and closing are BANK_ADMIN
+   * decisions on someone else's account; closing requires a zero ledger balance.
+   *
+   * Write ordering keeps the two stores safe if one write fails: restrictive changes (freeze, close) hit
+   * the ledger first, permissive ones (unfreeze) commit here first. A failure therefore leaves money
+   * MORE restricted, never less, and reconcileWithLedger() repairs the difference.
    */
   public async updateAccountStatus(
     accountId: string,
@@ -159,61 +178,56 @@ export class AccountService {
     if (account.status === AccountStatus.CLOSED) {
       throw new ConflictError('Cannot alter status of an already permanently closed account');
     }
-
     if (account.status === status) {
       return account;
     }
 
-    const isAdmin = actor.role === 'BANK_ADMIN';
-    const customerSelfFreeze =
-      actor.role === 'CUSTOMER' && status === AccountStatus.FROZEN;
-
-    if (!isAdmin && !customerSelfFreeze) {
+    const isAdmin = this.actsAsAdmin(actor, account);
+    const ownerFreeze = account.customerId === actor.id && status === AccountStatus.FROZEN;
+    if (!isAdmin && !ownerFreeze) {
       throw new ForbiddenError(
         'Only bank administrators can unfreeze or close accounts; customers may only freeze their own account'
       );
     }
 
+    // Restrictive changes: ledger first (it is the authority on whether money can move / balance is 0)
     if (status === AccountStatus.CLOSED) {
-      const ledger = await this.ledgerClient.getAccount(accountId);
-      if (BigInt(ledger.balanceInPaise) !== 0n) {
-        throw new ConflictError('Account balance must be zero before the account can be closed');
-      }
+      await this.ledgerClient.closeAccount(accountId);
+    } else if (status === AccountStatus.FROZEN) {
+      await this.ledgerClient.updateAccount(accountId, { isActive: false });
     }
 
-    const updated = await this.prisma.$transaction(
-      async (tx) => {
-        // Conditional update guards against a concurrent status change between read and write
-        const result = await tx.bankAccount.updateMany({
-          where: { id: accountId, status: account.status },
-          data: { status },
-        });
-        if (result.count !== 1) {
-          throw new ConflictError('Account status changed concurrently, please retry');
-        }
+    const updated = await this.prisma.$transaction(async (tx) => {
+      // Conditional update guards against a concurrent status change between read and write
+      const result = await tx.bankAccount.updateMany({
+        where: { id: accountId, status: account.status },
+        data: { status },
+      });
+      if (result.count !== 1) {
+        throw new ConflictError('Account status changed concurrently, please retry');
+      }
+      await this.stageEvent(tx, 'account.status.changed.v1', accountId, {
+        accountId,
+        customerId: account.customerId,
+        previousStatus: account.status,
+        status,
+        changedBy: actor.id,
+      });
+      await this.audit(tx, actor.id, 'ACCOUNT_STATUS_CHANGED', accountId, { from: account.status, to: status });
+      return tx.bankAccount.findUniqueOrThrow({ where: { id: accountId } });
+    });
 
-        await this.ledgerClient.updateAccount(accountId, {
-          isActive: status === AccountStatus.ACTIVE,
-        });
-
-        await this.stageEvent(tx, 'account.status.changed.v1', accountId, {
-          accountId,
-          customerId: account.customerId,
-          previousStatus: account.status,
-          status,
-          changedBy: actor.id,
-        });
-
-        return tx.bankAccount.findUniqueOrThrow({ where: { id: accountId } });
-      },
-      { timeout: 15000 }
-    );
+    // Permissive change: only after our own commit
+    if (status === AccountStatus.ACTIVE) {
+      await this.ledgerClient.updateAccount(accountId, { isActive: true });
+    }
 
     return updated;
   }
 
   /**
-   * Changes the per-day outgoing limit enforced by the ledger
+   * Changes the per-day outgoing limit enforced by the ledger. Customers can set any value up to the
+   * customer cap; only an administrator (on someone else's account) can go above it.
    */
   public async updateDailyLimit(
     accountId: string,
@@ -221,36 +235,101 @@ export class AccountService {
     actor: AuthenticatedUser
   ): Promise<BankAccount> {
     const account = await this.getAccountById(accountId, actor);
-    if (actor.role === 'SUPPORT') {
-      throw new ForbiddenError('Support staff cannot change account limits');
+    const isAdmin = this.actsAsAdmin(actor, account);
+    if (!isAdmin && account.customerId !== actor.id) {
+      throw new ForbiddenError('Only the account owner or a bank administrator can change limits');
     }
     if (account.status === AccountStatus.CLOSED) {
       throw new ConflictError('Cannot change limits on a closed account');
     }
-    this.assertDailyLimitAllowed(dailyLimit, actor);
+    this.assertDailyLimitAllowed(dailyLimit, isAdmin);
 
-    return this.prisma.$transaction(
-      async (tx) => {
-        const updated = await tx.bankAccount.update({
-          where: { id: accountId },
-          data: { dailyLimit },
-        });
-        await this.ledgerClient.updateAccount(accountId, { dailyLimitPaise: dailyLimit.toString() });
-        return updated;
-      },
-      { timeout: 15000 }
-    );
+    const lowering = dailyLimit <= account.dailyLimit;
+    if (lowering) {
+      await this.ledgerClient.updateAccount(accountId, { dailyLimitPaise: dailyLimit.toString() });
+    }
+    const updated = await this.prisma.$transaction(async (tx) => {
+      const result = await tx.bankAccount.update({ where: { id: accountId }, data: { dailyLimit } });
+      await this.audit(tx, actor.id, 'DAILY_LIMIT_CHANGED', accountId, {
+        from: account.dailyLimit.toString(),
+        to: dailyLimit.toString(),
+      });
+      return result;
+    });
+    if (!lowering) {
+      await this.ledgerClient.updateAccount(accountId, { dailyLimitPaise: dailyLimit.toString() });
+    }
+    return updated;
   }
 
-  private assertDailyLimitAllowed(dailyLimit: bigint, actor: AuthenticatedUser): void {
+  private assertDailyLimitAllowed(dailyLimit: bigint, isAdmin: boolean): void {
     if (dailyLimit <= 0n) {
       throw new BadRequestError('Daily limit must be a positive amount in paise');
     }
-    if (actor.role !== 'BANK_ADMIN' && dailyLimit > MAX_CUSTOMER_DAILY_LIMIT_PAISE) {
+    if (!isAdmin && dailyLimit > MAX_CUSTOMER_DAILY_LIMIT_PAISE) {
       throw new ForbiddenError(
         `Daily limits above ${MAX_CUSTOMER_DAILY_LIMIT_PAISE.toString()} paise require bank approval`
       );
     }
+  }
+
+  /**
+   * Re-aligns the ledger with this service's account state (status and daily limit), repairing any
+   * divergence left by a failed cross-service write. Run periodically.
+   */
+  public async reconcileWithLedger(batchSize = 200): Promise<{ checked: number; repaired: number }> {
+    let checked = 0;
+    let repaired = 0;
+    let cursor: string | undefined;
+    for (;;) {
+      const accounts = await this.prisma.bankAccount.findMany({
+        orderBy: { id: 'asc' },
+        take: batchSize,
+        ...(cursor ? { skip: 1, cursor: { id: cursor } } : {}),
+      });
+      if (!accounts.length) break;
+      cursor = accounts[accounts.length - 1].id;
+      const snapshots = new Map((await this.ledgerClient.getAccounts(accounts.map((a) => a.id))).map((s) => [s.id, s]));
+
+      for (const account of accounts) {
+        checked++;
+        const ledger = snapshots.get(account.id);
+        if (!ledger) {
+          logger.error({ accountId: account.id, alert: 'LEDGER_ACCOUNT_MISSING' }, 'Account has no ledger account');
+          continue;
+        }
+        try {
+          if (account.status === AccountStatus.CLOSED && !ledger.closed) {
+            await this.ledgerClient.closeAccount(account.id);
+            repaired++;
+          } else if (account.status !== AccountStatus.CLOSED) {
+            const wantActive = account.status === AccountStatus.ACTIVE;
+            const wantLimit = account.dailyLimit.toString();
+            if (ledger.closed) {
+              logger.error({ accountId: account.id, alert: 'ACCOUNT_LEDGER_CLOSED_MISMATCH' }, 'Ledger closed but account is not');
+            } else if (ledger.isActive !== wantActive || ledger.dailyLimitPaise !== wantLimit) {
+              await this.ledgerClient.updateAccount(account.id, { isActive: wantActive, dailyLimitPaise: wantLimit });
+              repaired++;
+            }
+          }
+        } catch (err) {
+          logger.error({ err, accountId: account.id }, 'Ledger reconciliation repair failed');
+        }
+      }
+      if (accounts.length < batchSize) break;
+    }
+    if (repaired) logger.warn({ repaired }, 'Repaired account/ledger divergence');
+    return { checked, repaired };
+  }
+
+  private async audit(
+    tx: Prisma.TransactionClient,
+    actorId: string,
+    action: string,
+    targetId: string,
+    details?: Record<string, unknown>
+  ): Promise<void> {
+    await tx.auditLog.create({ data: { actorId, action, targetId, details: details as Prisma.InputJsonValue | undefined } });
   }
 
   private async stageEvent(

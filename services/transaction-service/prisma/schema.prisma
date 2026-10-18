@@ -47,6 +47,8 @@ model LedgerAccount {
   balance       BigInt         @default(0) // Stored in minor units (e.g. Paise: 10000 = ₹100.00)
   dailyLimit    BigInt         @default(10000000) @map("daily_limit") // Max outgoing paise per IST calendar day
   isActive      Boolean        @default(true) @map("is_active")
+  // Set once, by the ledger itself, only when the balance is zero; a closed account can never reopen
+  closedAt      DateTime?      @map("closed_at")
   createdAt     DateTime       @default(now()) @map("created_at")
   updatedAt     DateTime       @updatedAt @map("updated_at")
   entries       LedgerEntry[]
@@ -92,7 +94,7 @@ model LedgerEntry {
   transaction   Transaction    @relation(fields: [transactionId], references: [id], onDelete: Restrict)
   account       LedgerAccount  @relation(fields: [accountId], references: [id], onDelete: Restrict)
 
-  @@index([accountId, createdAt])
+  @@index([accountId, createdAt, id])
   @@index([transactionId])
   @@map("ledger_entries")
 }
@@ -127,9 +129,55 @@ model OutboxEvent {
   retryCount    Int           @default(0) @map("retry_count")
   lastError     String?       @map("last_error")
   nextAttemptAt DateTime?     @map("next_attempt_at")
+  lockedUntil   DateTime?    @map("locked_until") // relay lease: a crashed relay's claim expires
   createdAt     DateTime      @default(now()) @map("created_at")
   publishedAt   DateTime?     @map("published_at")
 
   @@index([status, nextAttemptAt, createdAt])
+  @@index([aggregateId, status])
   @@map("outbox_events")
+}
+
+enum CashOperationType {
+  DEPOSIT
+  WITHDRAWAL
+}
+
+enum CashOperationStatus {
+  PENDING_APPROVAL
+  EXECUTED
+  REJECTED
+}
+
+// Teller cash movements. Large amounts (or a teller exceeding their daily total) need a second
+// BANK_ADMIN to approve (maker-checker); every operation is kept here for audit and per-teller caps.
+model CashOperation {
+  id            String              @id @default(uuid())
+  type          CashOperationType
+  status        CashOperationStatus
+  accountId     String              @map("account_id")
+  amount        BigInt
+  description   String?
+  requestedBy   String              @map("requested_by")
+  approvedBy    String?             @map("approved_by")
+  decidedAt     DateTime?           @map("decided_at")
+  transactionId String?             @unique @map("transaction_id")
+  createdAt     DateTime            @default(now()) @map("created_at")
+
+  @@index([status, createdAt])
+  @@index([requestedBy, createdAt])
+  @@map("cash_operations")
+}
+
+// Append-only audit trail of staff actions on the ledger (UPDATE/DELETE blocked by trigger)
+model AuditLog {
+  id        String   @id @default(uuid())
+  actorId   String   @map("actor_id")
+  action    String
+  targetId  String?  @map("target_id")
+  details   Json?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([actorId, createdAt])
+  @@map("audit_log")
 }

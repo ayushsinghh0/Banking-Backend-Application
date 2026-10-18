@@ -6,7 +6,7 @@
  */
 import 'dotenv/config';
 import { PrismaClient, Role } from '../../generated/client';
-import { connectRedis, ConsoleMailer, RedisTokenStateStore } from '@banksphere/common';
+import { connectRedis, ConsoleMailer, RedisTokenStateStore, prismaClientOptions } from '@banksphere/common';
 import { AuthService } from '../services/auth.service';
 import { TokenService } from '../services/token.service';
 import { RedisAuthSecurityStore } from '../services/auth-security.store';
@@ -21,7 +21,7 @@ async function main(): Promise<void> {
     throw new Error('ADMIN_PASSWORD must be at least 12 characters with upper, lower case letters and a digit');
   }
 
-  const prisma = new PrismaClient();
+  const prisma = new PrismaClient(prismaClientOptions());
   const redis = await connectRedis();
   try {
     const authService = new AuthService({
@@ -31,8 +31,8 @@ async function main(): Promise<void> {
       security: new RedisAuthSecurityStore(redis),
       mailer: new ConsoleMailer(), // createStaffUser sends no email
     });
-    const user = await authService.createStaffUser({ email, password, role: Role.BANK_ADMIN });
-    console.log(`Created BANK_ADMIN ${user.email} (${user.id})`);
+    const user = await authService.createStaffUser({ email, password, role: Role.BANK_ADMIN }, null);
+    console.log(`Created BANK_ADMIN ${user.email} (${user.id}). Sign in and enrol MFA at POST /api/v1/auth/mfa/setup before using admin APIs.`);
   } finally {
     await prisma.$disconnect();
     redis.disconnect();

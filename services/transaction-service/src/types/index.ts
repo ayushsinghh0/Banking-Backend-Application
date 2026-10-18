@@ -24,19 +24,16 @@ export enum IdempotencyStatus {
   FAILED = 'FAILED',
 }
 
-export interface DepositDTO {
+export interface CashOperationDTO {
+  type: 'DEPOSIT' | 'WITHDRAWAL';
   accountId: string;
   amountInPaise: bigint;
   description?: string;
-  referenceId?: string;
 }
 
-export interface WithdrawDTO {
-  accountId: string;
-  amountInPaise: bigint;
-  description?: string;
-  referenceId?: string;
-}
+export type CashOperationResult =
+  | { status: 'EXECUTED'; cashOperationId: string; transaction: TransactionResult }
+  | { status: 'PENDING_APPROVAL'; cashOperationId: string };
 
 export interface TransferDTO {
   sourceAccountId: string;

@@ -7,8 +7,8 @@ import {
   createAuthenticate,
   createBaseApp,
   errorHandlerMiddleware,
-  getInternalServiceToken,
-  getJwtAccessSecret,
+  assertJwtVerificationConfigured,
+  getInternalToken,
   isSwaggerEnabled,
   logger,
   notFoundHandler,
@@ -16,14 +16,15 @@ import {
   setupSwagger,
   startHttpServer,
   TokenStateStore,
+  prismaClientOptions,
 } from '@banksphere/common';
 import { CustomerService } from './services/customer.service';
 import { CustomerController } from './controllers/customer.controller';
 import { createCustomerRouter, createInternalCustomerRouter } from './routes/customer.routes';
 
 export function createApp(prisma: PrismaClient, redis: Redis, tokenState: TokenStateStore) {
-  getJwtAccessSecret(); // Fail fast on a missing/weak signing secret
-  getInternalServiceToken();
+  assertJwtVerificationConfigured(); // Fail fast on missing/invalid JWT public keys
+  getInternalToken('CUSTOMER_INTERNAL_TOKEN');
   const app = createBaseApp();
 
   const customerService = new CustomerService(
@@ -89,7 +90,7 @@ export function createApp(prisma: PrismaClient, redis: Redis, tokenState: TokenS
 }
 
 async function main(): Promise<void> {
-  const prisma = new PrismaClient();
+  const prisma = new PrismaClient(prismaClientOptions());
   const redis = await connectRedis();
   const { app } = createApp(prisma, redis, new RedisTokenStateStore(redis));
   startHttpServer(app, process.env.PORT || 8002, 'customer-service', [

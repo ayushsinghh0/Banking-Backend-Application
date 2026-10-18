@@ -11,6 +11,7 @@ export function createFraudRouter(controller: FraudController, authenticate: Req
   router.post('/evaluate', controller.evaluate);
   router.get('/alerts', controller.getAlerts);
   router.patch('/alerts/:alertId', controller.updateAlert);
+  router.get('/alerts/:alertId/history', controller.getAlertHistory);
 
   return router;
 }

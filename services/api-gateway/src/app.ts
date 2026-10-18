@@ -1,24 +1,21 @@
 import 'dotenv/config';
-import express, { Request, Response, NextFunction, RequestHandler } from 'express';
+import express, { Request, Response } from 'express';
 import helmet from 'helmet';
 import cors from 'cors';
 import Redis from 'ioredis';
-import { createProxyMiddleware } from 'http-proxy-middleware';
 import {
+  connectRedis,
   correlationIdMiddleware,
   createRateLimiter,
   errorHandlerMiddleware,
-  INTERNAL_TOKEN_HEADER,
   logger,
   notFoundHandler,
   parseTrustProxy,
+  startHttpServer,
 } from '@banksphere/common';
+import { createProxy, RouteTarget } from './proxy';
 
-export interface RouteTarget {
-  prefix: string;
-  target: string;
-  name: string;
-}
+export type { RouteTarget };
 
 export function defaultRoutes(env: NodeJS.ProcessEnv = process.env): RouteTarget[] {
   return [
@@ -31,9 +28,6 @@ export function defaultRoutes(env: NodeJS.ProcessEnv = process.env): RouteTarget
   ];
 }
 
-// Headers a client must never be able to inject into internal traffic
-const STRIPPED_REQUEST_HEADERS = [INTERNAL_TOKEN_HEADER, 'x-user-id', 'x-user-role', 'x-user-email'];
-
 export interface GatewayOptions {
   routes?: RouteTarget[];
   redis?: Redis;
@@ -44,6 +38,7 @@ export function createGateway(options: GatewayOptions = {}) {
   const routes = options.routes ?? defaultRoutes();
   const app = express();
   app.disable('x-powered-by');
+  // Only trust X-Forwarded-For when a load balancer that overwrites it sits in front (see README)
   const trustProxy = parseTrustProxy(process.env.TRUST_PROXY);
   if (trustProxy !== undefined) {
     app.set('trust proxy', trustProxy);
@@ -67,13 +62,6 @@ export function createGateway(options: GatewayOptions = {}) {
     })
   );
 
-  for (const header of STRIPPED_REQUEST_HEADERS) {
-    app.use((req, _res, next) => {
-      delete req.headers[header];
-      next();
-    });
-  }
-
   if (options.redis) {
     app.use(
       '/api',
@@ -85,83 +73,45 @@ export function createGateway(options: GatewayOptions = {}) {
     );
   }
 
-  app.get('/health', async (_req: Request, res: Response) => {
+  // Public health reveals only UP/DOWN; per-upstream detail goes to the logs, not to the internet
+  app.get('/health', async (req: Request, res: Response) => {
     const results = await Promise.all(
       routes.map(async (route) => {
         try {
           const r = await fetch(`${route.target}/health`, { signal: AbortSignal.timeout(2000) });
-          return [route.name, r.ok ? 'UP' : 'DOWN'] as const;
+          return [route.name, r.ok] as const;
         } catch {
-          return [route.name, 'DOWN'] as const;
+          return [route.name, false] as const;
         }
       })
     );
-    const upstreams = Object.fromEntries(results);
-    const allUp = results.every(([, s]) => s === 'UP');
-    res.status(allUp ? 200 : 503).json({
-      status: allUp ? 'UP' : 'DEGRADED',
-      service: 'api-gateway',
-      upstreams,
-      timestamp: new Date().toISOString(),
-    });
+    const down = results.filter(([, ok]) => !ok).map(([name]) => name);
+    if (down.length) req.log.warn({ down }, 'Gateway health: upstreams down');
+    res.status(down.length ? 503 : 200).json({ status: down.length ? 'DEGRADED' : 'UP', service: 'api-gateway' });
   });
 
   for (const route of routes) {
-    const proxy = createProxyMiddleware<Request, Response>({
-      target: route.target,
-      changeOrigin: true,
-      // Only exact prefix matches; /internal/* on upstreams is therefore unreachable from outside
-      pathFilter: (path) => path === route.prefix || path.startsWith(`${route.prefix}/`),
-      proxyTimeout: 15000,
-      on: {
-        proxyReq: (proxyReq, req) => {
-          proxyReq.setHeader('x-correlation-id', req.correlationId);
-          // Overwrite (never append to) X-Forwarded-For with the client IP as resolved by this gateway,
-          // so a client can't spoof its IP to the per-IP rate limits behind it
-          proxyReq.setHeader('x-forwarded-for', req.ip || '');
-        },
-        error: (err, req, res) => {
-          const correlationId = (req as Request).correlationId;
-          logger.error({ err: err.message, upstream: route.name, correlationId }, 'Upstream request failed');
-          const response = res as Response;
-          if (!response.headersSent && typeof response.status === 'function') {
-            response.status(502).json({
-              error: { code: 'BAD_GATEWAY', message: `${route.name} is unavailable`, correlationId },
-            });
-          }
-        },
-      },
-    }) as unknown as RequestHandler;
-    app.use(proxy);
+    app.use(createProxy(route));
   }
 
   app.use(notFoundHandler);
-  app.use((err: Error, req: Request, res: Response, next: NextFunction) =>
-    errorHandlerMiddleware(err, req, res, next)
-  );
+  app.use(errorHandlerMiddleware);
 
   return app;
 }
 
-if (require.main === module) {
-  const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379', {
-    maxRetriesPerRequest: 2,
-  });
-  redis.on('error', (err) => logger.warn({ err: err.message }, 'Redis error (rate limiting fails open)'));
-
+async function main(): Promise<void> {
+  const redis = await connectRedis(process.env.RATE_LIMIT_REDIS_URL || process.env.REDIS_URL);
   const app = createGateway({ redis });
-  const PORT = process.env.PORT || 8000;
-  const server = app.listen(PORT, () => {
-    logger.info(`BankSphere API Gateway running on port ${PORT}`);
-  });
+  if (process.env.NODE_ENV === 'production' && !process.env.TRUST_PROXY) {
+    logger.warn('TRUST_PROXY is not set: client IPs are taken from the TCP connection (correct only without a load balancer)');
+  }
+  startHttpServer(app, process.env.PORT || 8000, 'api-gateway', [() => redis.quit()]);
+}
 
-  const shutdown = () => {
-    logger.info('Shutting down API Gateway gracefully...');
-    server.close(() => {
-      redis.disconnect();
-      process.exit(0);
-    });
-  };
-  process.on('SIGTERM', shutdown);
-  process.on('SIGINT', shutdown);
+if (require.main === module) {
+  main().catch((err) => {
+    logger.fatal({ err }, 'api-gateway failed to start');
+    process.exit(1);
+  });
 }

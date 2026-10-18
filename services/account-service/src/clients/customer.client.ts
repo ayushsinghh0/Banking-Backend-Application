@@ -1,7 +1,7 @@
 import {
   BadGatewayError,
   INTERNAL_TOKEN_HEADER,
-  getInternalServiceToken,
+  getInternalToken,
 } from '@banksphere/common';
 
 export type KycStatus = 'PENDING' | 'VERIFIED' | 'REJECTED';
@@ -23,7 +23,7 @@ export class HttpCustomerClient implements CustomerClient {
     let response: globalThis.Response;
     try {
       response = await fetch(`${this.baseUrl}/internal/v1/customers/${encodeURIComponent(userId)}/kyc`, {
-        headers: { [INTERNAL_TOKEN_HEADER]: getInternalServiceToken() },
+        headers: { [INTERNAL_TOKEN_HEADER]: getInternalToken('CUSTOMER_INTERNAL_TOKEN') },
         signal: AbortSignal.timeout(this.timeoutMs),
       });
     } catch {

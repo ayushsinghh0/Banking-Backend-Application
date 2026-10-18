@@ -1,23 +1,37 @@
 # Local development overlay:
 #   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
 # - publishes Postgres, Redis and Kafka on 127.0.0.1 so services can also run natively (npm start)
+#   (they join an extra non-internal `devhost` network, because the production `backend` network is
+#   internal-only and cannot publish ports)
 # - adds Mailpit, a local SMTP server that captures every email (web UI: http://localhost:8025)
+# - relaxes the auth per-IP limits so the e2e suite can be re-run
 # Never use this overlay in production.
+
+networks:
+  devhost: {}
 
 services:
   postgres:
+    networks: [backend, devhost]
     ports: ["127.0.0.1:5432:5432"]
 
   redis:
+    networks: [backend, devhost]
     # 6380 on the host so it does not clash with a locally installed Redis
     ports: ["127.0.0.1:${DEV_REDIS_PORT:-6380}:6379"]
 
+  redis-ratelimit:
+    networks: [edge, devhost]
+    ports: ["127.0.0.1:${DEV_RATE_LIMIT_REDIS_PORT:-6381}:6379"]
+
   kafka:
+    networks: [backend, devhost]
     ports: ["127.0.0.1:9092:9092"]
 
   mailpit:
-    image: axllent/mailpit:v1.21
+    image: axllent/mailpit:v1.21@sha256:81370195cd4a0eab9604d17c2617a7525b0486f9365555253b6c5376c6350f1a
     restart: unless-stopped
+    networks: [backend, devhost]
     ports:
       - "127.0.0.1:1025:1025"
       - "127.0.0.1:8025:8025"

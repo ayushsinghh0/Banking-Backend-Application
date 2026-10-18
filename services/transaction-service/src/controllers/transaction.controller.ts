@@ -1,6 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import { BadRequestError, getAuthenticatedUser, parsePagination } from '@banksphere/common';
+import { CashOperationResult } from '../types';
 import { LedgerService } from '../services/ledger.service';
 import { IdempotencyService } from '../services/idempotency.service';
 
@@ -32,6 +33,13 @@ const depositWithdrawSchema = z
   .strict();
 
 const accountIdParams = z.object({ accountId: z.string().uuid() });
+const cashOperationParams = z.object({ cashOperationId: z.string().uuid() });
+const cashListQuery = z.object({ status: z.enum(['PENDING_APPROVAL', 'EXECUTED', 'REJECTED']).optional() });
+
+function cashResponse(result: CashOperationResult): { statusCode: number; data: unknown } {
+  // 202 Accepted: recorded, waiting for a second administrator
+  return { statusCode: result.status === 'EXECUTED' ? 201 : 202, data: result };
+}
 
 const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9_-]{8,128}$/;
 
@@ -82,8 +90,9 @@ export class TransactionController {
       const actor = getAuthenticatedUser(req);
       const body = transferSchema.parse(req.body);
 
-      await this.runIdempotent(req, res, 'transfer', body, (tx) =>
-        this.ledgerService.executeTransfer(
+      await this.runIdempotent(req, res, 'transfer', body, async (tx) => ({
+        statusCode: 201,
+        data: await this.ledgerService.executeTransfer(
           {
             sourceAccountId: body.sourceAccountId,
             destinationAccountId: body.destinationAccountId,
@@ -93,50 +102,66 @@ export class TransactionController {
           },
           actor,
           tx
-        )
+        ),
+      }));
+    } catch (error) {
+      next(error);
+    }
+  };
+
+  private cashOperation(type: 'DEPOSIT' | 'WITHDRAWAL') {
+    return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+      try {
+        const actor = getAuthenticatedUser(req);
+        const body = depositWithdrawSchema.parse(req.body);
+        await this.runIdempotent(req, res, type.toLowerCase(), body, async (tx) =>
+          cashResponse(
+            await this.ledgerService.requestCashOperation(
+              { type, accountId: body.accountId, amountInPaise: BigInt(body.amountInPaise), description: body.description },
+              actor,
+              tx
+            )
+          )
+        );
+      } catch (error) {
+        next(error);
+      }
+    };
+  }
+
+  /** Teller cash-in (BANK_ADMIN; large amounts need a second admin's approval) */
+  public deposit = this.cashOperation('DEPOSIT');
+
+  /** Teller cash-out (BANK_ADMIN; large amounts need a second admin's approval) */
+  public withdraw = this.cashOperation('WITHDRAWAL');
+
+  public approveCashOperation = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    try {
+      const actor = getAuthenticatedUser(req);
+      const { cashOperationId } = cashOperationParams.parse(req.params);
+      await this.runIdempotent(req, res, 'cash-approve', { cashOperationId }, async (tx) =>
+        cashResponse(await this.ledgerService.approveCashOperation(cashOperationId, actor, tx))
       );
     } catch (error) {
       next(error);
     }
   };
 
-  public deposit = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  public rejectCashOperation = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     try {
-      const actor = getAuthenticatedUser(req);
-      const body = depositWithdrawSchema.parse(req.body);
-
-      await this.runIdempotent(req, res, 'deposit', body, (tx) =>
-        this.ledgerService.executeDeposit(
-          {
-            accountId: body.accountId,
-            amountInPaise: BigInt(body.amountInPaise),
-            description: body.description,
-          },
-          actor,
-          tx
-        )
-      );
+      const { cashOperationId } = cashOperationParams.parse(req.params);
+      await this.ledgerService.rejectCashOperation(cashOperationId, getAuthenticatedUser(req));
+      res.status(200).json({ success: true, data: { cashOperationId, status: 'REJECTED' } });
     } catch (error) {
       next(error);
     }
   };
 
-  public withdraw = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  public listCashOperations = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     try {
-      const actor = getAuthenticatedUser(req);
-      const body = depositWithdrawSchema.parse(req.body);
-
-      await this.runIdempotent(req, res, 'withdraw', body, (tx) =>
-        this.ledgerService.executeWithdrawal(
-          {
-            accountId: body.accountId,
-            amountInPaise: BigInt(body.amountInPaise),
-            description: body.description,
-          },
-          actor,
-          tx
-        )
-      );
+      const { status } = cashListQuery.parse(req.query);
+      const { limit, offset } = parsePagination(req.query);
+      res.json({ success: true, data: await this.ledgerService.listCashOperations(status, limit, offset), pagination: { limit, offset } });
     } catch (error) {
       next(error);
     }

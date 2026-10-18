@@ -1,9 +1,10 @@
 # BankSphere production stack.
-#   cp .env.example .env      # fill in every CHANGE_ME (see README > Configuration)
+#   cp .env.example .env      # fill in every CHANGE_ME (see README > Production deployment)
 #   docker compose up -d --build
 #   docker compose run --rm -e ADMIN_EMAIL=... -e ADMIN_PASSWORD=... auth-service node dist/scripts/create-admin.js
 #
-# Only the API gateway publishes a port. Put a TLS-terminating reverse proxy / load balancer in front of it.
+# Networks: the internet-facing gateway lives only on `edge`; databases, Redis and Kafka live only on
+# `backend`. Only the gateway publishes a port: put a TLS-terminating load balancer in front of it.
 # For local development add the dev overlay:  docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
 
 x-node-healthcheck: &node-healthcheck
@@ -11,15 +12,13 @@ x-node-healthcheck: &node-healthcheck
   interval: 10s
   timeout: 5s
   retries: 6
-  start_period: 20s
+  start_period: 30s
 
 x-service-env: &service-env
   NODE_ENV: production
   LOG_LEVEL: ${LOG_LEVEL:-info}
   TRUST_PROXY: "1" # requests arrive through the API gateway
-  JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?set JWT_ACCESS_SECRET in .env}
-  JWT_ACCESS_EXPIRATION: ${JWT_ACCESS_EXPIRATION:-15m}
-  INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:?set INTERNAL_SERVICE_TOKEN in .env}
+  JWT_VERIFY_KEYS: ${JWT_VERIFY_KEYS:?set JWT_VERIFY_KEYS in .env}
   REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379
   KAFKA_ENABLED: "true"
   KAFKA_BROKERS: kafka:29092
@@ -30,7 +29,10 @@ x-app: &app
   read_only: true
   tmpfs: [/tmp]
   security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
+  mem_limit: 384m
   healthcheck: *node-healthcheck
+  networks: [edge, backend]
   depends_on:
     migrate:
       condition: service_completed_successfully
@@ -39,21 +41,36 @@ x-app: &app
     kafka-init:
       condition: service_completed_successfully
 
+networks:
+  edge: {}
+  backend:
+    internal: true # no route to the outside world
+
 services:
   postgres:
-    image: postgres:16.4-alpine
+    image: postgres:16.4-alpine@sha256:5660c2cbfea50c7a9127d17dc4e48543eedd3d7a41a595a2dfa572471e37e64c
     restart: always
+    mem_limit: 768m
+    networks: [backend]
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: ${POSTGRES_DB:-banksphere}
       POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
-      AUTH_DB_PASSWORD: ${AUTH_DB_PASSWORD:?set AUTH_DB_PASSWORD in .env}
-      CUSTOMER_DB_PASSWORD: ${CUSTOMER_DB_PASSWORD:?set CUSTOMER_DB_PASSWORD in .env}
-      ACCOUNT_DB_PASSWORD: ${ACCOUNT_DB_PASSWORD:?set ACCOUNT_DB_PASSWORD in .env}
-      LEDGER_DB_PASSWORD: ${LEDGER_DB_PASSWORD:?set LEDGER_DB_PASSWORD in .env}
-      NOTIFICATION_DB_PASSWORD: ${NOTIFICATION_DB_PASSWORD:?set NOTIFICATION_DB_PASSWORD in .env}
-      FRAUD_DB_PASSWORD: ${FRAUD_DB_PASSWORD:?set FRAUD_DB_PASSWORD in .env}
+      TZ: UTC
+      PGTZ: UTC
+      AUTH_DB_OWNER_PASSWORD: ${AUTH_DB_OWNER_PASSWORD:?set in .env}
+      AUTH_DB_APP_PASSWORD: ${AUTH_DB_APP_PASSWORD:?set in .env}
+      CUSTOMER_DB_OWNER_PASSWORD: ${CUSTOMER_DB_OWNER_PASSWORD:?set in .env}
+      CUSTOMER_DB_APP_PASSWORD: ${CUSTOMER_DB_APP_PASSWORD:?set in .env}
+      ACCOUNT_DB_OWNER_PASSWORD: ${ACCOUNT_DB_OWNER_PASSWORD:?set in .env}
+      ACCOUNT_DB_APP_PASSWORD: ${ACCOUNT_DB_APP_PASSWORD:?set in .env}
+      LEDGER_DB_OWNER_PASSWORD: ${LEDGER_DB_OWNER_PASSWORD:?set in .env}
+      LEDGER_DB_APP_PASSWORD: ${LEDGER_DB_APP_PASSWORD:?set in .env}
+      NOTIFICATION_DB_OWNER_PASSWORD: ${NOTIFICATION_DB_OWNER_PASSWORD:?set in .env}
+      NOTIFICATION_DB_APP_PASSWORD: ${NOTIFICATION_DB_APP_PASSWORD:?set in .env}
+      FRAUD_DB_OWNER_PASSWORD: ${FRAUD_DB_OWNER_PASSWORD:?set in .env}
+      FRAUD_DB_APP_PASSWORD: ${FRAUD_DB_APP_PASSWORD:?set in .env}
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./docker/postgres/init-schemas.sh:/docker-entrypoint-initdb.d/10-init-schemas.sh:ro
@@ -63,12 +80,14 @@ services:
       timeout: 5s
       retries: 20
 
+  # Security state (token versions, revoked jtis, lockouts): AOF-persisted and never evicted
   redis:
-    image: redis:7.4-alpine
+    image: redis:7.4-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
     restart: always
+    mem_limit: 320m
+    networks: [backend]
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
-    # AOF persistence + noeviction: token revocation state must never be silently evicted
     command: ["sh", "-c", "exec redis-server --appendonly yes --appendfsync everysec --maxmemory 256mb --maxmemory-policy noeviction --requirepass \"$$REDIS_PASSWORD\""]
     volumes:
       - redis_data:/data
@@ -78,10 +97,27 @@ services:
       timeout: 5s
       retries: 10
 
+  # Gateway rate-limit counters only: may evict, so a request flood can never exhaust security state
+  redis-ratelimit:
+    image: redis:7.4-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
+    restart: always
+    mem_limit: 160m
+    networks: [edge]
+    environment:
+      REDIS_PASSWORD: ${RATE_LIMIT_REDIS_PASSWORD:?set RATE_LIMIT_REDIS_PASSWORD in .env}
+    command: ["sh", "-c", "exec redis-server --save '' --appendonly no --maxmemory 128mb --maxmemory-policy allkeys-lru --requirepass \"$$REDIS_PASSWORD\""]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   # Single-node Kafka in KRaft mode (no ZooKeeper)
   kafka:
-    image: apache/kafka:3.8.1
+    image: apache/kafka:3.8.1@sha256:22c4bea38875408e8f9fe52aca8e3a6ee67f9aa0090db59af99a2f6647558db5
     restart: always
+    mem_limit: 1g
+    networks: [backend]
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
@@ -108,7 +144,8 @@ services:
       start_period: 20s
 
   kafka-init:
-    image: apache/kafka:3.8.1
+    image: apache/kafka:3.8.1@sha256:22c4bea38875408e8f9fe52aca8e3a6ee67f9aa0090db59af99a2f6647558db5
+    networks: [backend]
     depends_on:
       kafka:
         condition: service_healthy
@@ -123,23 +160,24 @@ services:
         /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists --topic notifications.dlq --partitions 1 --replication-factor 1
         echo "Kafka topics ready"
 
-  # One-shot job: applies every service's migrations with that service's own database role
+  # One-shot job: applies every service's migrations as that schema's OWNER role
   migrate:
     build: { context: ., target: build }
+    networks: [backend]
     environment:
-      AUTH_DATABASE_URL: postgresql://auth_svc:${AUTH_DB_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=auth_schema
-      CUSTOMER_DATABASE_URL: postgresql://customer_svc:${CUSTOMER_DB_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=customer_schema
-      ACCOUNT_DATABASE_URL: postgresql://account_svc:${ACCOUNT_DB_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=account_schema
-      TRANSACTION_DATABASE_URL: postgresql://ledger_svc:${LEDGER_DB_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=ledger_schema
-      NOTIFICATION_DATABASE_URL: postgresql://notification_svc:${NOTIFICATION_DB_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=notification_schema
-      FRAUD_DATABASE_URL: postgresql://fraud_svc:${FRAUD_DB_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=fraud_schema
+      AUTH_URL: postgresql://auth_owner:${AUTH_DB_OWNER_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=auth_schema
+      CUSTOMER_URL: postgresql://customer_owner:${CUSTOMER_DB_OWNER_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=customer_schema
+      ACCOUNT_URL: postgresql://account_owner:${ACCOUNT_DB_OWNER_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=account_schema
+      TRANSACTION_URL: postgresql://ledger_owner:${LEDGER_DB_OWNER_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=ledger_schema
+      NOTIFICATION_URL: postgresql://notification_owner:${NOTIFICATION_DB_OWNER_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=notification_schema
+      FRAUD_URL: postgresql://fraud_owner:${FRAUD_DB_OWNER_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=fraud_schema
     command:
       - sh
       - -c
       - |
         set -e
         for s in AUTH:auth CUSTOMER:customer ACCOUNT:account TRANSACTION:transaction NOTIFICATION:notification FRAUD:fraud; do
-          var=$${s%%:*}_DATABASE_URL; svc=$${s##*:}
+          var=$${s%%:*}_URL; svc=$${s##*:}
           echo "Migrating $$svc-service"
           (cd services/$$svc-service && DATABASE_URL="$$(printenv $$var)" npx prisma migrate deploy)
         done
@@ -150,14 +188,16 @@ services:
   api-gateway:
     <<: *app
     build: { context: ., args: { SERVICE: api-gateway } }
+    networks: [edge]
     ports:
       - "${GATEWAY_PORT:-8000}:8000"
     environment:
       NODE_ENV: production
       LOG_LEVEL: ${LOG_LEVEL:-info}
       PORT: 8000
+      # Leave empty unless a load balancer that OVERWRITES X-Forwarded-For sits in front (then: hop count)
       TRUST_PROXY: ${GATEWAY_TRUST_PROXY:-}
-      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      REDIS_URL: redis://:${RATE_LIMIT_REDIS_PASSWORD}@redis-ratelimit:6379
       CORS_ORIGINS: ${CORS_ORIGINS:-}
       GATEWAY_RATE_LIMIT_PER_MINUTE: ${GATEWAY_RATE_LIMIT_PER_MINUTE:-300}
       AUTH_SERVICE_URL: http://auth-service:8001
@@ -167,7 +207,7 @@ services:
       NOTIFICATION_SERVICE_URL: http://notification-service:8005
       FRAUD_SERVICE_URL: http://fraud-service:8006
     depends_on:
-      redis: { condition: service_healthy }
+      redis-ratelimit: { condition: service_healthy }
       auth-service: { condition: service_healthy }
       customer-service: { condition: service_healthy }
       account-service: { condition: service_healthy }
@@ -182,8 +222,12 @@ services:
       <<: *service-env
       PORT: 8001
       KAFKA_CLIENT_ID: auth-service
-      DATABASE_URL: postgresql://auth_svc:${AUTH_DB_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=auth_schema
+      DATABASE_URL: postgresql://auth_app:${AUTH_DB_APP_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=auth_schema
+      JWT_SIGNING_KEY: ${JWT_SIGNING_KEY:?set JWT_SIGNING_KEY in .env}
+      JWT_SIGNING_KEY_ID: ${JWT_SIGNING_KEY_ID:?set JWT_SIGNING_KEY_ID in .env}
+      JWT_ACCESS_EXPIRATION: ${JWT_ACCESS_EXPIRATION:-15m}
       JWT_REFRESH_EXPIRATION_DAYS: ${JWT_REFRESH_EXPIRATION_DAYS:-7}
+      MFA_ENCRYPTION_KEY: ${MFA_ENCRYPTION_KEY:?set MFA_ENCRYPTION_KEY in .env}
       APP_BASE_URL: ${APP_BASE_URL:?set APP_BASE_URL in .env}
       EMAIL_TRANSPORT: smtp
       SMTP_HOST: ${SMTP_HOST:?set SMTP_HOST in .env}
@@ -200,7 +244,8 @@ services:
     environment:
       <<: *service-env
       PORT: 8002
-      DATABASE_URL: postgresql://customer_svc:${CUSTOMER_DB_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=customer_schema
+      DATABASE_URL: postgresql://customer_app:${CUSTOMER_DB_APP_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=customer_schema
+      CUSTOMER_INTERNAL_TOKEN: ${CUSTOMER_INTERNAL_TOKEN:?set CUSTOMER_INTERNAL_TOKEN in .env}
 
   account-service:
     <<: *app
@@ -211,7 +256,9 @@ services:
       KAFKA_CLIENT_ID: account-service
       LEDGER_SERVICE_URL: http://transaction-service:8004
       CUSTOMER_SERVICE_URL: http://customer-service:8002
-      DATABASE_URL: postgresql://account_svc:${ACCOUNT_DB_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=account_schema
+      DATABASE_URL: postgresql://account_app:${ACCOUNT_DB_APP_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=account_schema
+      LEDGER_INTERNAL_TOKEN: ${LEDGER_INTERNAL_TOKEN:?set LEDGER_INTERNAL_TOKEN in .env}
+      CUSTOMER_INTERNAL_TOKEN: ${CUSTOMER_INTERNAL_TOKEN}
 
   transaction-service:
     <<: *app
@@ -220,7 +267,8 @@ services:
       <<: *service-env
       PORT: 8004
       KAFKA_CLIENT_ID: transaction-service
-      DATABASE_URL: postgresql://ledger_svc:${LEDGER_DB_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=ledger_schema
+      DATABASE_URL: postgresql://ledger_app:${LEDGER_DB_APP_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=ledger_schema
+      LEDGER_INTERNAL_TOKEN: ${LEDGER_INTERNAL_TOKEN}
 
   notification-service:
     <<: *app
@@ -229,7 +277,7 @@ services:
       <<: *service-env
       PORT: 8005
       KAFKA_CLIENT_ID: notification-service
-      DATABASE_URL: postgresql://notification_svc:${NOTIFICATION_DB_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=notification_schema
+      DATABASE_URL: postgresql://notification_app:${NOTIFICATION_DB_APP_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=notification_schema
       SECURITY_ALERT_EMAIL: ${SECURITY_ALERT_EMAIL:?set SECURITY_ALERT_EMAIL in .env}
       EMAIL_TRANSPORT: smtp
       SMTP_HOST: ${SMTP_HOST}
@@ -247,7 +295,7 @@ services:
       <<: *service-env
       PORT: 8006
       KAFKA_CLIENT_ID: fraud-service
-      DATABASE_URL: postgresql://fraud_svc:${FRAUD_DB_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=fraud_schema
+      DATABASE_URL: postgresql://fraud_app:${FRAUD_DB_APP_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=fraud_schema
 
 volumes:
   postgres_data:

@@ -9,8 +9,9 @@ import {
   createEventPublisher,
   createMailerFromEnv,
   createRateLimiter,
+  assertJwtSigningConfigured,
+  clientIpKey,
   errorHandlerMiddleware,
-  getJwtAccessSecret,
   isSwaggerEnabled,
   logger,
   Mailer,
@@ -20,12 +21,14 @@ import {
   setupSwagger,
   startHttpServer,
   TokenStateStore,
+  prismaClientOptions,
 } from '@banksphere/common';
 import { TokenService } from './services/token.service';
 import { AuthService } from './services/auth.service';
 import { AuthController } from './controllers/auth.controller';
 import { createAuthRouter, AuthRateLimiters } from './routes/auth.routes';
 import { AuthSecurityStore, RedisAuthSecurityStore } from './services/auth-security.store';
+import { assertMfaEncryptionConfigured } from './services/totp';
 
 export interface AuthAppDeps {
   tokenState: TokenStateStore;
@@ -36,7 +39,8 @@ export interface AuthAppDeps {
 }
 
 export function createApp(prisma: PrismaClient, deps: AuthAppDeps) {
-  getJwtAccessSecret(); // Fail fast on a missing/weak signing secret
+  assertJwtSigningConfigured(); // Fail fast on a missing/mismatched signing key
+  assertMfaEncryptionConfigured();
   const app = createBaseApp();
 
   const tokenService = new TokenService();
@@ -48,7 +52,10 @@ export function createApp(prisma: PrismaClient, deps: AuthAppDeps) {
     mailer: deps.mailer,
   });
   const authController = new AuthController(authService);
-  const authenticate = createAuthenticate(deps.tokenState);
+  const auth = {
+    authenticate: createAuthenticate(deps.tokenState),
+    authenticateForEnrolment: createAuthenticate(deps.tokenState, { allowStaffWithoutMfa: true }),
+  };
 
   // Per-IP brute-force protection. Fails closed: if Redis is down these endpoints return 503.
   const ipLimiter = (prefix: string, windowMs: number, maxRequests: number) =>
@@ -57,7 +64,7 @@ export function createApp(prisma: PrismaClient, deps: AuthAppDeps) {
       maxRequests,
       keyPrefix: `rl:auth:${prefix}:`,
       failOpen: false,
-      keyGenerator: (req) => req.ip || 'unknown',
+      keyGenerator: (req) => clientIpKey(req.ip),
     });
   const limiters: AuthRateLimiters | undefined = deps.redis
     ? {
@@ -67,7 +74,7 @@ export function createApp(prisma: PrismaClient, deps: AuthAppDeps) {
       }
     : undefined;
 
-  app.use('/api/v1/auth', createAuthRouter(authController, authenticate, limiters));
+  app.use('/api/v1/auth', createAuthRouter(authController, auth, limiters));
 
   if (isSwaggerEnabled()) {
     setupSwagger(app, {
@@ -79,7 +86,12 @@ export function createApp(prisma: PrismaClient, deps: AuthAppDeps) {
         '/api/v1/auth/register': { post: { summary: 'Register (always CUSTOMER). 202; a verification email is sent' } },
         '/api/v1/auth/email/verify': { post: { summary: 'Verify email with the token from the email' } },
         '/api/v1/auth/email/resend-verification': { post: { summary: 'Re-send the verification email (always 202)' } },
-        '/api/v1/auth/login': { post: { summary: 'Authenticate (email must be verified)' } },
+        '/api/v1/auth/login': { post: { summary: 'Authenticate (email must be verified); returns tokens or an MFA challenge' } },
+        '/api/v1/auth/login/mfa': { post: { summary: 'Complete login with {challengeToken, code}' } },
+        '/api/v1/auth/mfa/setup': { post: { summary: 'Start TOTP enrolment (returns secret + otpauth URI)' } },
+        '/api/v1/auth/mfa/enable': { post: { summary: 'Confirm TOTP enrolment with a code; returns an MFA session' } },
+        '/api/v1/auth/mfa/disable': { post: { summary: 'Customers only: disable TOTP with password + code' } },
+        '/api/v1/auth/admin/users/{userId}/mfa/reset': { post: { summary: 'BANK_ADMIN: reset another user\'s MFA' } },
         '/api/v1/auth/refresh': { post: { summary: 'Rotate refresh token' } },
         '/api/v1/auth/logout': { post: { summary: 'Revoke refresh-token family and the presented access token' } },
         '/api/v1/auth/password/forgot': { post: { summary: 'Email a single-use reset link (always 202)' } },
@@ -110,7 +122,7 @@ export function createApp(prisma: PrismaClient, deps: AuthAppDeps) {
 }
 
 async function main(): Promise<void> {
-  const prisma = new PrismaClient();
+  const prisma = new PrismaClient(prismaClientOptions());
   const redis = await connectRedis();
   const mailer = createMailerFromEnv();
   const tokenState = new RedisTokenStateStore(redis);
@@ -123,6 +135,12 @@ async function main(): Promise<void> {
 
   const synced = await authService.syncTokenVersions();
   logger.info({ synced }, 'Token versions mirrored to Redis');
+  // Repairs any token-version write that failed (e.g. Redis blip during a password reset) within 30s
+  const versionSync = setInterval(() => {
+    authService
+      .syncTokenVersions(new Date(Date.now() - 10 * 60_000))
+      .catch((err) => logger.warn({ err }, 'Periodic token version sync failed'));
+  }, 30_000);
 
   const { publisher, kafka } = createEventPublisher(process.env.KAFKA_CLIENT_ID || 'auth-service');
   const relay = publisher ? new OutboxRelay(prisma, publisher) : null;
@@ -134,6 +152,7 @@ async function main(): Promise<void> {
 
   startHttpServer(app, process.env.PORT || 8001, 'auth-service', [
     () => clearInterval(housekeeping),
+    () => clearInterval(versionSync),
     () => relay?.stop(),
     () => authService.drainBackgroundTasks(),
     () => kafka?.disconnect(),

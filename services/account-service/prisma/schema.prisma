@@ -52,9 +52,24 @@ model OutboxEvent {
   retryCount    Int          @default(0) @map("retry_count")
   lastError     String?      @map("last_error")
   nextAttemptAt DateTime?    @map("next_attempt_at")
+  lockedUntil   DateTime?    @map("locked_until") // relay lease: a crashed relay's claim expires
   createdAt     DateTime     @default(now()) @map("created_at")
   publishedAt   DateTime?    @map("published_at")
 
   @@index([status, nextAttemptAt, createdAt])
+  @@index([aggregateId, status])
   @@map("outbox_events")
+}
+
+// Append-only audit trail of status / limit changes (UPDATE/DELETE blocked by trigger)
+model AuditLog {
+  id        String   @id @default(uuid())
+  actorId   String   @map("actor_id")
+  action    String
+  targetId  String   @map("target_id")
+  details   Json?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([targetId, createdAt])
+  @@map("audit_log")
 }

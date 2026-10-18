@@ -74,3 +74,17 @@ export async function connectRedis(url = process.env.REDIS_URL || 'redis://local
   await redis.connect();
   return redis;
 }
+
+/**
+ * Options for every PrismaClient. Prisma's default of 2s to obtain a connection for an interactive
+ * transaction is too tight for real networks and bursts; contention beyond these bounds surfaces as a
+ * retryable 503 (see isRetryableDatabaseError) instead of hanging.
+ */
+export function prismaClientOptions(): { transactionOptions: { maxWait: number; timeout: number } } {
+  return {
+    transactionOptions: {
+      maxWait: Number(process.env.PRISMA_TX_MAX_WAIT_MS || 5_000),
+      timeout: Number(process.env.PRISMA_TX_TIMEOUT_MS || 10_000),
+    },
+  };
+}

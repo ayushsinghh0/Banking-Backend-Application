@@ -6,3 +6,4 @@ coverage/
 !.env.example
 services/*/generated/
 *.log
+scripts/.e2e-state.json

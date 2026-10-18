@@ -30,6 +30,11 @@ model User {
   // Bumped on password change/reset and on disable: every access token carrying an older version is revoked
   tokenVersion      Int                      @default(0) @map("token_version")
   passwordChangedAt DateTime?                @map("password_changed_at")
+  // TOTP second factor. Secrets are AES-256-GCM encrypted with MFA_ENCRYPTION_KEY, never stored in clear
+  mfaEnabled        Boolean                  @default(false) @map("mfa_enabled")
+  mfaSecretEnc      String?                  @map("mfa_secret_enc")
+  mfaPendingSecretEnc String?                @map("mfa_pending_secret_enc")
+  mfaLastUsedStep   Int?                     @map("mfa_last_used_step") // replay protection: a code works once
   createdAt         DateTime                 @default(now()) @map("created_at")
   updatedAt         DateTime                 @updatedAt @map("updated_at")
   refreshTokens     RefreshToken[]
@@ -46,6 +51,9 @@ model RefreshToken {
   familyId    String   @map("family_id")          // Token family UUID to track rotation chains
   isRevoked   Boolean  @default(false) @map("is_revoked")
   expiresAt   DateTime @map("expires_at")
+  // Absolute session lifetime: rotation never extends a session past this instant
+  familyExpiresAt  DateTime @map("family_expires_at")
+  mfaAuthenticated Boolean  @default(false) @map("mfa_authenticated")
   createdAt   DateTime @default(now()) @map("created_at")
   user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -95,9 +103,25 @@ model OutboxEvent {
   retryCount    Int          @default(0) @map("retry_count")
   lastError     String?      @map("last_error")
   nextAttemptAt DateTime?    @map("next_attempt_at")
+  lockedUntil   DateTime?    @map("locked_until") // relay lease: a crashed relay's claim expires
   createdAt     DateTime     @default(now()) @map("created_at")
   publishedAt   DateTime?    @map("published_at")
 
   @@index([status, nextAttemptAt, createdAt])
+  @@index([aggregateId, status])
   @@map("outbox_events")
+}
+
+// Append-only audit trail of security-relevant and staff actions (UPDATE/DELETE blocked by trigger)
+model AuditLog {
+  id        String   @id @default(uuid())
+  actorId   String?  @map("actor_id")
+  action    String
+  targetId  String?  @map("target_id")
+  details   Json?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([actorId, createdAt])
+  @@index([targetId, createdAt])
+  @@map("audit_log")
 }

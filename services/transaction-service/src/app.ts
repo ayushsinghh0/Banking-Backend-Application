@@ -8,8 +8,8 @@ import {
   createBaseApp,
   createEventPublisher,
   errorHandlerMiddleware,
-  getInternalServiceToken,
-  getJwtAccessSecret,
+  assertJwtVerificationConfigured,
+  getInternalToken,
   isSwaggerEnabled,
   logger,
   notFoundHandler,
@@ -18,6 +18,7 @@ import {
   setupSwagger,
   startHttpServer,
   TokenStateStore,
+  prismaClientOptions,
 } from '@banksphere/common';
 import { LedgerService } from './services/ledger.service';
 import { IdempotencyService } from './services/idempotency.service';
@@ -31,8 +32,8 @@ export interface TransactionAppDeps {
 }
 
 export function createApp(prisma: PrismaClient, deps: TransactionAppDeps) {
-  getJwtAccessSecret(); // Fail fast on a missing/weak signing secret
-  getInternalServiceToken();
+  assertJwtVerificationConfigured(); // Fail fast on missing/invalid JWT public keys
+  getInternalToken('LEDGER_INTERNAL_TOKEN');
   const app = createBaseApp();
 
   // Services initialization
@@ -96,13 +97,13 @@ export function createApp(prisma: PrismaClient, deps: TransactionAppDeps) {
   // Centralized Error Handling Middleware
   app.use(errorHandlerMiddleware);
 
-  return { app, idempotencyService, prisma };
+  return { app, idempotencyService, ledgerService, prisma };
 }
 
 async function main(): Promise<void> {
-  const prisma = new PrismaClient();
+  const prisma = new PrismaClient(prismaClientOptions());
   const redis = await connectRedis();
-  const { app, idempotencyService } = createApp(prisma, { tokenState: new RedisTokenStateStore(redis), redis });
+  const { app, idempotencyService, ledgerService } = createApp(prisma, { tokenState: new RedisTokenStateStore(redis), redis });
 
   // The relay only runs with a real publisher. Without Kafka, events stay PENDING and are
   // delivered once Kafka is configured, instead of being marked PUBLISHED and lost.
@@ -113,9 +114,18 @@ async function main(): Promise<void> {
   const purgeTimer = setInterval(() => {
     idempotencyService.purgeExpired().catch((err) => logger.error({ err }, 'Idempotency purge failed'));
   }, 60 * 60 * 1000);
+  // Ledger invariant: balances must equal the net of their entries (alerts on mismatch)
+  const reconcile = () =>
+    ledgerService
+      .reconcileBalances()
+      .then((r) => logger.info({ checked: r.checked, mismatches: r.mismatches.length }, 'Ledger reconciliation done'))
+      .catch((err) => logger.error({ err }, 'Ledger reconciliation failed'));
+  void reconcile();
+  const reconcileTimer = setInterval(reconcile, Number(process.env.RECONCILE_INTERVAL_MS || 10 * 60 * 1000));
 
   startHttpServer(app, process.env.PORT || 8004, 'transaction-service', [
     () => clearInterval(purgeTimer),
+    () => clearInterval(reconcileTimer),
     () => relay?.stop(),
     () => kafka?.disconnect(),
     () => prisma.$disconnect(),

@@ -5,6 +5,8 @@ export interface TransactionEvaluationContext {
   accountId: string;
   amountInPaise: bigint;
   timestamp: Date;
+  /** OUTBOUND: money leaving the account; INBOUND: money arriving (mule-account detection) */
+  direction: 'OUTBOUND' | 'INBOUND';
 }
 
 export interface RiskRuleResult {

@@ -10,7 +10,8 @@ import {
   createMailerFromEnv,
   createEventPublisher,
   errorHandlerMiddleware,
-  getJwtAccessSecret,
+  assertJwtVerificationConfigured,
+  KafkaService,
   isSwaggerEnabled,
   logger,
   notFoundHandler,
@@ -20,6 +21,7 @@ import {
   setupSwagger,
   startHttpServer,
   TokenStateStore,
+  prismaClientOptions,
 } from '@banksphere/common';
 import { EmailProvider, MailerEmailProvider } from './providers/email.provider';
 import { NotificationService, KafkaDLQPublisher } from './services/notification.service';
@@ -32,10 +34,12 @@ export interface NotificationAppDeps {
   emailProvider: EmailProvider;
   dlqPublisher?: KafkaDLQPublisher | null;
   redis?: Redis;
+  /** When set, /health also reports Kafka consumer liveness */
+  kafka?: KafkaService | null;
 }
 
 export function createApp(prisma: PrismaClient, deps: NotificationAppDeps) {
-  getJwtAccessSecret(); // Fail fast on a missing/weak signing secret
+  assertJwtVerificationConfigured(); // Fail fast on missing/invalid JWT public keys
   const app = createBaseApp();
 
   const notificationService = new NotificationService(prisma, deps.emailProvider, deps.dlqPublisher);
@@ -77,6 +81,7 @@ export function createApp(prisma: PrismaClient, deps: NotificationAppDeps) {
     try {
       await prisma.$queryRaw`SELECT 1`;
       if (deps.redis) await deps.redis.ping();
+      if (deps.kafka && !deps.kafka.consumersHealthy()) throw new Error('Kafka consumer is not running');
       res.json({
         status: 'UP',
         service: 'notification-service',
@@ -97,7 +102,7 @@ export function createApp(prisma: PrismaClient, deps: NotificationAppDeps) {
 }
 
 async function main(): Promise<void> {
-  const prisma = new PrismaClient();
+  const prisma = new PrismaClient(prismaClientOptions());
   const redis = await connectRedis();
   const { publisher, kafka } = createEventPublisher(process.env.KAFKA_CLIENT_ID || 'notification-service');
   const { app, notificationService } = createApp(prisma, {
@@ -105,17 +110,12 @@ async function main(): Promise<void> {
     emailProvider: new MailerEmailProvider(createMailerFromEnv()),
     dlqPublisher: publisher,
     redis,
+    kafka,
   });
 
-  let consumer: KafkaNotificationConsumer | null = null;
-  if (kafka) {
-    consumer = new KafkaNotificationConsumer(kafka, notificationService);
-    // Kafka being unavailable must not take the API down; KafkaJS keeps retrying the connection
-    consumer.start().catch((err) => logger.error({ err }, 'Notification consumer failed to start'));
-  }
+  if (kafka) new KafkaNotificationConsumer(kafka, notificationService).start();
 
   startHttpServer(app, process.env.PORT || 8005, 'notification-service', [
-    () => consumer?.stop(),
     () => kafka?.disconnect(),
     () => prisma.$disconnect(),
     () => redis.quit(),

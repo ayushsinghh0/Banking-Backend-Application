@@ -1,45 +1,43 @@
 /**
- * Money utilities enforcing integer minor units (Paise) to eliminate floating-point arithmetic errors.
- * 1 Rupee = 100 Paise.
+ * Money utilities enforcing integer minor units (paise) to eliminate floating-point arithmetic errors.
+ * 1 Rupee = 100 Paise. All conversions are exact: no Number/float is ever involved.
  */
 export class MoneyUtil {
   /**
-   * Converts a Rupee decimal string (e.g. "125.50") into BigInt paise (12550n)
+   * Converts a non-negative Rupee decimal string (e.g. "125.50") into BigInt paise (12550n).
+   * Rejects negatives, more than 2 decimal places and anything that isn't a plain decimal.
    */
-  public static rupeesToPaise(rupees: string | number): bigint {
-    const str = typeof rupees === 'number' ? rupees.toFixed(2) : rupees.trim();
-    const parts = str.split('.');
-    const whole = parts[0] || '0';
-    let fraction = parts[1] || '00';
-
-    if (fraction.length === 1) {
-      fraction += '0';
-    } else if (fraction.length > 2) {
-      fraction = fraction.substring(0, 2);
+  public static rupeesToPaise(rupees: string): bigint {
+    const str = rupees.trim();
+    const match = /^(\d{1,16})(?:\.(\d{1,2}))?$/.exec(str);
+    if (!match) {
+      throw new Error(`Invalid rupee amount '${rupees}': expected digits with at most 2 decimal places`);
     }
-
-    const totalPaiseStr = `${whole}${fraction}`.replace(/^0+(?=\d)/, '');
-    return BigInt(totalPaiseStr || '0');
+    return BigInt(match[1]) * 100n + BigInt((match[2] ?? '').padEnd(2, '0'));
   }
 
   /**
-   * Converts BigInt paise (e.g. 12550n) into human-readable Rupee string ("125.50")
+   * Converts BigInt paise (e.g. 12550n) into a Rupee string ("125.50").
    */
   public static paiseToRupees(paise: bigint | string): string {
-    const str = paise.toString().padStart(3, '0');
-    const whole = str.slice(0, -2) || '0';
-    const fraction = str.slice(-2);
-    return `${whole}.${fraction}`;
+    const value = BigInt(paise);
+    const negative = value < 0n;
+    const abs = negative ? -value : value;
+    const whole = abs / 100n;
+    const fraction = (abs % 100n).toString().padStart(2, '0');
+    return `${negative ? '-' : ''}${whole.toString()}.${fraction}`;
   }
 
   /**
-   * Formats paise into Indian Rupee locale currency: "₹1,25,000.50"
+   * Formats paise as Indian Rupees with Indian digit grouping, exactly: "₹1,25,000.50".
    */
   public static formatINR(paise: bigint | string): string {
-    const rupees = Number(this.paiseToRupees(paise));
-    return new Intl.NumberFormat('en-IN', {
-      style: 'currency',
-      currency: 'INR',
-    }).format(rupees);
+    const [rupees, fraction] = MoneyUtil.paiseToRupees(paise).split('.');
+    const negative = rupees.startsWith('-');
+    const digits = negative ? rupees.slice(1) : rupees;
+    const lastThree = digits.slice(-3);
+    const rest = digits.slice(0, -3);
+    const grouped = rest ? `${rest.replace(/\B(?=(\d{2})+(?!\d))/g, ',')},${lastThree}` : lastThree;
+    return `${negative ? '-' : ''}₹${grouped}.${fraction}`;
   }
 }

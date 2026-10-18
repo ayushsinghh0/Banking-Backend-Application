@@ -1,6 +1,6 @@
 import { PrismaClient, CustomerProfile, KycStatus } from '../../generated/client';
 import Redis from 'ioredis';
-import { NotFoundError, ConflictError, logger } from '@banksphere/common';
+import { AuthenticatedUser, ConflictError, ForbiddenError, NotFoundError, logger } from '@banksphere/common';
 
 export interface CreateProfileDTO {
   userId: string;
@@ -117,33 +117,66 @@ export class CustomerService {
    * CACHE INVALIDATION ON MUTATION:
    * When profile fields update in PostgreSQL, immediately purge the stale Redis cache entry.
    */
+  /**
+   * Updates the caller's own profile. Identity fields that KYC vouched for (full name, date of birth)
+   * can still be corrected, but doing so sends a VERIFIED/REJECTED profile back to PENDING for
+   * re-review, so a verified identity can't be swapped for another one afterwards.
+   */
   public async updateProfile(userId: string, dto: UpdateProfileDTO): Promise<CustomerProfile> {
-    const existing = await this.prisma.customerProfile.findUnique({
-      where: { userId },
+    const updated = await this.prisma.$transaction(async (tx) => {
+      const existing = await tx.customerProfile.findUnique({ where: { userId } });
+      if (!existing) {
+        throw new NotFoundError('Customer profile not found');
+      }
+
+      const nameChanged = dto.fullName !== undefined && dto.fullName !== existing.fullName;
+      const dobChanged =
+        dto.dateOfBirth !== undefined &&
+        (existing.dateOfBirth?.getTime() ?? null) !== (dto.dateOfBirth?.getTime() ?? null);
+      const identityChanged = nameChanged || dobChanged;
+      const resetKyc = identityChanged && existing.kycStatus !== KycStatus.PENDING;
+
+      const result = await tx.customerProfile.update({
+        where: { userId },
+        data: {
+          ...(dto.fullName && { fullName: dto.fullName }),
+          ...(dto.phoneNumber && { phoneNumber: dto.phoneNumber }),
+          ...(dto.address !== undefined && { address: dto.address }),
+          ...(dto.dateOfBirth !== undefined && { dateOfBirth: dto.dateOfBirth }),
+          ...(resetKyc && { kycStatus: KycStatus.PENDING }),
+        },
+      });
+
+      if (identityChanged) {
+        await tx.kycEvent.create({
+          data: {
+            userId,
+            actorId: userId,
+            action: resetKyc ? 'IDENTITY_CHANGED_KYC_RESET' : 'IDENTITY_CHANGED',
+            fromStatus: existing.kycStatus,
+            toStatus: result.kycStatus,
+            details: {
+              ...(nameChanged && { fullName: { from: existing.fullName, to: dto.fullName } }),
+              ...(dobChanged && {
+                dateOfBirth: { from: existing.dateOfBirth?.toISOString() ?? null, to: dto.dateOfBirth?.toISOString() ?? null },
+              }),
+            },
+          },
+        });
+      }
+      return result;
     });
 
-    if (!existing) {
-      throw new NotFoundError('Customer profile not found');
-    }
+    await this.invalidateCache(userId);
+    return updated;
+  }
 
-    const updated = await this.prisma.customerProfile.update({
-      where: { userId },
-      data: {
-        ...(dto.fullName && { fullName: dto.fullName }),
-        ...(dto.phoneNumber && { phoneNumber: dto.phoneNumber }),
-        ...(dto.address !== undefined && { address: dto.address }),
-        ...(dto.dateOfBirth !== undefined && { dateOfBirth: dto.dateOfBirth }),
-      },
-    });
-
-    // CACHE INVALIDATION: Delete stale key from Redis
+  private async invalidateCache(userId: string): Promise<void> {
     try {
       await this.redis.del(this.getCacheKey(userId));
     } catch (cacheErr) {
       logger.warn({ err: cacheErr }, 'Redis cache invalidation failed');
     }
-
-    return updated;
   }
 
   /**
@@ -159,25 +192,36 @@ export class CustomerService {
   }
 
   /**
-   * KYC review outcome, set by bank staff only
+   * KYC review outcome, set by a BANK_ADMIN. Staff can never decide their own KYC, and every
+   * decision is recorded in the append-only kyc_events trail.
    */
-  public async updateKycStatus(userId: string, kycStatus: KycStatus): Promise<CustomerProfile> {
-    const existing = await this.prisma.customerProfile.findUnique({ where: { userId } });
-    if (!existing) {
-      throw new NotFoundError('Customer profile not found');
+  public async updateKycStatus(actor: AuthenticatedUser, userId: string, kycStatus: KycStatus): Promise<CustomerProfile> {
+    if (actor.id === userId) {
+      throw new ForbiddenError('Staff cannot review their own KYC');
     }
-
-    const updated = await this.prisma.customerProfile.update({
-      where: { userId },
-      data: { kycStatus },
+    const updated = await this.prisma.$transaction(async (tx) => {
+      const existing = await tx.customerProfile.findUnique({ where: { userId } });
+      if (!existing) {
+        throw new NotFoundError('Customer profile not found');
+      }
+      const result = await tx.customerProfile.update({ where: { userId }, data: { kycStatus } });
+      await tx.kycEvent.create({
+        data: {
+          userId,
+          actorId: actor.id,
+          action: 'KYC_DECISION',
+          fromStatus: existing.kycStatus,
+          toStatus: kycStatus,
+        },
+      });
+      return result;
     });
 
-    try {
-      await this.redis.del(this.getCacheKey(userId));
-    } catch (cacheErr) {
-      logger.warn({ err: cacheErr }, 'Redis cache invalidation failed');
-    }
-
+    await this.invalidateCache(userId);
     return updated;
+  }
+
+  public async getKycHistory(userId: string) {
+    return this.prisma.kycEvent.findMany({ where: { userId }, orderBy: { createdAt: 'desc' }, take: 100 });
   }
 }

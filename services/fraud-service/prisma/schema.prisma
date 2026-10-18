@@ -42,6 +42,7 @@ model RiskAssessment {
   riskScore      Int       @map("risk_score") // 0 to 100
   riskLevel      RiskLevel @default(LOW) @map("risk_level")
   triggeredRules Json      @map("triggered_rules") // Array of rule IDs that fired
+  direction      String    @default("OUTBOUND") // OUTBOUND (money leaving the account) or INBOUND (mule detection)
   assessedAt     DateTime  @default(now()) @map("assessed_at")
 
   @@index([transactionId])
@@ -58,10 +59,51 @@ model FraudAlert {
   severity      RiskLevel   @default(HIGH)
   reason        String
   status        AlertStatus @default(OPEN)
+  reviewedBy    String?     @map("reviewed_by")
   createdAt     DateTime    @default(now()) @map("created_at")
   updatedAt     DateTime    @updatedAt @map("updated_at")
 
   @@index([status])
   @@index([transactionId])
   @@map("fraud_alerts")
+}
+
+// Append-only triage history: who moved an alert to which status, and why
+model FraudAlertEvent {
+  id         String      @id @default(uuid())
+  alertId    String      @map("alert_id")
+  actorId    String      @map("actor_id")
+  fromStatus AlertStatus @map("from_status")
+  toStatus   AlertStatus @map("to_status")
+  note       String?
+  createdAt  DateTime    @default(now()) @map("created_at")
+
+  @@index([alertId, createdAt])
+  @@map("fraud_alert_events")
+}
+
+enum OutboxStatus {
+  PENDING
+  PUBLISHED
+  FAILED
+}
+
+// Transactional outbox: fraud.alert.created.v1 is committed together with the alert
+model OutboxEvent {
+  id            String       @id @default(uuid())
+  aggregateType String       @map("aggregate_type")
+  aggregateId   String       @map("aggregate_id")
+  eventType     String       @map("event_type")
+  payload       Json
+  status        OutboxStatus @default(PENDING)
+  retryCount    Int          @default(0) @map("retry_count")
+  lastError     String?      @map("last_error")
+  nextAttemptAt DateTime?    @map("next_attempt_at")
+  lockedUntil   DateTime?    @map("locked_until")
+  createdAt     DateTime     @default(now()) @map("created_at")
+  publishedAt   DateTime?    @map("published_at")
+
+  @@index([status, nextAttemptAt, createdAt])
+  @@index([aggregateId, status])
+  @@map("outbox_events")
 }

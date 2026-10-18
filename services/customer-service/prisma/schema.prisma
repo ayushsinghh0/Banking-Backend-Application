@@ -29,3 +29,18 @@ model CustomerProfile {
   @@index([phoneNumber])
   @@map("customer_profiles")
 }
+
+// Append-only KYC audit trail: who approved/rejected whom, and identity changes that reset KYC
+model KycEvent {
+  id         String     @id @default(uuid())
+  userId     String     @map("user_id")
+  actorId    String     @map("actor_id")
+  action     String
+  fromStatus KycStatus? @map("from_status")
+  toStatus   KycStatus? @map("to_status")
+  details    Json?
+  createdAt  DateTime   @default(now()) @map("created_at")
+
+  @@index([userId, createdAt])
+  @@map("kyc_events")
+}
