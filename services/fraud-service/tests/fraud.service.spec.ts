@@ -1,5 +1,7 @@
 import { FraudService } from '../src/services/fraud.service';
+import { CashStructuringRule } from '../src/rules/cash-structuring.rule';
 import { RiskLevel, AlertStatus } from '../generated/client';
+import { ConflictError, ForbiddenError } from '@banksphere/common';
 
 describe('FraudService (Risk Engine, Anomaly Detection, and Alerts)', () => {
   let mockPrisma: any;
@@ -27,6 +29,7 @@ describe('FraudService (Risk Engine, Anomaly Detection, and Alerts)', () => {
       outboxEvent: { create: jest.fn() },
     };
     mockPrisma.$transaction = jest.fn((cb: any) => cb(mockPrisma));
+    mockPrisma.$queryRaw = jest.fn().mockResolvedValue([]);
     fraudService = new FraudService(mockPrisma);
   });
 
@@ -70,13 +73,61 @@ describe('FraudService (Risk Engine, Anomaly Detection, and Alerts)', () => {
     expect(mockPrisma.fraudAlert.create).not.toHaveBeenCalled();
   });
 
+  const analyst = (id: string) => ({ id, email: `${id}@bank.com`, role: 'FRAUD_ANALYST' as const, mfa: true });
+
   it('TRIAGE: status changes are attributed and kept in the append-only history', async () => {
-    mockPrisma.fraudAlert.findUnique.mockResolvedValue({ id: 'alert-1', status: AlertStatus.OPEN });
-    await fraudService.updateAlertStatus({ id: 'analyst-1', email: 'a@b.com', role: 'SUPPORT', mfa: true }, 'alert-1', AlertStatus.DISMISSED, 'false positive');
-    expect(mockPrisma.fraudAlert.update.mock.calls[0][0].data).toEqual({ status: AlertStatus.DISMISSED, reviewedBy: 'analyst-1' });
+    mockPrisma.fraudAlert.findUnique.mockResolvedValue({ id: 'alert-1', status: AlertStatus.OPEN, severity: RiskLevel.MEDIUM });
+    const result = await fraudService.updateAlertStatus(analyst('analyst-1'), 'alert-1', AlertStatus.DISMISSED, 'false positive');
+    expect(result.pendingSecondApproval).toBe(false);
+    expect(mockPrisma.fraudAlert.update.mock.calls[0][0].data).toEqual({
+      status: AlertStatus.DISMISSED,
+      reviewedBy: 'analyst-1',
+      closeRequestedBy: null,
+      closeRequestedStatus: null,
+    });
     expect(mockPrisma.fraudAlertEvent.create.mock.calls[0][0].data).toEqual(
       expect.objectContaining({ actorId: 'analyst-1', fromStatus: AlertStatus.OPEN, toStatus: AlertStatus.DISMISSED, note: 'false positive' })
     );
+  });
+
+  it('TRIAGE: nobody may triage an alert about a transaction they initiated', async () => {
+    mockPrisma.fraudAlert.findUnique.mockResolvedValue({ id: 'alert-1', status: AlertStatus.OPEN, severity: RiskLevel.LOW, initiatedBy: 'teller-1' });
+    await expect(fraudService.updateAlertStatus(analyst('teller-1'), 'alert-1', AlertStatus.DISMISSED)).rejects.toThrow(ForbiddenError);
+    expect(mockPrisma.fraudAlert.update).not.toHaveBeenCalled();
+  });
+
+  it('TRIAGE: closing a HIGH alert needs a second, different analyst', async () => {
+    mockPrisma.fraudAlert.findUnique.mockResolvedValue({ id: 'alert-1', status: AlertStatus.OPEN, severity: RiskLevel.HIGH });
+    const first = await fraudService.updateAlertStatus(analyst('analyst-1'), 'alert-1', AlertStatus.RESOLVED);
+    expect(first.pendingSecondApproval).toBe(true);
+    expect(mockPrisma.fraudAlert.update.mock.calls[0][0].data).toEqual(
+      expect.objectContaining({ status: AlertStatus.UNDER_REVIEW, closeRequestedBy: 'analyst-1', closeRequestedStatus: AlertStatus.RESOLVED })
+    );
+
+    // The proposer can't confirm their own proposal
+    mockPrisma.fraudAlert.findUnique.mockResolvedValue({
+      id: 'alert-1', status: AlertStatus.UNDER_REVIEW, severity: RiskLevel.HIGH, closeRequestedBy: 'analyst-1', closeRequestedStatus: AlertStatus.RESOLVED,
+    });
+    await expect(fraudService.updateAlertStatus(analyst('analyst-1'), 'alert-1', AlertStatus.RESOLVED)).rejects.toThrow(ConflictError);
+
+    const second = await fraudService.updateAlertStatus(analyst('analyst-2'), 'alert-1', AlertStatus.RESOLVED);
+    expect(second.pendingSecondApproval).toBe(false);
+    expect(mockPrisma.fraudAlert.update.mock.calls.at(-1)[0].data).toEqual(
+      expect.objectContaining({ status: AlertStatus.RESOLVED, reviewedBy: 'analyst-2', closeRequestedBy: null })
+    );
+  });
+
+  it('STRUCTURING: repeated cash operations just under the approval limit by one teller are flagged', async () => {
+    const rule = new CashStructuringRule(mockPrisma, 20_000_000n, 80n, 2);
+    const cash = ctx({ amountInPaise: 19_000_000n, transactionType: 'DEPOSIT', initiatedBy: 'teller-1', direction: 'INBOUND' });
+    mockPrisma.riskAssessment.count.mockResolvedValue(1);
+    expect((await rule.evaluate(cash)).triggered).toBe(false);
+    mockPrisma.riskAssessment.count.mockResolvedValue(2);
+    expect((await rule.evaluate(cash)).triggered).toBe(true);
+    // Small amounts, transfers and amounts above the limit (already dual-controlled) are not structuring
+    expect((await rule.evaluate({ ...cash, amountInPaise: 1_000_000n })).triggered).toBe(false);
+    expect((await rule.evaluate({ ...cash, transactionType: 'TRANSFER' })).triggered).toBe(false);
+    expect((await rule.evaluate({ ...cash, amountInPaise: 30_000_000n })).triggered).toBe(false);
   });
 
   it('maps risk scores to levels', () => {

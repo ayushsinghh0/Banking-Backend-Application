@@ -21,6 +21,8 @@ import {
   prismaClientOptions,
 } from '@banksphere/common';
 import { LedgerService } from './services/ledger.service';
+import { TellerService } from './services/teller.service';
+import { BeneficiaryService } from './services/beneficiary.service';
 import { IdempotencyService } from './services/idempotency.service';
 import { TransactionController } from './controllers/transaction.controller';
 import { createTransactionRouter } from './routes/transaction.routes';
@@ -41,7 +43,8 @@ export function createApp(prisma: PrismaClient, deps: TransactionAppDeps) {
   const idempotencyService = new IdempotencyService(prisma);
 
   // Controller & Router
-  const controller = new TransactionController(ledgerService, idempotencyService);
+  const tellerService = new TellerService(prisma);
+  const controller = new TransactionController(ledgerService, tellerService, new BeneficiaryService(prisma), idempotencyService);
   app.use('/api/v1/transactions', createTransactionRouter(controller, createAuthenticate(deps.tokenState)));
   app.use('/internal/v1', createInternalRouter(ledgerService));
 
@@ -97,13 +100,13 @@ export function createApp(prisma: PrismaClient, deps: TransactionAppDeps) {
   // Centralized Error Handling Middleware
   app.use(errorHandlerMiddleware);
 
-  return { app, idempotencyService, ledgerService, prisma };
+  return { app, idempotencyService, ledgerService, tellerService, prisma };
 }
 
 async function main(): Promise<void> {
   const prisma = new PrismaClient(prismaClientOptions());
   const redis = await connectRedis();
-  const { app, idempotencyService, ledgerService } = createApp(prisma, { tokenState: new RedisTokenStateStore(redis), redis });
+  const { app, idempotencyService, ledgerService, tellerService } = createApp(prisma, { tokenState: new RedisTokenStateStore(redis), redis });
 
   // The relay only runs with a real publisher. Without Kafka, events stay PENDING and are
   // delivered once Kafka is configured, instead of being marked PUBLISHED and lost.
@@ -113,6 +116,7 @@ async function main(): Promise<void> {
 
   const purgeTimer = setInterval(() => {
     idempotencyService.purgeExpired().catch((err) => logger.error({ err }, 'Idempotency purge failed'));
+    tellerService.expireStaleApprovals().catch((err) => logger.error({ err }, 'Cash approval expiry failed'));
   }, 60 * 60 * 1000);
   // Ledger invariant: balances must equal the net of their entries (alerts on mismatch)
   const reconcile = () =>

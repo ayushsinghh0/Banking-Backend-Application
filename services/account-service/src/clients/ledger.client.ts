@@ -17,6 +17,8 @@ export interface LedgerAccountProvisioning {
 export interface LedgerAccountUpdate {
   isActive?: boolean;
   dailyLimitPaise?: string;
+  /** Control-state version; the ledger applies it only if newer than its own */
+  version: number;
 }
 
 export interface LedgerAccountSnapshot {
@@ -25,6 +27,7 @@ export interface LedgerAccountSnapshot {
   dailyLimitPaise: string;
   isActive: boolean;
   closed: boolean;
+  controlVersion: number;
 }
 
 /**
@@ -34,11 +37,11 @@ export interface LedgerAccountSnapshot {
  */
 export interface LedgerClient {
   provisionAccount(input: LedgerAccountProvisioning): Promise<void>;
-  updateAccount(accountId: string, input: LedgerAccountUpdate): Promise<void>;
+  updateAccount(accountId: string, input: LedgerAccountUpdate): Promise<{ applied: boolean }>;
   getAccount(accountId: string): Promise<LedgerAccountSnapshot>;
   getAccounts(accountIds: string[]): Promise<LedgerAccountSnapshot[]>;
   /** Ledger-side close: refuses (409 BALANCE_NOT_ZERO) unless the balance is zero, checked under lock */
-  closeAccount(accountId: string): Promise<void>;
+  closeAccount(accountId: string, version: number): Promise<void>;
 }
 
 export class HttpLedgerClient implements LedgerClient {
@@ -51,8 +54,9 @@ export class HttpLedgerClient implements LedgerClient {
     await this.request('POST', '/internal/v1/ledger-accounts', input);
   }
 
-  public async updateAccount(accountId: string, input: LedgerAccountUpdate): Promise<void> {
-    await this.request('PATCH', `/internal/v1/ledger-accounts/${encodeURIComponent(accountId)}`, input);
+  public async updateAccount(accountId: string, input: LedgerAccountUpdate): Promise<{ applied: boolean }> {
+    const body = await this.request('PATCH', `/internal/v1/ledger-accounts/${encodeURIComponent(accountId)}`, input);
+    return { applied: Boolean(body?.data?.applied) };
   }
 
   public async getAccount(accountId: string): Promise<LedgerAccountSnapshot> {
@@ -68,8 +72,8 @@ export class HttpLedgerClient implements LedgerClient {
     return body.data as LedgerAccountSnapshot[];
   }
 
-  public async closeAccount(accountId: string): Promise<void> {
-    await this.request('POST', `/internal/v1/ledger-accounts/${encodeURIComponent(accountId)}/close`);
+  public async closeAccount(accountId: string, version: number): Promise<void> {
+    await this.request('POST', `/internal/v1/ledger-accounts/${encodeURIComponent(accountId)}/close`, { version });
   }
 
   private async request(method: string, path: string, body?: unknown): Promise<any> {

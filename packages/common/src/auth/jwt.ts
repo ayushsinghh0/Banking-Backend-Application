@@ -2,7 +2,15 @@ import crypto, { KeyObject } from 'crypto';
 import jwt from 'jsonwebtoken';
 import { UnauthorizedError } from '../errors/app-error';
 
-export const ROLES = ['CUSTOMER', 'BANK_ADMIN', 'SUPPORT'] as const;
+/**
+ * CUSTOMER      self-registered bank customer
+ * SUPPORT       read-only staff (customer service)
+ * TELLER        branch cash operations (maker)
+ * KYC_OFFICER   identity verification decisions
+ * FRAUD_ANALYST fraud alert triage
+ * BANK_ADMIN    supervisor: user/role administration, account status & limits, approvals (checker)
+ */
+export const ROLES = ['CUSTOMER', 'SUPPORT', 'TELLER', 'KYC_OFFICER', 'FRAUD_ANALYST', 'BANK_ADMIN'] as const;
 export type UserRole = (typeof ROLES)[number];
 
 export interface AuthenticatedUser {
@@ -17,6 +25,8 @@ export interface AuthenticatedUser {
   expiresAt?: number;
   /** True when the session was established with a second factor (TOTP) */
   mfa?: boolean;
+  /** Session (refresh-token family) id this access token belongs to */
+  sessionId?: string;
 }
 
 export interface AccessTokenClaims {
@@ -25,6 +35,7 @@ export interface AccessTokenClaims {
   role: UserRole;
   tokenVersion: number;
   mfa: boolean;
+  sessionId: string;
 }
 
 /**
@@ -115,7 +126,7 @@ export function signAccessToken(
 ): string {
   const { kid, key } = getSigningKey();
   return jwt.sign(
-    { email: claims.email, role: claims.role, tv: claims.tokenVersion, mfa: claims.mfa },
+    { email: claims.email, role: claims.role, tv: claims.tokenVersion, mfa: claims.mfa, sid: claims.sessionId },
     key,
     {
       algorithm: JWT_ALGORITHM,
@@ -156,6 +167,7 @@ export function verifyAccessToken(token: string): AuthenticatedUser {
     typeof decoded.jti !== 'string' ||
     !Number.isInteger(decoded.tv) ||
     typeof decoded.mfa !== 'boolean' ||
+    typeof decoded.sid !== 'string' ||
     typeof decoded.exp !== 'number'
   ) {
     throw new UnauthorizedError('Malformed access token claims');
@@ -169,6 +181,7 @@ export function verifyAccessToken(token: string): AuthenticatedUser {
     tokenVersion: decoded.tv,
     expiresAt: decoded.exp,
     mfa: decoded.mfa,
+    sessionId: decoded.sid,
   };
 }
 

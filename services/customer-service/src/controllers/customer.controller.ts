@@ -27,7 +27,9 @@ const updateProfileSchema = z.object({
 
 const userIdParamsSchema = z.object({ userId: z.string().uuid() });
 
-const kycSchema = z.object({ kycStatus: z.enum(['PENDING', 'VERIFIED', 'REJECTED']) }).strict();
+const kycSchema = z
+  .object({ kycStatus: z.enum(['PENDING', 'VERIFIED', 'REJECTED']), expectedVersion: z.number().int().positive() })
+  .strict();
 
 export class CustomerController {
   constructor(private readonly customerService: CustomerService) {}
@@ -95,7 +97,7 @@ export class CustomerController {
   public getByUserId = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     try {
       const { userId } = userIdParamsSchema.parse(req.params);
-      const { profile } = await this.customerService.getProfileByUserId(userId);
+      const profile = await this.customerService.getProfileForStaff(getAuthenticatedUser(req), userId);
       res.status(200).json({ success: true, data: profile });
     } catch (error) {
       next(error);
@@ -105,8 +107,8 @@ export class CustomerController {
   public updateKycStatus = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     try {
       const { userId } = userIdParamsSchema.parse(req.params);
-      const { kycStatus } = kycSchema.parse(req.body);
-      const profile = await this.customerService.updateKycStatus(getAuthenticatedUser(req), userId, kycStatus);
+      const { kycStatus, expectedVersion } = kycSchema.parse(req.body);
+      const profile = await this.customerService.updateKycStatus(getAuthenticatedUser(req), userId, kycStatus, expectedVersion);
       res.status(200).json({ success: true, data: profile });
     } catch (error) {
       next(error);

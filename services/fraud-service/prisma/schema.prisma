@@ -43,11 +43,14 @@ model RiskAssessment {
   riskLevel      RiskLevel @default(LOW) @map("risk_level")
   triggeredRules Json      @map("triggered_rules") // Array of rule IDs that fired
   direction      String    @default("OUTBOUND") // OUTBOUND (money leaving the account) or INBOUND (mule detection)
+  transactionType String?  @map("transaction_type")
+  initiatedBy    String?   @map("initiated_by") // customer, or the teller for cash operations
   assessedAt     DateTime  @default(now()) @map("assessed_at")
 
   @@index([transactionId])
   @@index([accountId])
   @@index([riskLevel])
+  @@index([initiatedBy, assessedAt])
   @@map("risk_assessments")
 }
 
@@ -60,6 +63,11 @@ model FraudAlert {
   reason        String
   status        AlertStatus @default(OPEN)
   reviewedBy    String?     @map("reviewed_by")
+  initiatedBy   String?     @map("initiated_by") // who initiated the flagged transaction (e.g. a teller)
+  cashOperationId String?   @map("cash_operation_id")
+  // Four-eyes closure of HIGH/CRITICAL alerts: first analyst proposes, a different one confirms
+  closeRequestedBy     String?      @map("close_requested_by")
+  closeRequestedStatus AlertStatus? @map("close_requested_status")
   createdAt     DateTime    @default(now()) @map("created_at")
   updatedAt     DateTime    @updatedAt @map("updated_at")
 
@@ -91,6 +99,7 @@ enum OutboxStatus {
 // Transactional outbox: fraud.alert.created.v1 is committed together with the alert
 model OutboxEvent {
   id            String       @id @default(uuid())
+  seq           BigInt       @default(autoincrement()) // per-aggregate publish order
   aggregateType String       @map("aggregate_type")
   aggregateId   String       @map("aggregate_id")
   eventType     String       @map("event_type")
@@ -100,10 +109,12 @@ model OutboxEvent {
   lastError     String?      @map("last_error")
   nextAttemptAt DateTime?    @map("next_attempt_at")
   lockedUntil   DateTime?    @map("locked_until")
+  lockedBy      String?      @map("locked_by") // fencing token of the relay holding the lease
   createdAt     DateTime     @default(now()) @map("created_at")
   publishedAt   DateTime?    @map("published_at")
 
   @@index([status, nextAttemptAt, createdAt])
-  @@index([aggregateId, status])
+  @@index([aggregateId, status, seq])
+  @@unique([seq])
   @@map("outbox_events")
 }

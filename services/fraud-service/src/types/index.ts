@@ -7,6 +7,11 @@ export interface TransactionEvaluationContext {
   timestamp: Date;
   /** OUTBOUND: money leaving the account; INBOUND: money arriving (mule-account detection) */
   direction: 'OUTBOUND' | 'INBOUND';
+  /** DEPOSIT | WITHDRAWAL | TRANSFER */
+  transactionType?: string;
+  /** Customer who sent a transfer, or the teller who handled cash */
+  initiatedBy?: string;
+  cashOperationId?: string;
 }
 
 export interface RiskRuleResult {

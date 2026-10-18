@@ -17,6 +17,10 @@ export function createBaseApp(): Express {
   app.use(helmet());
   app.use(express.json({ limit: '100kb' }));
   app.use(correlationIdMiddleware);
+  // Liveness: the process is serving requests. /health (per service) is readiness: its dependencies.
+  app.get('/health/live', (_req, res) => {
+    res.json({ status: 'UP' });
+  });
   return app;
 }
 

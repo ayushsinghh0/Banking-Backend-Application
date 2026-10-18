@@ -68,6 +68,9 @@ export async function connectRedis(url = process.env.REDIS_URL || 'redis://local
     enableOfflineQueue: false,
     maxRetriesPerRequest: 1,
     connectTimeout: 5_000,
+    // The ready check (INFO) waits out AOF loading after a Redis restart, and without it ioredis can end
+    // up "ready" on a dead socket after a flapping reconnect. The ACL users are granted +info for it.
+    enableReadyCheck: true,
     retryStrategy: (times) => Math.min(times * 200, 3_000),
   });
   redis.on('error', (err) => logger.warn({ err: err.message }, 'Redis connection error'));

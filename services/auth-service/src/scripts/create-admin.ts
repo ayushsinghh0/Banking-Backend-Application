@@ -5,7 +5,7 @@
  *   ADMIN_EMAIL=ops@bank.example ADMIN_PASSWORD='...' npm run create-admin -w @banksphere/auth-service
  */
 import 'dotenv/config';
-import { PrismaClient, Role } from '../../generated/client';
+import { PrismaClient } from '../../generated/client';
 import { connectRedis, ConsoleMailer, RedisTokenStateStore, prismaClientOptions } from '@banksphere/common';
 import { AuthService } from '../services/auth.service';
 import { TokenService } from '../services/token.service';
@@ -28,11 +28,14 @@ async function main(): Promise<void> {
       prisma,
       tokenService: new TokenService(),
       tokenState: new RedisTokenStateStore(redis),
-      security: new RedisAuthSecurityStore(redis),
-      mailer: new ConsoleMailer(), // createStaffUser sends no email
+      security: new RedisAuthSecurityStore(redis, redis),
+      mailer: new ConsoleMailer(), // bootstrap sends no email
     });
-    const user = await authService.createStaffUser({ email, password, role: Role.BANK_ADMIN }, null);
-    console.log(`Created BANK_ADMIN ${user.email} (${user.id}). Sign in and enrol MFA at POST /api/v1/auth/mfa/setup before using admin APIs.`);
+    const { user, enrolmentToken } = await authService.createBootstrapAdmin(email, password);
+    console.log(`Created BANK_ADMIN ${user.email} (${user.id}).`);
+    console.log('Sign in, then enrol MFA with POST /api/v1/auth/mfa/setup and /mfa/enable using this ONE-TIME enrolment token');
+    console.log(`(valid ${authService.config.enrolmentTtlHours}h; hand it to the administrator out of band):`);
+    console.log(`ENROLMENT_TOKEN=${enrolmentToken}`);
   } finally {
     await prisma.$disconnect();
     redis.disconnect();

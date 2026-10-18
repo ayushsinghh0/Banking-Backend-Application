@@ -16,6 +16,8 @@ EVENTS="user.registered.v1 account.created.v1 account.status.changed.v1 transact
 for t in $EVENTS; do
   topics --create --if-not-exists --topic "$t" --partitions 3 --replication-factor 1
   topics --create --if-not-exists --topic "$t.dlq" --partitions 1 --replication-factor 1
+  # Delayed-retry topic: transient failures are parked here (with a retryAt) instead of blocking the partition
+  topics --create --if-not-exists --topic "$t.retry" --partitions 3 --replication-factor 1
 done
 topics --create --if-not-exists --topic notifications.dlq --partitions 1 --replication-factor 1
 
@@ -41,11 +43,16 @@ produce fraud-svc   fraud.alert.created.v1
 for u in auth-svc account-svc ledger-svc fraud-svc notification-svc; do idempotent "$u"; done
 
 # Consumers
+# Consumers (each also owns its retry hop: produce + consume <topic>.retry)
 consume fraud-svc transaction.completed.v1
+consume fraud-svc transaction.completed.v1.retry
+produce fraud-svc transaction.completed.v1.retry
 group   fraud-svc fraud-service-group
 produce fraud-svc transaction.completed.v1.dlq
 for t in $EVENTS; do
   consume notification-svc "$t"
+  consume notification-svc "$t.retry"
+  produce notification-svc "$t.retry"
   produce notification-svc "$t.dlq"
 done
 group   notification-svc notification-service-group

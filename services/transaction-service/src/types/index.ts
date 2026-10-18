@@ -29,6 +29,8 @@ export interface CashOperationDTO {
   accountId: string;
   amountInPaise: bigint;
   description?: string;
+  /** Required for withdrawals: the customer's single-use authorisation code */
+  authorizationCode?: string;
 }
 
 export type CashOperationResult =
@@ -67,4 +69,6 @@ export interface LedgerAccountProvisionDTO {
 export interface LedgerAccountUpdateDTO {
   isActive?: boolean;
   dailyLimitPaise?: bigint;
+  /** account-service control-state version; applied only if newer than the ledger's */
+  version: number;
 }

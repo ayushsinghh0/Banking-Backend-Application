@@ -23,8 +23,10 @@ const updateSchema = z
   .object({
     isActive: z.boolean().optional(),
     dailyLimitPaise: paise.optional(),
+    version: z.number().int().positive(),
   })
   .strict();
+const closeSchema = z.object({ version: z.number().int().positive() }).strict();
 
 const idParams = z.object({ accountId: z.string().uuid() });
 const snapshotsSchema = z.object({ ids: z.array(z.string().uuid()).min(1).max(500) }).strict();
@@ -59,7 +61,8 @@ export function createInternalRouter(ledgerService: LedgerService): Router {
   router.post('/ledger-accounts/:accountId/close', async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { accountId } = idParams.parse(req.params);
-      await ledgerService.closeAccount(accountId);
+      const { version } = closeSchema.parse(req.body);
+      await ledgerService.closeAccount(accountId, version);
       res.json({ success: true, data: await ledgerService.getAccountSnapshot(accountId) });
     } catch (error) {
       next(error);
@@ -79,8 +82,8 @@ export function createInternalRouter(ledgerService: LedgerService): Router {
     try {
       const { accountId } = idParams.parse(req.params);
       const dto = updateSchema.parse(req.body);
-      await ledgerService.updateAccount(accountId, dto);
-      res.json({ success: true, data: await ledgerService.getAccountSnapshot(accountId) });
+      const { applied } = await ledgerService.updateAccount(accountId, dto);
+      res.json({ success: true, data: { applied, ...(await ledgerService.getAccountSnapshot(accountId)) } });
     } catch (error) {
       next(error);
     }

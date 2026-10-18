@@ -1,6 +1,6 @@
 import { PrismaClient, CustomerProfile, KycStatus } from '../../generated/client';
 import Redis from 'ioredis';
-import { AuthenticatedUser, ConflictError, ForbiddenError, NotFoundError, logger } from '@banksphere/common';
+import { AuthenticatedUser, ConflictError, ForbiddenError, HttpError, NotFoundError, logger } from '@banksphere/common';
 
 export interface CreateProfileDTO {
   userId: string;
@@ -118,12 +118,13 @@ export class CustomerService {
    * When profile fields update in PostgreSQL, immediately purge the stale Redis cache entry.
    */
   /**
-   * Updates the caller's own profile. Identity fields that KYC vouched for (full name, date of birth)
-   * can still be corrected, but doing so sends a VERIFIED/REJECTED profile back to PENDING for
-   * re-review, so a verified identity can't be swapped for another one afterwards.
+   * Updates the caller's own profile under a row lock. Every change bumps the profile version, so a KYC
+   * review in progress no longer matches. Identity fields that KYC vouched for (full name, date of birth,
+   * address) can still be corrected, but doing so sends a VERIFIED/REJECTED profile back to PENDING.
    */
   public async updateProfile(userId: string, dto: UpdateProfileDTO): Promise<CustomerProfile> {
     const updated = await this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM customer_profiles WHERE user_id = ${userId} FOR UPDATE`;
       const existing = await tx.customerProfile.findUnique({ where: { userId } });
       if (!existing) {
         throw new NotFoundError('Customer profile not found');
@@ -133,7 +134,8 @@ export class CustomerService {
       const dobChanged =
         dto.dateOfBirth !== undefined &&
         (existing.dateOfBirth?.getTime() ?? null) !== (dto.dateOfBirth?.getTime() ?? null);
-      const identityChanged = nameChanged || dobChanged;
+      const addressChanged = dto.address !== undefined && dto.address !== existing.address;
+      const identityChanged = nameChanged || dobChanged || addressChanged;
       const resetKyc = identityChanged && existing.kycStatus !== KycStatus.PENDING;
 
       const result = await tx.customerProfile.update({
@@ -144,6 +146,7 @@ export class CustomerService {
           ...(dto.address !== undefined && { address: dto.address }),
           ...(dto.dateOfBirth !== undefined && { dateOfBirth: dto.dateOfBirth }),
           ...(resetKyc && { kycStatus: KycStatus.PENDING }),
+          version: { increment: 1 },
         },
       });
 
@@ -160,6 +163,7 @@ export class CustomerService {
               ...(dobChanged && {
                 dateOfBirth: { from: existing.dateOfBirth?.toISOString() ?? null, to: dto.dateOfBirth?.toISOString() ?? null },
               }),
+              ...(addressChanged && { address: { from: existing.address, to: dto.address } }),
             },
           },
         });
@@ -192,10 +196,16 @@ export class CustomerService {
   }
 
   /**
-   * KYC review outcome, set by a BANK_ADMIN. Staff can never decide their own KYC, and every
-   * decision is recorded in the append-only kyc_events trail.
+   * KYC review outcome, set by a KYC officer. The decision applies only to the exact profile version the
+   * officer reviewed (compare-and-set): if the customer changed anything meanwhile, it is refused and must
+   * be re-reviewed. Staff never decide their own KYC; every decision is recorded in kyc_events.
    */
-  public async updateKycStatus(actor: AuthenticatedUser, userId: string, kycStatus: KycStatus): Promise<CustomerProfile> {
+  public async updateKycStatus(
+    actor: AuthenticatedUser,
+    userId: string,
+    kycStatus: KycStatus,
+    expectedVersion: number
+  ): Promise<CustomerProfile> {
     if (actor.id === userId) {
       throw new ForbiddenError('Staff cannot review their own KYC');
     }
@@ -204,7 +214,13 @@ export class CustomerService {
       if (!existing) {
         throw new NotFoundError('Customer profile not found');
       }
-      const result = await tx.customerProfile.update({ where: { userId }, data: { kycStatus } });
+      const result = await tx.customerProfile.updateMany({
+        where: { userId, version: expectedVersion },
+        data: { kycStatus, version: { increment: 1 } },
+      });
+      if (result.count !== 1) {
+        throw new HttpError(409, 'PROFILE_CHANGED', 'The profile changed since it was reviewed; reload and review it again');
+      }
       await tx.kycEvent.create({
         data: {
           userId,
@@ -212,13 +228,24 @@ export class CustomerService {
           action: 'KYC_DECISION',
           fromStatus: existing.kycStatus,
           toStatus: kycStatus,
+          details: { reviewedVersion: expectedVersion },
         },
       });
-      return result;
+      return tx.customerProfile.findUniqueOrThrow({ where: { userId } });
     });
 
     await this.invalidateCache(userId);
     return updated;
+  }
+
+  /** Staff read of a customer's profile: always served from the database and recorded */
+  public async getProfileForStaff(actor: AuthenticatedUser, userId: string): Promise<CustomerProfile> {
+    const profile = await this.prisma.customerProfile.findUnique({ where: { userId } });
+    if (!profile) throw new NotFoundError('Customer profile not found');
+    await this.prisma.staffAccessLog.create({
+      data: { actorId: actor.id, actorRole: actor.role, userId, action: 'VIEW_PROFILE' },
+    });
+    return profile;
   }
 
   public async getKycHistory(userId: string) {

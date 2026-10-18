@@ -82,6 +82,26 @@ export function errorHandlerMiddleware(
     return;
   }
 
+  // A required dependency (Redis security state) is unreachable: fail closed with a retryable 503
+  if (isDependencyUnavailableError(err)) {
+    if (req.log) {
+      req.log.error({ err: (err as Error).message, correlationId }, 'Dependency unavailable');
+    }
+    res.setHeader('Retry-After', '5');
+    res.status(503).json({
+      error: { code: 'SERVICE_UNAVAILABLE', message: 'The service is temporarily unavailable. Please retry shortly.', correlationId },
+    });
+    return;
+  }
+
+  // A database CHECK constraint is the last line of defence (e.g. balance limits): a 422, not a crash
+  if (/violates check constraint|23514/.test(String((err as any).message ?? '') + String((err as any).meta?.code ?? ''))) {
+    res.status(422).json({
+      error: { code: 'CONSTRAINT_VIOLATION', message: 'The request would violate a data integrity rule', correlationId },
+    });
+    return;
+  }
+
   // Unique-constraint races that slipped past application-level checks
   if ((err as any).code === 'P2002') {
     res.status(409).json({
@@ -121,4 +141,13 @@ export function isRetryableDatabaseError(err: unknown): boolean {
   if (RETRYABLE_PG_STATES.includes(pgCode)) return true;
   const message = String(e.message ?? '');
   return /lock timeout|deadlock detected|could not serialize access/i.test(message);
+}
+
+/** ioredis errors raised while the connection is down (fail-fast clients: no offline queue) */
+export function isDependencyUnavailableError(err: unknown): boolean {
+  const e = err as any;
+  if (!e || typeof e !== 'object') return false;
+  if (e.name === 'MaxRetriesPerRequestError') return true;
+  if (['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EPIPE'].includes(e.code)) return true;
+  return /Stream isn't writeable|Connection is closed|max retries per request|^LOADING /i.test(String(e.message ?? ''));
 }

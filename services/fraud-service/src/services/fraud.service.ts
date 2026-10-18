@@ -1,9 +1,10 @@
 import crypto from 'crypto';
-import { AuthenticatedUser, NotFoundError, logger } from '@banksphere/common';
+import { AuthenticatedUser, ConflictError, ForbiddenError, NotFoundError, logger } from '@banksphere/common';
 import { PrismaClient, RiskLevel, AlertStatus, FraudAlert, Prisma } from '../../generated/client';
 import { IRiskRule } from '../rules/risk-rule.interface';
 import { AmountThresholdRule } from '../rules/amount-threshold.rule';
 import { VelocityRule } from '../rules/velocity.rule';
+import { CashStructuringRule } from '../rules/cash-structuring.rule';
 import {
   TransactionEvaluationContext,
   RiskRuleResult,
@@ -24,6 +25,7 @@ export class FraudService {
         Number(process.env.VELOCITY_WINDOW_SECONDS || 60),
         Number(process.env.VELOCITY_MAX_TRANSACTIONS || 3)
       ),
+      new CashStructuringRule(this.prisma),
     ];
   }
 
@@ -111,6 +113,8 @@ export class FraudService {
             riskScore,
             riskLevel,
             direction: context.direction,
+            transactionType: context.transactionType,
+            initiatedBy: context.initiatedBy,
             triggeredRules: triggeredRules as unknown as Prisma.InputJsonValue,
             assessedAt: context.timestamp,
           },
@@ -125,6 +129,8 @@ export class FraudService {
             severity: riskLevel,
             reason: `[${context.direction}] ${reasons || 'Multiple risk anomalies detected'}`,
             status: AlertStatus.OPEN,
+            initiatedBy: context.initiatedBy,
+            cashOperationId: context.cashOperationId,
           },
         });
         await tx.outboxEvent.create({
@@ -166,22 +172,51 @@ export class FraudService {
   }
 
   /**
-   * Analyst triage of an alert; every change is attributed and kept in fraud_alert_events
+   * Analyst triage of an alert, with separation of duties:
+   * - nobody may triage an alert about a transaction they initiated (e.g. a teller's own cash operation);
+   * - closing (RESOLVED/DISMISSED) a HIGH or CRITICAL alert needs two different analysts: the first call
+   *   records a proposal, the second (by someone else, same target status) closes it.
+   * Every step is attributed in fraud_alert_events.
    */
   public async updateAlertStatus(actor: AuthenticatedUser, alertId: string, status: AlertStatus, note?: string) {
     return this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM fraud_alerts WHERE id = ${alertId} FOR UPDATE`;
       const existing = await tx.fraudAlert.findUnique({ where: { id: alertId } });
       if (!existing) {
         throw new NotFoundError('Fraud alert not found');
       }
+      if (existing.initiatedBy && existing.initiatedBy === actor.id) {
+        throw new ForbiddenError('You cannot triage an alert about a transaction you initiated');
+      }
+      const closing = status === AlertStatus.RESOLVED || status === AlertStatus.DISMISSED;
+      const severe = existing.severity === RiskLevel.HIGH || existing.severity === RiskLevel.CRITICAL;
+
+      if (closing && severe) {
+        const confirmsProposal =
+          existing.closeRequestedBy && existing.closeRequestedBy !== actor.id && existing.closeRequestedStatus === status;
+        if (!confirmsProposal) {
+          if (existing.closeRequestedBy === actor.id) {
+            throw new ConflictError('Closing this alert needs confirmation by a different analyst');
+          }
+          const proposed = await tx.fraudAlert.update({
+            where: { id: alertId },
+            data: { status: AlertStatus.UNDER_REVIEW, closeRequestedBy: actor.id, closeRequestedStatus: status, reviewedBy: actor.id },
+          });
+          await tx.fraudAlertEvent.create({
+            data: { alertId, actorId: actor.id, fromStatus: existing.status, toStatus: AlertStatus.UNDER_REVIEW, note: `Proposed ${status}${note ? `: ${note}` : ''}` },
+          });
+          return { ...proposed, pendingSecondApproval: true };
+        }
+      }
+
       const updated = await tx.fraudAlert.update({
         where: { id: alertId },
-        data: { status, reviewedBy: actor.id },
+        data: { status, reviewedBy: actor.id, closeRequestedBy: null, closeRequestedStatus: null },
       });
       await tx.fraudAlertEvent.create({
         data: { alertId, actorId: actor.id, fromStatus: existing.status, toStatus: status, note },
       });
-      return updated;
+      return { ...updated, pendingSecondApproval: false };
     });
   }
 

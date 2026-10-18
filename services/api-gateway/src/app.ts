@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import net from 'net';
 import express, { Request, Response } from 'express';
 import helmet from 'helmet';
 import cors from 'cors';
@@ -27,6 +28,33 @@ export function defaultRoutes(env: NodeJS.ProcessEnv = process.env): RouteTarget
     { name: 'fraud-service', prefix: '/api/v1/fraud', target: env.FRAUD_SERVICE_URL || 'http://localhost:8006' },
   ];
 }
+
+/** Path prefixes that only staff use; restricted by STAFF_ALLOWED_CIDRS when it is configured */
+const STAFF_PATHS = [
+  '/api/v1/auth/admin',
+  '/api/v1/fraud',
+  '/api/v1/notifications',
+  '/api/v1/transactions/deposit',
+  '/api/v1/transactions/withdraw',
+  '/api/v1/transactions/teller',
+  '/api/v1/transactions/cash-operations',
+];
+
+/** "10.0.0.0/8,192.168.1.0/24,fd00::/8" -> BlockList, or null when unset */
+export function parseCidrs(value: string | undefined): net.BlockList | null {
+  if (!value || !value.trim()) return null;
+  const list = new net.BlockList();
+  for (const entry of value.split(',').map((e) => e.trim()).filter(Boolean)) {
+    const [address, prefix] = entry.split('/');
+    const family = net.isIPv6(address) ? 'ipv6' : 'ipv4';
+    if (prefix === undefined) list.addAddress(address, family);
+    else list.addSubnet(address, Number(prefix), family);
+  }
+  return list;
+}
+
+/** Upstreams whose failure makes the API unusable; notification/fraud degrade gracefully instead */
+const CRITICAL_UPSTREAMS = new Set(['auth-service', 'customer-service', 'account-service', 'transaction-service']);
 
 export interface GatewayOptions {
   routes?: RouteTarget[];
@@ -73,22 +101,45 @@ export function createGateway(options: GatewayOptions = {}) {
     );
   }
 
-  // Public health reveals only UP/DOWN; per-upstream detail goes to the logs, not to the internet
-  app.get('/health', async (req: Request, res: Response) => {
-    const results = await Promise.all(
-      routes.map(async (route) => {
-        try {
-          const r = await fetch(`${route.target}/health`, { signal: AbortSignal.timeout(2000) });
-          return [route.name, r.ok] as const;
-        } catch {
-          return [route.name, false] as const;
-        }
-      })
-    );
-    const down = results.filter(([, ok]) => !ok).map(([name]) => name);
-    if (down.length) req.log.warn({ down }, 'Gateway health: upstreams down');
-    res.status(down.length ? 503 : 200).json({ status: down.length ? 'DEGRADED' : 'UP', service: 'api-gateway' });
+  // Liveness: the gateway process itself (used by the container healthcheck / load balancer liveness)
+  app.get('/health/live', (_req: Request, res: Response) => {
+    res.json({ status: 'UP', service: 'api-gateway' });
   });
+
+  // Readiness: only the services the core banking API cannot work without. Cached for a few seconds so
+  // anonymous health probes can't be amplified into upstream load; reveals only UP/DEGRADED.
+  const critical = routes.filter((r) => CRITICAL_UPSTREAMS.has(r.name));
+  let cached: { at: number; down: string[] } | null = null;
+  app.get('/health', async (req: Request, res: Response) => {
+    if (!cached || Date.now() - cached.at > 5_000) {
+      const results = await Promise.all(
+        critical.map(async (route) => {
+          try {
+            const r = await fetch(`${route.target}/health`, { signal: AbortSignal.timeout(2000) });
+            return [route.name, r.ok] as const;
+          } catch {
+            return [route.name, false] as const;
+          }
+        })
+      );
+      cached = { at: Date.now(), down: results.filter(([, ok]) => !ok).map(([name]) => name) };
+      if (cached.down.length) req.log.warn({ down: cached.down }, 'Gateway readiness: critical upstreams down');
+    }
+    res.status(cached.down.length ? 503 : 200).json({ status: cached.down.length ? 'DEGRADED' : 'UP', service: 'api-gateway' });
+  });
+
+  // Staff-only APIs can be restricted to internal networks (VPN/ZTNA) with STAFF_ALLOWED_CIDRS
+  const staffNetworks = parseCidrs(process.env.STAFF_ALLOWED_CIDRS);
+  if (staffNetworks) {
+    app.use((req: Request, res: Response, next) => {
+      if (!STAFF_PATHS.some((p) => req.path === p || req.path.startsWith(`${p}/`))) return next();
+      const ip = (req.ip || '').replace(/^::ffff:/, '');
+      const family = net.isIPv6(ip) ? 'ipv6' : 'ipv4';
+      if (ip && staffNetworks.check(ip, family)) return next();
+      req.log.warn({ path: req.path }, 'Staff API called from a non-allowed network');
+      res.status(403).json({ error: { code: 'NETWORK_NOT_ALLOWED', message: 'This endpoint is only available from the staff network', correlationId: req.correlationId } });
+    });
+  }
 
   for (const route of routes) {
     app.use(createProxy(route));

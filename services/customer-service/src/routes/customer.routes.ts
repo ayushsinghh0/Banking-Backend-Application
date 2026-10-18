@@ -14,10 +14,11 @@ export function createCustomerRouter(controller: CustomerController, authenticat
   router.post('/me', controller.createMe);
   router.patch('/me', controller.updateMe);
 
-  // Staff endpoints: profile lookup and KYC review
-  router.get('/:userId', requireRoles('BANK_ADMIN', 'SUPPORT'), controller.getByUserId);
-  router.patch('/:userId/kyc', requireRoles('BANK_ADMIN'), controller.updateKycStatus);
-  router.get('/:userId/kyc/history', requireRoles('BANK_ADMIN', 'SUPPORT'), controller.getKycHistory);
+  // Staff endpoints: profile lookup (logged) and KYC review (KYC officers only: separation of duties)
+  const staff = requireRoles('SUPPORT', 'TELLER', 'KYC_OFFICER', 'FRAUD_ANALYST', 'BANK_ADMIN');
+  router.get('/:userId', staff, controller.getByUserId);
+  router.patch('/:userId/kyc', requireRoles('KYC_OFFICER'), controller.updateKycStatus);
+  router.get('/:userId/kyc/history', requireRoles('KYC_OFFICER', 'BANK_ADMIN', 'SUPPORT'), controller.getKycHistory);
 
   return router;
 }

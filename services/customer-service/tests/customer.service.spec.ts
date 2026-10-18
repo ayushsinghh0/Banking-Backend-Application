@@ -1,5 +1,5 @@
 import { CustomerService } from '../src/services/customer.service';
-import { NotFoundError, ForbiddenError } from '@banksphere/common';
+import { NotFoundError, ForbiddenError, HttpError } from '@banksphere/common';
 
 describe('CustomerService (Redis Cache-Aside & Invalidation)', () => {
   let mockPrisma: any;
@@ -12,8 +12,12 @@ describe('CustomerService (Redis Cache-Aside & Invalidation)', () => {
         findUnique: jest.fn(),
         create: jest.fn(),
         update: jest.fn(),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        findUniqueOrThrow: jest.fn(),
       },
       kycEvent: { create: jest.fn(), findMany: jest.fn() },
+      staffAccessLog: { create: jest.fn() },
+      $queryRaw: jest.fn().mockResolvedValue([]),
     };
     mockPrisma.$transaction = jest.fn((cb: any) => cb(mockPrisma));
 
@@ -131,13 +135,25 @@ describe('CustomerService (Redis Cache-Aside & Invalidation)', () => {
     });
 
     it('SELF-KYC: staff cannot decide their own KYC; decisions by others are audited', async () => {
-      const admin = { id: 'admin-1', email: 'a@b.com', role: 'BANK_ADMIN' as const, mfa: true };
-      await expect(customerService.updateKycStatus(admin, 'admin-1', 'VERIFIED' as any)).rejects.toThrow(ForbiddenError);
+      const officer = { id: 'kyc-1', email: 'k@b.com', role: 'KYC_OFFICER' as const, mfa: true };
+      await expect(customerService.updateKycStatus(officer, 'kyc-1', 'VERIFIED' as any, 1)).rejects.toThrow(ForbiddenError);
 
-      mockPrisma.customerProfile.findUnique.mockResolvedValue({ userId: 'u-1', kycStatus: 'PENDING' });
-      mockPrisma.customerProfile.update.mockResolvedValue({ userId: 'u-1', kycStatus: 'VERIFIED' });
-      await customerService.updateKycStatus(admin, 'u-1', 'VERIFIED' as any);
-      expect(mockPrisma.kycEvent.create.mock.calls[0][0].data).toEqual(expect.objectContaining({ actorId: 'admin-1', toStatus: 'VERIFIED' }));
+      mockPrisma.customerProfile.findUnique.mockResolvedValue({ userId: 'u-1', kycStatus: 'PENDING', version: 1 });
+      mockPrisma.customerProfile.findUniqueOrThrow.mockResolvedValue({ userId: 'u-1', kycStatus: 'VERIFIED', version: 2 });
+      await customerService.updateKycStatus(officer, 'u-1', 'VERIFIED' as any, 1);
+      expect(mockPrisma.customerProfile.updateMany.mock.calls[0][0].where).toEqual({ userId: 'u-1', version: 1 });
+      expect(mockPrisma.kycEvent.create.mock.calls[0][0].data).toEqual(
+        expect.objectContaining({ actorId: 'kyc-1', toStatus: 'VERIFIED', details: { reviewedVersion: 1 } })
+      );
+      expect(mockRedis.del).toHaveBeenCalledWith('customer:profile:u-1');
+    });
+
+    it('STALE REVIEW: a decision on a profile that changed after it was reviewed is rejected', async () => {
+      const officer = { id: 'kyc-1', email: 'k@b.com', role: 'KYC_OFFICER' as const, mfa: true };
+      mockPrisma.customerProfile.findUnique.mockResolvedValue({ userId: 'u-1', kycStatus: 'PENDING', version: 3 });
+      mockPrisma.customerProfile.updateMany.mockResolvedValue({ count: 0 });
+      await expect(customerService.updateKycStatus(officer, 'u-1', 'VERIFIED' as any, 2)).rejects.toThrow(HttpError);
+      expect(mockPrisma.kycEvent.create).not.toHaveBeenCalled();
     });
   });
 });

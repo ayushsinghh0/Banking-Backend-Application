@@ -3,8 +3,12 @@
 #   docker compose up -d --build
 #   docker compose run --rm -e ADMIN_EMAIL=... -e ADMIN_PASSWORD=... auth-service node dist/scripts/create-admin.js
 #
-# Networks: the internet-facing gateway lives only on `edge`; databases, Redis and Kafka live only on
-# `backend`. Only the gateway publishes a port: put a TLS-terminating load balancer in front of it.
+# Networks (only the gateway publishes a port: put a TLS-terminating load balancer in front of it):
+#   edge     gateway only (published port)
+#   apps     internal: gateway <-> services, plus the rate-limit Redis
+#   backend  internal: services <-> Postgres, Redis, Kafka
+#   egress   outbound internet, only for the services that send email (auth, notification)
+# Every other service has no route to the internet at all.
 # For local development add the dev overlay:  docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
 
 x-node-healthcheck: &node-healthcheck
@@ -19,7 +23,8 @@ x-service-env: &service-env
   LOG_LEVEL: ${LOG_LEVEL:-info}
   TRUST_PROXY: "1" # requests arrive through the API gateway
   JWT_VERIFY_KEYS: ${JWT_VERIFY_KEYS:?set JWT_VERIFY_KEYS in .env}
-  REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379
+  # Read-only Redis ACL user (token versions + revoked jtis); auth and customer override it
+  REDIS_URL: redis://reader:${REDIS_READER_PASSWORD:?set REDIS_READER_PASSWORD in .env}@redis:6379
   KAFKA_ENABLED: "true"
   KAFKA_BROKERS: kafka:29092
 
@@ -32,7 +37,7 @@ x-app: &app
   cap_drop: [ALL]
   mem_limit: 384m
   healthcheck: *node-healthcheck
-  networks: [edge, backend]
+  networks: [apps, backend]
   depends_on:
     migrate:
       condition: service_completed_successfully
@@ -43,8 +48,11 @@ x-app: &app
 
 networks:
   edge: {}
+  apps:
+    internal: true
   backend:
     internal: true # no route to the outside world
+  egress: {}
 
 services:
   postgres:
@@ -86,13 +94,17 @@ services:
     restart: always
     mem_limit: 320m
     networks: [backend]
+    # ACL users per service (docker/redis/start.sh): only auth-service can change security state
     environment:
-      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
-    command: ["sh", "-c", "exec redis-server --appendonly yes --appendfsync everysec --maxmemory 256mb --maxmemory-policy noeviction --requirepass \"$$REDIS_PASSWORD\""]
+      REDIS_AUTH_PASSWORD: ${REDIS_AUTH_PASSWORD:?set REDIS_AUTH_PASSWORD in .env}
+      REDIS_CUSTOMER_PASSWORD: ${REDIS_CUSTOMER_PASSWORD:?set REDIS_CUSTOMER_PASSWORD in .env}
+      REDIS_READER_PASSWORD: ${REDIS_READER_PASSWORD:?set REDIS_READER_PASSWORD in .env}
+    command: ["sh", "/usr/local/etc/redis/start.sh"]
     volumes:
       - redis_data:/data
+      - ./docker/redis/start.sh:/usr/local/etc/redis/start.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      test: ["CMD-SHELL", "redis-cli --user reader --pass \"$$REDIS_READER_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -102,7 +114,7 @@ services:
     image: redis:7.4-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
     restart: always
     mem_limit: 160m
-    networks: [edge]
+    networks: [apps]
     environment:
       REDIS_PASSWORD: ${RATE_LIMIT_REDIS_PASSWORD:?set RATE_LIMIT_REDIS_PASSWORD in .env}
     command: ["sh", "-c", "exec redis-server --save '' --appendonly no --maxmemory 128mb --maxmemory-policy allkeys-lru --requirepass \"$$REDIS_PASSWORD\""]
@@ -205,7 +217,7 @@ services:
   api-gateway:
     <<: *app
     build: { context: ., args: { SERVICE: api-gateway } }
-    networks: [edge]
+    networks: [edge, apps]
     ports:
       - "${GATEWAY_PORT:-8000}:8000"
     environment:
@@ -217,6 +229,8 @@ services:
       REDIS_URL: redis://:${RATE_LIMIT_REDIS_PASSWORD}@redis-ratelimit:6379
       CORS_ORIGINS: ${CORS_ORIGINS:-}
       GATEWAY_RATE_LIMIT_PER_MINUTE: ${GATEWAY_RATE_LIMIT_PER_MINUTE:-300}
+      # Comma-separated CIDRs (VPN/office) allowed to call staff-only APIs; empty = no network restriction
+      STAFF_ALLOWED_CIDRS: ${STAFF_ALLOWED_CIDRS:-}
       AUTH_SERVICE_URL: http://auth-service:8001
       CUSTOMER_SERVICE_URL: http://customer-service:8002
       ACCOUNT_SERVICE_URL: http://account-service:8003
@@ -240,6 +254,10 @@ services:
       KAFKA_USERNAME: auth-svc
       KAFKA_PASSWORD: ${KAFKA_AUTH_PASSWORD}
       PORT: 8001
+      REDIS_URL: redis://auth-svc:${REDIS_AUTH_PASSWORD}@redis:6379
+      # Login/recovery counters live in the evictable rate-limit Redis, never in the security store
+      RATE_LIMIT_REDIS_URL: redis://:${RATE_LIMIT_REDIS_PASSWORD}@redis-ratelimit:6379
+      STAFF_EMAIL_DOMAIN: ${STAFF_EMAIL_DOMAIN:-}
       KAFKA_CLIENT_ID: auth-service
       DATABASE_URL: postgresql://auth_app:${AUTH_DB_APP_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=auth_schema
       JWT_SIGNING_KEY: ${JWT_SIGNING_KEY:?set JWT_SIGNING_KEY in .env}
@@ -256,6 +274,12 @@ services:
       SMTP_USER: ${SMTP_USER:-}
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
       MAIL_FROM: ${MAIL_FROM:?set MAIL_FROM in .env}
+    networks: [apps, backend, egress]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+      redis-ratelimit: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
 
   customer-service:
     <<: *app
@@ -263,6 +287,7 @@ services:
     environment:
       <<: *service-env
       PORT: 8002
+      REDIS_URL: redis://customer-svc:${REDIS_CUSTOMER_PASSWORD}@redis:6379
       DATABASE_URL: postgresql://customer_app:${CUSTOMER_DB_APP_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=customer_schema
       CUSTOMER_INTERNAL_TOKEN: ${CUSTOMER_INTERNAL_TOKEN:?set CUSTOMER_INTERNAL_TOKEN in .env}
 
@@ -312,6 +337,7 @@ services:
       SMTP_USER: ${SMTP_USER:-}
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
       MAIL_FROM: ${MAIL_FROM}
+    networks: [apps, backend, egress]
 
   fraud-service:
     <<: *app

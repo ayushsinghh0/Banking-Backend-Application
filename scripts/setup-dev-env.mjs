@@ -4,6 +4,7 @@
  *
  *   node scripts/setup-dev-env.mjs            # creates .env (random secrets) if missing, then services/<svc>/.env
  *   node scripts/setup-dev-env.mjs --force    # regenerate everything (drop the dev database volume too!)
+ *   node scripts/setup-dev-env.mjs --services # keep .env, add any newly required secrets, rewrite services/<svc>/.env
  *
  * The root .env drives docker compose; the per-service .env files let you run services natively
  * (npm start / npm run dev) against the containers started with:
@@ -16,11 +17,12 @@ import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const force = process.argv.includes('--force');
+const rewriteServices = force || process.argv.includes('--services');
 const secret = () => crypto.randomBytes(32).toString('hex'); // hex: safe inside connection URLs
 const token = () => crypto.randomBytes(48).toString('base64url');
 
-function writeIfAbsent(file, content) {
-  if (fs.existsSync(file) && !force) {
+function writeIfAbsent(file, content, overwrite = force) {
+  if (fs.existsSync(file) && !overwrite) {
     console.log(`skip   ${path.relative(root, file)} (exists)`);
     return;
   }
@@ -44,7 +46,9 @@ POSTGRES_USER=postgres
 POSTGRES_PASSWORD=${secret()}
 POSTGRES_DB=banksphere
 ${dbPasswords}
-REDIS_PASSWORD=${secret()}
+REDIS_AUTH_PASSWORD=${secret()}
+REDIS_CUSTOMER_PASSWORD=${secret()}
+REDIS_READER_PASSWORD=${secret()}
 RATE_LIMIT_REDIS_PASSWORD=${secret()}
 JWT_SIGNING_KEY=${priv}
 JWT_SIGNING_KEY_ID=${kid}
@@ -68,10 +72,23 @@ SMTP_SECURE=false
 SMTP_REQUIRE_TLS=false
 MAIL_FROM="BankSphere <no-reply@banksphere.local>"
 SECURITY_ALERT_EMAIL=security-team@banksphere.local
+STAFF_EMAIL_DOMAIN=banksphere.local
 `
   );
 } else {
   console.log('skip   .env (exists)');
+  // Secrets introduced after the .env was generated are appended, never rotated
+  const existing = fs.readFileSync(rootEnvFile, 'utf8');
+  const added = [
+    ['REDIS_AUTH_PASSWORD', secret()],
+    ['REDIS_CUSTOMER_PASSWORD', secret()],
+    ['REDIS_READER_PASSWORD', secret()],
+    ['STAFF_EMAIL_DOMAIN', 'banksphere.local'],
+  ].filter(([k]) => !new RegExp(`^${k}=`, 'm').test(existing));
+  if (added.length) {
+    fs.appendFileSync(rootEnvFile, `${existing.endsWith('\n') ? '' : '\n'}${added.map(([k, v]) => `${k}=${v}`).join('\n')}\n`);
+    console.log(`update .env (added ${added.map(([k]) => k).join(', ')})`);
+  }
 }
 
 const env = Object.fromEntries(
@@ -92,7 +109,6 @@ const db = (prefix, schema) =>
 const common = `NODE_ENV=development
 LOG_LEVEL=info
 JWT_VERIFY_KEYS="${env.JWT_VERIFY_KEYS}"
-REDIS_URL="redis://:${env.REDIS_PASSWORD}@127.0.0.1:6380"
 KAFKA_ENABLED=true
 KAFKA_BROKERS=localhost:9092
 TRUST_PROXY=1
@@ -106,19 +122,23 @@ SMTP_REQUIRE_TLS=false
 MAIL_FROM="${env.MAIL_FROM}"
 `;
 
+// Redis ACL users (docker/redis/start.sh): only auth-service may write security state
+const redis = (user, pw) => `REDIS_URL="redis://${user}:${env[pw]}@127.0.0.1:6380"\n`;
+const reader = redis('reader', 'REDIS_READER_PASSWORD');
+
 const kafka = (user, pw) => `KAFKA_USERNAME=${user}\nKAFKA_PASSWORD=${env[pw]}\n`;
 
 const services = {
-  'auth-service': `PORT=8001\nKAFKA_CLIENT_ID=auth-service\n${kafka('auth-svc', 'KAFKA_AUTH_PASSWORD')}${db('AUTH', 'auth_schema')}\nJWT_SIGNING_KEY="${env.JWT_SIGNING_KEY}"\nJWT_SIGNING_KEY_ID=${env.JWT_SIGNING_KEY_ID}\nJWT_ACCESS_EXPIRATION=${env.JWT_ACCESS_EXPIRATION}\nJWT_REFRESH_EXPIRATION_DAYS=${env.JWT_REFRESH_EXPIRATION_DAYS}\nMFA_ENCRYPTION_KEY=${env.MFA_ENCRYPTION_KEY}\nAPP_BASE_URL=${env.APP_BASE_URL}\n${smtp}# Relaxed per-IP limits so the local e2e suite can be re-run (production defaults: 30 / 10 per 15 min)\nAUTH_RATE_LIMIT_MAX=500\nAUTH_RECOVERY_RATE_LIMIT_MAX=500\n`,
-  'customer-service': `PORT=8002\n${db('CUSTOMER', 'customer_schema')}\nCUSTOMER_INTERNAL_TOKEN="${env.CUSTOMER_INTERNAL_TOKEN}"\n`,
-  'account-service': `PORT=8003\nKAFKA_CLIENT_ID=account-service\n${kafka('account-svc', 'KAFKA_ACCOUNT_PASSWORD')}LEDGER_SERVICE_URL=http://localhost:8004\nCUSTOMER_SERVICE_URL=http://localhost:8002\n${db('ACCOUNT', 'account_schema')}\nLEDGER_INTERNAL_TOKEN="${env.LEDGER_INTERNAL_TOKEN}"\nCUSTOMER_INTERNAL_TOKEN="${env.CUSTOMER_INTERNAL_TOKEN}"\n`,
-  'transaction-service': `PORT=8004\nKAFKA_CLIENT_ID=transaction-service\n${kafka('ledger-svc', 'KAFKA_LEDGER_PASSWORD')}${db('LEDGER', 'ledger_schema')}\nLEDGER_INTERNAL_TOKEN="${env.LEDGER_INTERNAL_TOKEN}"\n`,
-  'notification-service': `PORT=8005\nKAFKA_CLIENT_ID=notification-service\n${kafka('notification-svc', 'KAFKA_NOTIFICATION_PASSWORD')}SECURITY_ALERT_EMAIL=${env.SECURITY_ALERT_EMAIL}\n${db('NOTIFICATION', 'notification_schema')}\n${smtp}`,
-  'fraud-service': `PORT=8006\nKAFKA_CLIENT_ID=fraud-service\n${kafka('fraud-svc', 'KAFKA_FRAUD_PASSWORD')}${db('FRAUD', 'fraud_schema')}\n`,
+  'auth-service': `PORT=8001\nKAFKA_CLIENT_ID=auth-service\n${redis('auth-svc', 'REDIS_AUTH_PASSWORD')}RATE_LIMIT_REDIS_URL="redis://:${env.RATE_LIMIT_REDIS_PASSWORD}@127.0.0.1:6381"\nSTAFF_EMAIL_DOMAIN=${env.STAFF_EMAIL_DOMAIN}\n${kafka('auth-svc', 'KAFKA_AUTH_PASSWORD')}${db('AUTH', 'auth_schema')}\nJWT_SIGNING_KEY="${env.JWT_SIGNING_KEY}"\nJWT_SIGNING_KEY_ID=${env.JWT_SIGNING_KEY_ID}\nJWT_ACCESS_EXPIRATION=${env.JWT_ACCESS_EXPIRATION}\nJWT_REFRESH_EXPIRATION_DAYS=${env.JWT_REFRESH_EXPIRATION_DAYS}\nMFA_ENCRYPTION_KEY=${env.MFA_ENCRYPTION_KEY}\nAPP_BASE_URL=${env.APP_BASE_URL}\n${smtp}# Relaxed per-IP limits so the local e2e suite can be re-run (production defaults: 30 / 10 per 15 min)\nAUTH_RATE_LIMIT_MAX=500\nAUTH_RECOVERY_RATE_LIMIT_MAX=500\n`,
+  'customer-service': `PORT=8002\n${redis('customer-svc', 'REDIS_CUSTOMER_PASSWORD')}${db('CUSTOMER', 'customer_schema')}\nCUSTOMER_INTERNAL_TOKEN="${env.CUSTOMER_INTERNAL_TOKEN}"\n`,
+  'account-service': `PORT=8003\n${reader}KAFKA_CLIENT_ID=account-service\n${kafka('account-svc', 'KAFKA_ACCOUNT_PASSWORD')}LEDGER_SERVICE_URL=http://localhost:8004\nCUSTOMER_SERVICE_URL=http://localhost:8002\n${db('ACCOUNT', 'account_schema')}\nLEDGER_INTERNAL_TOKEN="${env.LEDGER_INTERNAL_TOKEN}"\nCUSTOMER_INTERNAL_TOKEN="${env.CUSTOMER_INTERNAL_TOKEN}"\n`,
+  'transaction-service': `PORT=8004\n${reader}KAFKA_CLIENT_ID=transaction-service\n${kafka('ledger-svc', 'KAFKA_LEDGER_PASSWORD')}${db('LEDGER', 'ledger_schema')}\nLEDGER_INTERNAL_TOKEN="${env.LEDGER_INTERNAL_TOKEN}"\n`,
+  'notification-service': `PORT=8005\n${reader}KAFKA_CLIENT_ID=notification-service\n${kafka('notification-svc', 'KAFKA_NOTIFICATION_PASSWORD')}SECURITY_ALERT_EMAIL=${env.SECURITY_ALERT_EMAIL}\n${db('NOTIFICATION', 'notification_schema')}\n${smtp}`,
+  'fraud-service': `PORT=8006\n${reader}KAFKA_CLIENT_ID=fraud-service\n${kafka('fraud-svc', 'KAFKA_FRAUD_PASSWORD')}${db('FRAUD', 'fraud_schema')}\n`,
 };
 
 for (const [svc, specific] of Object.entries(services)) {
-  writeIfAbsent(path.join(root, 'services', svc, '.env'), `# Generated by scripts/setup-dev-env.mjs\n${common}${specific}`);
+  writeIfAbsent(path.join(root, 'services', svc, '.env'), `# Generated by scripts/setup-dev-env.mjs\n${common}${specific}`, rewriteServices);
 }
 
 writeIfAbsent(
@@ -128,6 +148,8 @@ PORT=8000
 NODE_ENV=development
 LOG_LEVEL=info
 REDIS_URL="redis://:${env.RATE_LIMIT_REDIS_PASSWORD}@127.0.0.1:6381"
+# Relaxed so the e2e suite can be re-run back to back (production default: 300 per minute per IP)
+GATEWAY_RATE_LIMIT_PER_MINUTE=5000
 CORS_ORIGINS=${env.CORS_ORIGINS}
 AUTH_SERVICE_URL=http://localhost:8001
 CUSTOMER_SERVICE_URL=http://localhost:8002
@@ -135,5 +157,6 @@ ACCOUNT_SERVICE_URL=http://localhost:8003
 TRANSACTION_SERVICE_URL=http://localhost:8004
 NOTIFICATION_SERVICE_URL=http://localhost:8005
 FRAUD_SERVICE_URL=http://localhost:8006
-`
+`,
+  rewriteServices
 );

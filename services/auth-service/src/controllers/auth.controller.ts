@@ -1,7 +1,8 @@
 import { Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
-import { clientIpKey, getAuthenticatedUser, readBearerToken, verifyAccessToken } from '@banksphere/common';
+import { clientIpKey, getAuthenticatedUser, parsePagination, readBearerToken, verifyAccessToken } from '@banksphere/common';
 import { AuthService } from '../services/auth.service';
+import { AdminRequestService } from '../services/admin-requests.service';
 
 const emailSchema = z
   .string()
@@ -24,11 +25,11 @@ const totpCodeSchema = z.string().regex(/^\d{6}$/, { message: 'Code must be 6 di
 // .strict() rejects unknown keys, so a client sending { role: 'BANK_ADMIN' } gets a 400
 const registerSchema = z.object({ email: emailSchema, password: passwordSchema }).strict();
 
+// Staff requests carry no password: the new staff member chooses it via the emailed activation link
 const createStaffSchema = z
   .object({
     email: emailSchema,
-    password: passwordSchema,
-    role: z.enum(['CUSTOMER', 'BANK_ADMIN', 'SUPPORT']),
+    role: z.enum(['SUPPORT', 'TELLER', 'KYC_OFFICER', 'FRAUD_ANALYST', 'BANK_ADMIN']),
   })
   .strict();
 
@@ -37,7 +38,11 @@ const loginSchema = z.object({
   password: z.string().min(1).max(128),
 });
 const mfaLoginSchema = z.object({ challengeToken: oneTimeTokenSchema, code: totpCodeSchema }).strict();
-const mfaCodeSchema = z.object({ code: totpCodeSchema }).strict();
+const mfaSetupSchema = z.object({ password: z.string().min(1).max(128), enrolmentToken: oneTimeTokenSchema.optional() }).strict();
+const mfaEnableSchema = z.object({ code: totpCodeSchema, enrolmentToken: oneTimeTokenSchema.optional() }).strict();
+const activateSchema = z.object({ token: oneTimeTokenSchema, password: passwordSchema }).strict();
+const requestIdParams = z.object({ requestId: z.string().uuid() });
+const requestListQuery = z.object({ status: z.enum(['PENDING', 'APPROVED', 'REJECTED']).optional() });
 const mfaDisableSchema = z.object({ password: z.string().min(1).max(128), code: totpCodeSchema }).strict();
 
 const refreshSchema = z.object({
@@ -62,7 +67,10 @@ const wrap =
   };
 
 export class AuthController {
-  constructor(private readonly authService: AuthService) {}
+  constructor(
+    private readonly authService: AuthService,
+    private readonly adminRequests: AdminRequestService
+  ) {}
 
   public register = wrap(async (req, res) => {
     const validated = registerSchema.parse(req.body);
@@ -116,14 +124,21 @@ export class AuthController {
   });
 
   public mfaSetup = wrap(async (req, res) => {
-    const result = await this.authService.beginMfaSetup(getAuthenticatedUser(req));
+    const { password, enrolmentToken } = mfaSetupSchema.parse(req.body);
+    const result = await this.authService.beginMfaSetup(getAuthenticatedUser(req), password, enrolmentToken);
     res.status(200).json({ success: true, data: result });
   });
 
   public mfaEnable = wrap(async (req, res) => {
-    const { code } = mfaCodeSchema.parse(req.body);
-    const tokens = await this.authService.enableMfa(getAuthenticatedUser(req), code);
+    const { code, enrolmentToken } = mfaEnableSchema.parse(req.body);
+    const tokens = await this.authService.enableMfa(getAuthenticatedUser(req), code, enrolmentToken);
     res.status(200).json({ success: true, data: { tokens } });
+  });
+
+  public activateStaff = wrap(async (req, res) => {
+    const { token, password } = activateSchema.parse(req.body);
+    const result = await this.authService.activateStaff(token, password);
+    res.status(200).json({ success: true, data: result });
   });
 
   public mfaDisable = wrap(async (req, res) => {
@@ -157,22 +172,53 @@ export class AuthController {
     res.status(200).json({ success: true, data: user });
   });
 
+  /** Four-eyes: records a request; a different BANK_ADMIN must approve it */
   public createStaffUser = wrap(async (req, res) => {
-    const validated = createStaffSchema.parse(req.body);
-    const user = await this.authService.createStaffUser(validated, getAuthenticatedUser(req).id);
-    res.status(201).json({ success: true, data: user });
+    const { email, role } = createStaffSchema.parse(req.body);
+    const request = await this.adminRequests.request(getAuthenticatedUser(req), { type: 'CREATE_STAFF', email, role });
+    res.status(202).json({ success: true, data: { requestId: request.id, status: request.status } });
   });
 
+  /** Customers: immediate (fraud response). Staff targets: becomes a four-eyes request (202). */
   public setUserStatus = wrap(async (req, res) => {
     const { userId } = userIdParamsSchema.parse(req.params);
     const { isActive } = userStatusSchema.parse(req.body);
-    const user = await this.authService.setUserActive(getAuthenticatedUser(req), userId, isActive);
-    res.status(200).json({ success: true, data: user });
+    const actor = getAuthenticatedUser(req);
+    try {
+      res.status(200).json({ success: true, data: await this.authService.setCustomerActive(actor, userId, isActive) });
+    } catch (err: any) {
+      if (err?.errorCode !== 'APPROVAL_REQUIRED') throw err;
+      const request = await this.adminRequests.request(actor, { type: 'SET_USER_ACTIVE', userId, isActive });
+      res.status(202).json({ success: true, data: { requestId: request.id, status: request.status } });
+    }
   });
 
   public resetUserMfa = wrap(async (req, res) => {
     const { userId } = userIdParamsSchema.parse(req.params);
-    await this.authService.adminResetMfa(getAuthenticatedUser(req), userId);
-    res.status(200).json({ success: true, message: 'MFA reset; the user must re-enrol at next sign-in.' });
+    const actor = getAuthenticatedUser(req);
+    try {
+      await this.authService.adminResetCustomerMfa(actor, userId);
+      res.status(200).json({ success: true, message: 'MFA reset; the user must re-enrol at next sign-in.' });
+    } catch (err: any) {
+      if (err?.errorCode !== 'APPROVAL_REQUIRED') throw err;
+      const request = await this.adminRequests.request(actor, { type: 'RESET_MFA', userId });
+      res.status(202).json({ success: true, data: { requestId: request.id, status: request.status } });
+    }
+  });
+
+  public listAdminRequests = wrap(async (req, res) => {
+    const { status } = requestListQuery.parse(req.query);
+    const { limit, offset } = parsePagination(req.query);
+    res.json({ success: true, data: await this.adminRequests.list(status, limit, offset), pagination: { limit, offset } });
+  });
+
+  public approveAdminRequest = wrap(async (req, res) => {
+    const { requestId } = requestIdParams.parse(req.params);
+    res.json({ success: true, data: await this.adminRequests.approve(getAuthenticatedUser(req), requestId) });
+  });
+
+  public rejectAdminRequest = wrap(async (req, res) => {
+    const { requestId } = requestIdParams.parse(req.params);
+    res.json({ success: true, data: await this.adminRequests.reject(getAuthenticatedUser(req), requestId) });
   });
 }

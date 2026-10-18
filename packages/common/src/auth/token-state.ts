@@ -7,23 +7,35 @@ import Redis from 'ioredis';
  *   mirrored here). Tokens carry the version they were issued with; bumping it on password change,
  *   password reset or account disable instantly invalidates every outstanding access token.
  * - jti denylist: logout revokes the single access token presented, until it would have expired anyway.
+ * - session denylist: when a session (refresh-token family) is ended - logout, or refresh-token reuse
+ *   i.e. suspected theft - every access token of that session stops working at once, not at expiry.
  */
+export interface AccessTokenRef {
+  userId: string;
+  jti: string;
+  tokenVersion: number;
+  sessionId?: string;
+}
+
 export interface TokenStateStore {
-  isAccessTokenRevoked(userId: string, jti: string, tokenVersion: number): Promise<boolean>;
+  isAccessTokenRevoked(token: AccessTokenRef): Promise<boolean>;
   setTokenVersion(userId: string, tokenVersion: number): Promise<void>;
   revokeJti(jti: string, ttlSeconds: number): Promise<void>;
+  revokeSession(sessionId: string, ttlSeconds: number): Promise<void>;
 }
 
 const VERSION_KEY = (userId: string) => `auth:tv:${userId}`;
 const JTI_KEY = (jti: string) => `auth:revoked-jti:${jti}`;
+const SESSION_KEY = (sessionId: string) => `auth:revoked-sid:${sessionId}`;
 
 export class RedisTokenStateStore implements TokenStateStore {
   constructor(private readonly redis: Redis) {}
 
-  public async isAccessTokenRevoked(userId: string, jti: string, tokenVersion: number): Promise<boolean> {
-    const [currentVersion, revokedJti] = await this.redis.mget(VERSION_KEY(userId), JTI_KEY(jti));
-    if (revokedJti) return true;
-    return tokenVersion < Number(currentVersion ?? 0);
+  public async isAccessTokenRevoked(token: AccessTokenRef): Promise<boolean> {
+    const keys = [VERSION_KEY(token.userId), JTI_KEY(token.jti), ...(token.sessionId ? [SESSION_KEY(token.sessionId)] : [])];
+    const [currentVersion, revokedJti, revokedSession] = await this.redis.mget(...keys);
+    if (revokedJti || revokedSession) return true;
+    return token.tokenVersion < Number(currentVersion ?? 0);
   }
 
   public async setTokenVersion(userId: string, tokenVersion: number): Promise<void> {
@@ -43,6 +55,11 @@ export class RedisTokenStateStore implements TokenStateStore {
     if (ttlSeconds <= 0) return;
     await this.redis.set(JTI_KEY(jti), '1', 'EX', Math.ceil(ttlSeconds));
   }
+
+  public async revokeSession(sessionId: string, ttlSeconds: number): Promise<void> {
+    if (ttlSeconds <= 0) return;
+    await this.redis.set(SESSION_KEY(sessionId), '1', 'EX', Math.ceil(ttlSeconds));
+  }
 }
 
 /**
@@ -51,9 +68,14 @@ export class RedisTokenStateStore implements TokenStateStore {
 export class InMemoryTokenStateStore implements TokenStateStore {
   private readonly versions = new Map<string, number>();
   private readonly revoked = new Set<string>();
+  private readonly revokedSessions = new Set<string>();
 
-  public async isAccessTokenRevoked(userId: string, jti: string, tokenVersion: number): Promise<boolean> {
-    return this.revoked.has(jti) || tokenVersion < (this.versions.get(userId) ?? 0);
+  public async isAccessTokenRevoked(token: AccessTokenRef): Promise<boolean> {
+    return (
+      this.revoked.has(token.jti) ||
+      (token.sessionId !== undefined && this.revokedSessions.has(token.sessionId)) ||
+      token.tokenVersion < (this.versions.get(token.userId) ?? 0)
+    );
   }
 
   public async setTokenVersion(userId: string, tokenVersion: number): Promise<void> {
@@ -62,5 +84,9 @@ export class InMemoryTokenStateStore implements TokenStateStore {
 
   public async revokeJti(jti: string): Promise<void> {
     this.revoked.add(jti);
+  }
+
+  public async revokeSession(sessionId: string): Promise<void> {
+    this.revokedSessions.add(sessionId);
   }
 }

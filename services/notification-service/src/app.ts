@@ -49,7 +49,7 @@ export function createApp(prisma: PrismaClient, deps: NotificationAppDeps) {
   app.get(
     '/api/v1/notifications/logs',
     authenticate,
-    requireRoles('BANK_ADMIN', 'SUPPORT'),
+    requireRoles('BANK_ADMIN', 'SUPPORT', 'FRAUD_ANALYST'),
     async (req: Request, res: Response, next: NextFunction) => {
       try {
         const { recipient } = logsQuerySchema.parse(req.query);

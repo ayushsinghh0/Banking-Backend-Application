@@ -9,7 +9,23 @@ export interface KafkaConfig {
 export interface SubscribeOptions {
   /** Attempts for a message that keeps failing with a NON-transient error before it is dead-lettered */
   maxAttempts?: number;
+  /** How long a transient failure is retried in place before the message moves to `<topic>.retry` */
+  transientBudgetMs?: number;
+  /** Delays (ms) for successive hops through `<topic>.retry`; after the last one the message is dead-lettered */
+  retryDelaysMs?: number[];
 }
+
+/** Envelope for messages parked on `<topic>.retry` */
+interface RetryEnvelope {
+  __retry: 1;
+  originalTopic: string;
+  hop: number;
+  retryAt: number;
+  lastError: string;
+  payload: unknown;
+}
+
+const DEFAULT_RETRY_DELAYS_MS = [60_000, 300_000, 900_000, 1_800_000, 3_600_000, 3_600_000, 3_600_000, 3_600_000];
 
 /**
  * Throw this (or any error isTransientError recognises) from a handler to say "the message is fine,
@@ -174,6 +190,8 @@ export class KafkaService {
     options: SubscribeOptions
   ): Promise<void> {
     const maxAttempts = options.maxAttempts ?? 5;
+    const transientBudgetMs = options.transientBudgetMs ?? Number(process.env.KAFKA_TRANSIENT_BUDGET_MS || 120_000);
+    const retryDelaysMs = options.retryDelaysMs ?? DEFAULT_RETRY_DELAYS_MS;
     const consumer = this.kafka.consumer({ groupId, sessionTimeout: 30_000, heartbeatInterval: 3_000 });
 
     consumer.on(consumer.events.CRASH, (event) => {
@@ -195,10 +213,14 @@ export class KafkaService {
     });
     consumer.on(consumer.events.GROUP_JOIN, () => this.consumerState.set(groupId, 'running'));
     consumer.on(consumer.events.FETCH, () => this.lastFetch.set(groupId, Date.now()));
+    consumer.on(consumer.events.HEARTBEAT, () => this.lastFetch.set(groupId, Date.now()));
 
     await consumer.connect();
     for (const topic of topics) {
-      await consumer.subscribe({ topic, fromBeginning: true });
+      // fromBeginning only matters for a brand-new consumer group: it must not miss events published
+      // before its first start. Handlers are idempotent (processed-event tables), so a replay is safe.
+      await consumer.subscribe({ topic, fromBeginning: process.env.KAFKA_FROM_BEGINNING !== 'false' });
+      await consumer.subscribe({ topic: `${topic}.retry`, fromBeginning: process.env.KAFKA_FROM_BEGINNING !== 'false' });
     }
 
     await consumer.run({
@@ -222,7 +244,28 @@ export class KafkaService {
           return;
         }
 
-        const correlationId = parsed?.correlationId || message.headers?.['x-correlation-id']?.toString();
+        const commitAndReturn = async () => {
+          await commit();
+        };
+
+        // Messages on a retry topic are delayed: wait (heartbeating) until they are due
+        let originalTopic = topic;
+        let payload: any = parsed;
+        let hop = 0;
+        if (topic.endsWith('.retry') && parsed?.__retry === 1) {
+          const envelope = parsed as RetryEnvelope;
+          originalTopic = envelope.originalTopic;
+          payload = envelope.payload;
+          hop = envelope.hop;
+          while (Date.now() < envelope.retryAt) {
+            if (this.stopping) throw new Error('Consumer stopping; message will be redelivered');
+            await new Promise((r) => setTimeout(r, Math.min(1_000, envelope.retryAt - Date.now())));
+            await heartbeat().catch(() => {});
+          }
+        }
+
+        const correlationId = payload?.correlationId || message.headers?.['x-correlation-id']?.toString();
+        const transientDeadline = Date.now() + transientBudgetMs;
 
         let failures = 0;
         let transientRetries = 0;
@@ -230,8 +273,8 @@ export class KafkaService {
         for (;;) {
           if (this.stopping) throw new Error('Consumer stopping; message will be redelivered');
           try {
-            await messageHandler(topic, parsed, correlationId);
-            await commit();
+            await messageHandler(originalTopic, payload, correlationId);
+            await commitAndReturn();
             return;
           } catch (error) {
             lastError = error;
@@ -239,10 +282,28 @@ export class KafkaService {
             if (transient) transientRetries++;
             else failures++;
             logger.warn(
-              { err: error, topic, partition, offset: message.offset, transient, failures, transientRetries },
+              { err: error, topic: originalTopic, partition, offset: message.offset, transient, failures, transientRetries, hop },
               'Consumer processing error'
             );
             if (!transient && failures >= maxAttempts) break;
+            if (transient && Date.now() >= transientDeadline) {
+              // Don't block the partition: park the message on the retry topic and move on
+              if (hop < retryDelaysMs.length) {
+                const envelope: RetryEnvelope = {
+                  __retry: 1,
+                  originalTopic,
+                  hop: hop + 1,
+                  retryAt: Date.now() + retryDelaysMs[hop],
+                  lastError: String((error as any)?.message ?? error).slice(0, 500),
+                  payload,
+                };
+                await this.publishEvent(`${originalTopic}.retry`, message.key?.toString() || 'unknown', envelope);
+                logger.warn({ topic: originalTopic, hop: hop + 1 }, 'Message moved to retry topic after transient failures');
+                await commitAndReturn();
+                return;
+              }
+              break; // retry hops exhausted: dead-letter
+            }
             const delay = transient
               ? Math.min(500 * 2 ** Math.min(transientRetries, 6), 30_000)
               : Math.min(200 * 2 ** failures, 5_000);
@@ -254,8 +315,8 @@ export class KafkaService {
           }
         }
 
-        await this.sendToDlq(topic, message.key?.toString(), rawValue, String((lastError as any)?.message ?? lastError));
-        await commit();
+        await this.sendToDlq(originalTopic, message.key?.toString(), JSON.stringify(payload), String((lastError as any)?.message ?? lastError));
+        await commitAndReturn();
       },
     });
 

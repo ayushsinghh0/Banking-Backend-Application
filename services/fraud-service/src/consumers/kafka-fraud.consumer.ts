@@ -32,6 +32,9 @@ export class KafkaFraudConsumer {
         transactionId: payload.transactionId as string,
         amountInPaise: BigInt(payload.amountInPaise),
         timestamp: new Date(payload.timestamp || Date.now()),
+        transactionType: typeof payload.type === 'string' ? payload.type : undefined,
+        initiatedBy: typeof payload.initiatedBy === 'string' ? payload.initiatedBy : undefined,
+        cashOperationId: typeof payload.cashOperationId === 'string' ? payload.cashOperationId : undefined,
       };
       const sides: TransactionEvaluationContext[] = [];
       if (payload.sourceAccountId) sides.push({ ...base, accountId: payload.sourceAccountId, direction: 'OUTBOUND' });

@@ -1,10 +1,12 @@
+import crypto from 'crypto';
 import { EventPublisher } from '../kafka/event-publisher';
 import { logger } from '../logger/logger';
 
 /**
  * Minimal shape of a Prisma client whose schema contains the standard `outbox_events` table:
- *   id, aggregate_id, event_type, payload (jsonb), status ("OutboxStatus": PENDING/PUBLISHED/FAILED),
- *   retry_count, last_error, next_attempt_at, locked_until, created_at, published_at
+ *   id, seq (bigserial), aggregate_id, event_type, payload (jsonb), status ("OutboxStatus":
+ *   PENDING/PUBLISHED/FAILED), retry_count, last_error, next_attempt_at, locked_until, locked_by,
+ *   created_at, published_at
  */
 export interface OutboxPrismaClient {
   $queryRaw<T = unknown>(query: TemplateStringsArray, ...values: any[]): Promise<T>;
@@ -19,43 +21,66 @@ interface OutboxRow {
   retry_count: number;
 }
 
+export interface OutboxRelayOptions {
+  /** Rows claimed per batch; small, so a batch always finishes well inside its lease */
+  batchSize?: number;
+  /** Lease per claim; must exceed batchSize * publishTimeoutMs */
+  leaseSeconds?: number;
+  publishTimeoutMs?: number;
+  /** Publish attempts before a row is parked as FAILED (with an alert) so it stops blocking its aggregate */
+  maxAttempts?: number;
+  /** PUBLISHED rows older than this are purged */
+  retentionDays?: number;
+}
+
 const MAX_BACKOFF_SECONDS = 300;
 
 /**
  * Transactional-outbox relay. Rows are written in the same DB transaction as the business change;
  * this relay publishes them to Kafka.
  *
- * - Rows are CLAIMED with a short lease in one quick statement, PUBLISHED with no DB transaction held
- *   open, then marked PUBLISHED. A crashed relay's lease simply expires and another replica takes over.
- * - Only the oldest unpublished event of each aggregate is claimable, so events for the same aggregate
- *   (e.g. FROZEN then ACTIVE for one account) are always delivered in order.
- * - Failed publishes are retried forever with exponential backoff (capped at 5 min): a Kafka outage
- *   delays events but never loses them.
+ * - Rows are CLAIMED with a lease and a fencing token (locked_by) in one quick statement, PUBLISHED with
+ *   no DB transaction held open, then marked PUBLISHED only if this relay still holds the claim.
+ * - Only the lowest-seq unpublished event of each aggregate is claimable, so events for one aggregate are
+ *   delivered in insertion order.
+ * - Failed publishes back off exponentially (capped at 5 min); after maxAttempts the row is parked as
+ *   FAILED and an alert is logged, so one poison event can't block its aggregate forever.
  * - Delivery is at-least-once; consumers deduplicate on eventId.
  */
 export class OutboxRelay {
   private timer: NodeJS.Timeout | null = null;
+  private purgeTimer: NodeJS.Timeout | null = null;
   private running = false;
   private stopped = false;
+  private readonly opts: Required<OutboxRelayOptions>;
 
   constructor(
     private readonly prisma: OutboxPrismaClient,
     private readonly publisher: EventPublisher,
-    private readonly options: { batchSize?: number; leaseSeconds?: number; publishTimeoutMs?: number } = {}
-  ) {}
+    options: OutboxRelayOptions = {}
+  ) {
+    this.opts = {
+      batchSize: options.batchSize ?? 20,
+      publishTimeoutMs: options.publishTimeoutMs ?? 10_000,
+      leaseSeconds: options.leaseSeconds ?? 300,
+      maxAttempts: options.maxAttempts ?? Number(process.env.OUTBOX_MAX_ATTEMPTS || 60),
+      retentionDays: options.retentionDays ?? Number(process.env.OUTBOX_RETENTION_DAYS || 7),
+    };
+  }
 
   public start(intervalMs = 1000): void {
     if (this.timer) return;
     this.stopped = false;
     this.timer = setInterval(() => void this.tick(), intervalMs);
+    this.purgeTimer = setInterval(() => void this.purgePublished().catch((err) => logger.warn({ err }, 'Outbox purge failed')), 3600_000);
   }
 
   public async stop(): Promise<void> {
     this.stopped = true;
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = null;
-    }
+    if (this.timer) clearInterval(this.timer);
+    if (this.purgeTimer) clearInterval(this.purgeTimer);
+    this.timer = null;
+    this.purgeTimer = null;
     while (this.running) {
       await new Promise((r) => setTimeout(r, 50));
     }
@@ -69,6 +94,8 @@ export class OutboxRelay {
       while (!this.stopped && (await this.processPendingEvents()) > 0) {
         /* continue */
       }
+      const lag = await this.lagSeconds();
+      if (lag > 300) logger.error({ lagSeconds: lag, alert: 'OUTBOX_LAG' }, 'Outbox events are not being published');
     } catch (err) {
       logger.error({ err }, 'Outbox relay batch failed');
     } finally {
@@ -86,12 +113,10 @@ export class OutboxRelay {
   }
 
   public async processPendingEvents(): Promise<number> {
-    const batchSize = this.options.batchSize ?? 100;
-    const leaseSeconds = this.options.leaseSeconds ?? 60;
-
+    const claim = crypto.randomUUID();
     const rows = await this.prisma.$queryRaw<OutboxRow[]>`
       UPDATE outbox_events o
-      SET locked_until = now() + make_interval(secs => ${leaseSeconds})
+      SET locked_until = now() + make_interval(secs => ${this.opts.leaseSeconds}), locked_by = ${claim}
       WHERE o.id IN (
         SELECT c.id FROM outbox_events c
         WHERE c.status = 'PENDING'
@@ -99,43 +124,56 @@ export class OutboxRelay {
           AND (c.locked_until IS NULL OR c.locked_until < now())
           AND NOT EXISTS (
             SELECT 1 FROM outbox_events e
-            WHERE e.aggregate_id = c.aggregate_id AND e.status = 'PENDING'
-              AND (e.created_at, e.id) < (c.created_at, c.id)
+            WHERE e.aggregate_id = c.aggregate_id AND e.status = 'PENDING' AND e.seq < c.seq
           )
-        ORDER BY c.created_at ASC, c.id ASC
-        LIMIT ${batchSize}
+        ORDER BY c.seq ASC
+        LIMIT ${this.opts.batchSize}
         FOR UPDATE SKIP LOCKED
       )
       RETURNING o.id, o.aggregate_id, o.event_type, o.payload, o.retry_count
     `;
 
     for (const row of rows) {
+      if (this.stopped) break; // unprocessed rows are released when the lease expires
       try {
         // Topic = event type (e.g. transaction.completed.v1); key = aggregate id keeps per-aggregate ordering
-        await this.withTimeout(
-          this.publisher.publish(row.event_type, row.aggregate_id, row.payload),
-          this.options.publishTimeoutMs ?? 15_000
-        );
+        await this.withTimeout(this.publisher.publish(row.event_type, row.aggregate_id, row.payload), this.opts.publishTimeoutMs);
         await this.prisma.$executeRaw`
           UPDATE outbox_events
-          SET status = 'PUBLISHED', published_at = now(), last_error = NULL, locked_until = NULL
-          WHERE id = ${row.id}
+          SET status = 'PUBLISHED', published_at = now(), last_error = NULL, locked_until = NULL, locked_by = NULL
+          WHERE id = ${row.id} AND locked_by = ${claim}
         `;
       } catch (err: any) {
-        const backoffSeconds = Math.min(2 ** Math.min(row.retry_count, 16), MAX_BACKOFF_SECONDS);
+        const attempts = row.retry_count + 1;
         const message = String(err?.message || 'Unknown publish failure').slice(0, 500);
-        logger.warn({ eventType: row.event_type, id: row.id, retry: row.retry_count + 1 }, 'Outbox publish failed, will retry');
+        if (attempts >= this.opts.maxAttempts) {
+          logger.error({ id: row.id, eventType: row.event_type, attempts, alert: 'OUTBOX_EVENT_FAILED' }, 'Outbox event parked as FAILED');
+          await this.prisma.$executeRaw`
+            UPDATE outbox_events
+            SET status = 'FAILED', retry_count = ${attempts}, last_error = ${message}, locked_until = NULL, locked_by = NULL
+            WHERE id = ${row.id} AND locked_by = ${claim}
+          `;
+          continue;
+        }
+        const backoffSeconds = Math.min(2 ** Math.min(row.retry_count, 16), MAX_BACKOFF_SECONDS);
+        logger.warn({ eventType: row.event_type, id: row.id, attempt: attempts }, 'Outbox publish failed, will retry');
         await this.prisma.$executeRaw`
           UPDATE outbox_events
-          SET retry_count = retry_count + 1,
-              last_error = ${message},
-              locked_until = NULL,
+          SET retry_count = ${attempts}, last_error = ${message}, locked_until = NULL, locked_by = NULL,
               next_attempt_at = now() + make_interval(secs => ${backoffSeconds})
-          WHERE id = ${row.id}
+          WHERE id = ${row.id} AND locked_by = ${claim}
         `;
       }
     }
     return rows.length;
+  }
+
+  /** Deletes PUBLISHED rows past the retention window */
+  public async purgePublished(): Promise<number> {
+    return this.prisma.$executeRaw`
+      DELETE FROM outbox_events
+      WHERE status = 'PUBLISHED' AND published_at < now() - make_interval(days => ${this.opts.retentionDays})
+    `;
   }
 
   private withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {

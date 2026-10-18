@@ -69,3 +69,41 @@ export function mfaChangedEmail(to: string, enabled: boolean): MailMessage {
   });
   return { to, subject: `Two-factor authentication ${enabled ? 'enabled' : 'disabled'} on your BankSphere account`, ...body };
 }
+
+export function staffActivationEmail(to: string, appBaseUrl: string, token: string, role: string, ttlHours: number): MailMessage {
+  const body = renderEmail({
+    greeting: 'Hello,',
+    paragraphs: [
+      `A BankSphere staff account (${role}) has been created for you after approval by two administrators.`,
+      'Use the link below to choose your password. You will then be asked to set up two-factor authentication with an authenticator app before you can use any staff function.',
+      `This link expires in ${ttlHours} hours and can only be used once.`,
+    ],
+    action: { label: 'Activate staff account', url: `${appBaseUrl.replace(/\/+$/, '')}/staff/activate#token=${encodeURIComponent(token)}` },
+    footer: 'If you were not expecting this, do not use the link and report it to the security team.',
+  });
+  return { to, subject: 'Activate your BankSphere staff account', ...body };
+}
+
+export function mfaReenrolEmail(to: string, appBaseUrl: string, token: string, ttlHours: number): MailMessage {
+  const body = renderEmail({
+    greeting: 'Hello,',
+    paragraphs: [
+      'Two-factor authentication on your BankSphere account was reset by an administrator.',
+      `Use the link below (valid for ${ttlHours} hours, single use) to enrol a new authenticator after signing in.`,
+    ],
+    action: { label: 'Set up two-factor authentication', url: `${appBaseUrl.replace(/\/+$/, '')}/mfa/enrol#token=${encodeURIComponent(token)}` },
+    footer: 'If you did not ask for this, contact the security team immediately.',
+  });
+  return { to, subject: 'Re-enrol two-factor authentication', ...body };
+}
+
+export function mfaLockedEmail(to: string): MailMessage {
+  const body = renderEmail({
+    paragraphs: [
+      'There were repeated failed two-factor authentication attempts on your BankSphere account, so two-factor sign-in has been paused for an hour.',
+      'Someone may know your password. Please reset your password now.',
+    ],
+    footer: 'If this was not you, contact BankSphere support immediately.',
+  });
+  return { to, subject: 'Security alert: repeated failed sign-in codes', ...body };
+}

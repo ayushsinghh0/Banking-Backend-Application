@@ -4,7 +4,7 @@
 #   (they join an extra non-internal `devhost` network, because the production `backend` network is
 #   internal-only and cannot publish ports)
 # - adds Mailpit, a local SMTP server that captures every email (web UI: http://localhost:8025)
-# - relaxes the auth per-IP limits so the e2e suite can be re-run
+# - relaxes the gateway and auth per-IP limits so the e2e suite can be re-run
 # Never use this overlay in production.
 
 networks:
@@ -21,7 +21,7 @@ services:
     ports: ["127.0.0.1:${DEV_REDIS_PORT:-6380}:6379"]
 
   redis-ratelimit:
-    networks: [edge, devhost]
+    networks: [apps, devhost]
     ports: ["127.0.0.1:${DEV_RATE_LIMIT_REDIS_PORT:-6381}:6379"]
 
   kafka:
@@ -37,6 +37,11 @@ services:
       - "127.0.0.1:8025:8025"
     environment:
       MP_MAX_MESSAGES: 5000
+
+  api-gateway:
+    environment:
+      # Relaxed so the e2e suite can be re-run back to back (production default: 300 per minute per IP)
+      GATEWAY_RATE_LIMIT_PER_MINUTE: "5000"
 
   auth-service:
     environment:

@@ -27,6 +27,8 @@ model BankAccount {
   status        AccountStatus @default(ACTIVE)
   currency      String        @default("INR")
   dailyLimit    BigInt        @default(10000000) @map("daily_limit") // In paise: default ₹1,00,000.00
+  // Version of the control state (status, limit) pushed to the ledger; bumped on every change
+  version       Int           @default(1)
   createdAt     DateTime      @default(now()) @map("created_at")
   updatedAt     DateTime      @updatedAt @map("updated_at")
 
@@ -44,6 +46,7 @@ enum OutboxStatus {
 // Transactional outbox: account events are written atomically with the account change
 model OutboxEvent {
   id            String       @id @default(uuid())
+  seq           BigInt       @default(autoincrement()) // per-aggregate publish order
   aggregateType String       @map("aggregate_type")
   aggregateId   String       @map("aggregate_id")
   eventType     String       @map("event_type")
@@ -53,11 +56,13 @@ model OutboxEvent {
   lastError     String?      @map("last_error")
   nextAttemptAt DateTime?    @map("next_attempt_at")
   lockedUntil   DateTime?    @map("locked_until") // relay lease: a crashed relay's claim expires
+  lockedBy      String?      @map("locked_by") // fencing token of the relay holding the lease
   createdAt     DateTime     @default(now()) @map("created_at")
   publishedAt   DateTime?    @map("published_at")
 
   @@index([status, nextAttemptAt, createdAt])
-  @@index([aggregateId, status])
+  @@index([aggregateId, status, seq])
+  @@unique([seq])
   @@map("outbox_events")
 }
 

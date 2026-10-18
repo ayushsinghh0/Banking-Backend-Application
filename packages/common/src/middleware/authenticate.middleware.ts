@@ -25,7 +25,7 @@ export function readBearerToken(req: Request): string | null {
 }
 
 export function isStaffRole(role: UserRole): boolean {
-  return role === 'BANK_ADMIN' || role === 'SUPPORT';
+  return role !== 'CUSTOMER';
 }
 
 export function isStaff(user: AuthenticatedUser): boolean {
@@ -59,7 +59,12 @@ export function createAuthenticate(tokenState: TokenStateStore, options: Authent
 
       let revoked: boolean;
       try {
-        revoked = await tokenState.isAccessTokenRevoked(user.id, user.jti!, user.tokenVersion!);
+        revoked = await tokenState.isAccessTokenRevoked({
+          userId: user.id,
+          jti: user.jti!,
+          tokenVersion: user.tokenVersion!,
+          sessionId: user.sessionId,
+        });
       } catch (err) {
         logger.error({ err }, 'Token state store unavailable; refusing request');
         throw new ServiceUnavailableError('Authentication temporarily unavailable');

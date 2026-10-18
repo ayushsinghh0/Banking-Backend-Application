@@ -2,19 +2,25 @@ import crypto from 'crypto';
 import Redis from 'ioredis';
 
 /**
- * Per-account abuse controls kept in Redis.
+ * Per-account abuse controls.
  *
  * Login lockout is keyed on (email, client network) with a much higher per-email ceiling:
- * - a password-guessing attacker gets LOGIN_MAX_FAILURES tries per network (then a lock),
- * - but cannot lock the real customer out from *their* network unless they mount a large distributed
- *   attack (LOGIN_GLOBAL_MAX_FAILURES per hour across all networks), which is also an alerting signal.
- * The attempt is counted BEFORE the password is checked (atomic INCR), so concurrent bursts cannot
- * squeeze extra guesses past the limit; a successful login refunds it.
+ * - a password-guessing attacker gets LOGIN_MAX_FAILURES tries per network, then a lock;
+ * - when the per-email ceiling trips (a distributed attack), networks from which the user has signed in
+ *   successfully before are still let through, so the attack can't lock the real customer out.
+ * The attempt is counted BEFORE the password is checked (atomic INCR); a successful login refunds it.
  *
- * Keys use a hash of the normalised email so raw addresses aren't stored in Redis.
+ * MFA challenges allow a fixed number of attempts, counted atomically BEFORE the code is verified, and a
+ * per-user TOTP failure budget (not reset by a correct password) stops brute force across challenges.
+ *
+ * Storage: high-churn counters live in the evictable rate-limit Redis (so a spray of random emails can't
+ * fill the security Redis); challenges and known networks live in the durable security Redis.
+ * Keys use a hash of the normalised email so raw addresses aren't stored.
  */
 export interface LoginAttempt {
   locked: boolean;
+  /** The per-email ceiling tripped and this network is not a known one: step-up required */
+  stepUpRequired?: boolean;
 }
 
 export interface AuthSecurityStore {
@@ -23,12 +29,14 @@ export interface AuthSecurityStore {
   clearAllLoginFailures(email: string): Promise<void>;
   /** Returns true if another email of this kind may be sent to this address now */
   consumeEmailQuota(kind: string, email: string): Promise<boolean>;
-  /** MFA login challenges: short-lived, single-use, limited attempts */
   createMfaChallenge(userId: string, ttlSeconds: number): Promise<string>;
-  /** Returns the user id while the challenge is valid and under its attempt limit */
-  peekMfaChallenge(token: string): Promise<string | null>;
-  recordMfaChallengeFailure(token: string): Promise<void>;
+  /** Atomically counts an attempt; returns the user id if the challenge is valid and under its limit */
+  consumeMfaChallengeAttempt(token: string): Promise<string | null>;
   deleteMfaChallenge(token: string): Promise<void>;
+  /** Per-user TOTP failures in a rolling hour; returns the new count */
+  recordMfaFailure(userId: string): Promise<number>;
+  isMfaLocked(userId: string): Promise<boolean>;
+  clearMfaFailures(userId: string): Promise<void>;
 }
 
 export interface AuthSecurityConfig {
@@ -37,6 +45,7 @@ export interface AuthSecurityConfig {
   lockoutSeconds: number;
   emailsPerHour: number;
   maxMfaAttempts: number;
+  maxMfaFailuresPerHour: number;
 }
 
 export const defaultAuthSecurityConfig = (): AuthSecurityConfig => ({
@@ -45,14 +54,21 @@ export const defaultAuthSecurityConfig = (): AuthSecurityConfig => ({
   lockoutSeconds: Number(process.env.LOGIN_LOCKOUT_SECONDS || 900),
   emailsPerHour: Number(process.env.AUTH_EMAILS_PER_HOUR || 3),
   maxMfaAttempts: 5,
+  maxMfaFailuresPerHour: Number(process.env.MFA_MAX_FAILURES_PER_HOUR || 10),
 });
 
 const hash = (value: string) => crypto.createHash('sha256').update(value).digest('hex');
 const emailKey = (email: string) => hash(email.trim().toLowerCase());
+const KNOWN_NETWORK_TTL = 90 * 24 * 3600;
 
 export class RedisAuthSecurityStore implements AuthSecurityStore {
+  /**
+   * @param counters evictable rate-limit Redis (lockout counters, quotas, TOTP failure counts)
+   * @param state    durable security Redis (MFA challenges, known networks)
+   */
   constructor(
-    private readonly redis: Redis,
+    private readonly counters: Redis,
+    private readonly state: Redis,
     private readonly config: AuthSecurityConfig = defaultAuthSecurityConfig()
   ) {}
 
@@ -62,11 +78,14 @@ export class RedisAuthSecurityStore implements AuthSecurityStore {
   private globalKey(email: string) {
     return `auth:login-fail-global:${emailKey(email)}`;
   }
+  private knownKey(email: string) {
+    return `auth:known-net:${emailKey(email)}`;
+  }
 
   public async beginLoginAttempt(email: string, network: string): Promise<LoginAttempt> {
     const pair = this.pairKey(email, network);
     const global = this.globalKey(email);
-    const results = await this.redis
+    const results = await this.counters
       .multi()
       .incr(pair)
       .expire(pair, this.config.lockoutSeconds, 'NX')
@@ -75,71 +94,84 @@ export class RedisAuthSecurityStore implements AuthSecurityStore {
       .exec();
     const pairCount = Number(results?.[0]?.[1] ?? 0);
     const globalCount = Number(results?.[2]?.[1] ?? 0);
-    return {
-      locked: pairCount > this.config.maxLoginFailures || globalCount > this.config.globalMaxLoginFailures,
-    };
+    if (pairCount > this.config.maxLoginFailures) return { locked: true };
+    if (globalCount > this.config.globalMaxLoginFailures) {
+      const known = await this.state.sismember(this.knownKey(email), hash(network));
+      if (!known) return { locked: true, stepUpRequired: true };
+    }
+    return { locked: false };
   }
 
   public async loginSucceeded(email: string, network: string): Promise<void> {
-    // Refund this attempt and forget this network's failures
-    await this.redis.multi().del(this.pairKey(email, network)).decr(this.globalKey(email)).exec();
+    // Refund this attempt, forget this network's failures and remember it as a known network
+    await this.counters.multi().del(this.pairKey(email, network)).decr(this.globalKey(email)).exec();
+    await this.state.multi().sadd(this.knownKey(email), hash(network)).expire(this.knownKey(email), KNOWN_NETWORK_TTL).exec();
   }
 
   public async clearAllLoginFailures(email: string): Promise<void> {
     const prefix = `auth:login-fail:${emailKey(email)}:`;
     let cursor = '0';
     do {
-      const [next, keys] = await this.redis.scan(cursor, 'MATCH', `${prefix}*`, 'COUNT', 200);
-      if (keys.length) await this.redis.del(...keys);
+      const [next, keys] = await this.counters.scan(cursor, 'MATCH', `${prefix}*`, 'COUNT', 200);
+      if (keys.length) await this.counters.del(...keys);
       cursor = next;
     } while (cursor !== '0');
-    await this.redis.del(this.globalKey(email));
+    await this.counters.del(this.globalKey(email));
   }
 
   public async consumeEmailQuota(kind: string, email: string): Promise<boolean> {
     const key = `auth:mail-quota:${kind}:${emailKey(email)}`;
-    const results = await this.redis.multi().incr(key).expire(key, 3600, 'NX').exec();
+    const results = await this.counters.multi().incr(key).expire(key, 3600, 'NX').exec();
     return Number(results?.[0]?.[1] ?? 0) <= this.config.emailsPerHour;
   }
 
   public async createMfaChallenge(userId: string, ttlSeconds: number): Promise<string> {
     const token = crypto.randomBytes(32).toString('base64url');
-    await this.redis.set(`auth:mfa-challenge:${hash(token)}`, JSON.stringify({ userId, failures: 0 }), 'EX', ttlSeconds);
+    const key = `auth:mfa-challenge:${hash(token)}`;
+    await this.state.multi().hset(key, 'userId', userId, 'attempts', '0').expire(key, ttlSeconds).exec();
     return token;
   }
 
-  public async peekMfaChallenge(token: string): Promise<string | null> {
-    const raw = await this.redis.get(`auth:mfa-challenge:${hash(token)}`);
-    if (!raw) return null;
-    const { userId, failures } = JSON.parse(raw) as { userId: string; failures: number };
-    return failures < this.config.maxMfaAttempts ? userId : null;
-  }
-
-  public async recordMfaChallengeFailure(token: string): Promise<void> {
-    const key = `auth:mfa-challenge:${hash(token)}`;
-    // Atomic read-modify-write that preserves the TTL
-    await this.redis.eval(
-      `local v = redis.call('GET', KEYS[1])
-       if not v then return 0 end
-       local o = cjson.decode(v)
-       o.failures = o.failures + 1
-       redis.call('SET', KEYS[1], cjson.encode(o), 'KEEPTTL')
-       return o.failures`,
+  public async consumeMfaChallengeAttempt(token: string): Promise<string | null> {
+    // Increment-then-check in one atomic step: parallel requests can't all see "0 attempts"
+    const result = (await this.state.eval(
+      `if redis.call('EXISTS', KEYS[1]) == 0 then return false end
+       local n = redis.call('HINCRBY', KEYS[1], 'attempts', 1)
+       if n > tonumber(ARGV[1]) then return false end
+       return redis.call('HGET', KEYS[1], 'userId')`,
       1,
-      key
-    );
+      `auth:mfa-challenge:${hash(token)}`,
+      String(this.config.maxMfaAttempts)
+    )) as string | null;
+    return result || null;
   }
 
   public async deleteMfaChallenge(token: string): Promise<void> {
-    await this.redis.del(`auth:mfa-challenge:${hash(token)}`);
+    await this.state.del(`auth:mfa-challenge:${hash(token)}`);
+  }
+
+  public async recordMfaFailure(userId: string): Promise<number> {
+    const key = `auth:mfa-fail:${userId}`;
+    const results = await this.counters.multi().incr(key).expire(key, 3600, 'NX').exec();
+    return Number(results?.[0]?.[1] ?? 0);
+  }
+
+  public async isMfaLocked(userId: string): Promise<boolean> {
+    return Number((await this.counters.get(`auth:mfa-fail:${userId}`)) ?? 0) >= this.config.maxMfaFailuresPerHour;
+  }
+
+  public async clearMfaFailures(userId: string): Promise<void> {
+    await this.counters.del(`auth:mfa-fail:${userId}`);
   }
 }
 
 export class InMemoryAuthSecurityStore implements AuthSecurityStore {
   private readonly pairs = new Map<string, number>();
   private readonly globals = new Map<string, number>();
+  private readonly known = new Map<string, Set<string>>();
   private readonly quotas = new Map<string, number>();
-  private readonly challenges = new Map<string, { userId: string; failures: number }>();
+  private readonly challenges = new Map<string, { userId: string; attempts: number }>();
+  private readonly mfaFailures = new Map<string, number>();
 
   constructor(
     private readonly config: AuthSecurityConfig = {
@@ -148,26 +180,35 @@ export class InMemoryAuthSecurityStore implements AuthSecurityStore {
       lockoutSeconds: 900,
       emailsPerHour: 3,
       maxMfaAttempts: 5,
+      maxMfaFailuresPerHour: 10,
     }
   ) {}
 
   public async beginLoginAttempt(email: string, network: string): Promise<LoginAttempt> {
-    const pk = `${emailKey(email)}:${network}`;
-    const p = (this.pairs.get(pk) ?? 0) + 1;
-    const g = (this.globals.get(emailKey(email)) ?? 0) + 1;
-    this.pairs.set(pk, p);
-    this.globals.set(emailKey(email), g);
-    return { locked: p > this.config.maxLoginFailures || g > this.config.globalMaxLoginFailures };
+    const ek = emailKey(email);
+    const p = (this.pairs.get(`${ek}:${network}`) ?? 0) + 1;
+    const g = (this.globals.get(ek) ?? 0) + 1;
+    this.pairs.set(`${ek}:${network}`, p);
+    this.globals.set(ek, g);
+    if (p > this.config.maxLoginFailures) return { locked: true };
+    if (g > this.config.globalMaxLoginFailures && !this.known.get(ek)?.has(network)) {
+      return { locked: true, stepUpRequired: true };
+    }
+    return { locked: false };
   }
 
   public async loginSucceeded(email: string, network: string): Promise<void> {
-    this.pairs.delete(`${emailKey(email)}:${network}`);
-    this.globals.set(emailKey(email), Math.max(0, (this.globals.get(emailKey(email)) ?? 1) - 1));
+    const ek = emailKey(email);
+    this.pairs.delete(`${ek}:${network}`);
+    this.globals.set(ek, Math.max(0, (this.globals.get(ek) ?? 1) - 1));
+    if (!this.known.has(ek)) this.known.set(ek, new Set());
+    this.known.get(ek)!.add(network);
   }
 
   public async clearAllLoginFailures(email: string): Promise<void> {
-    for (const k of [...this.pairs.keys()]) if (k.startsWith(`${emailKey(email)}:`)) this.pairs.delete(k);
-    this.globals.delete(emailKey(email));
+    const ek = emailKey(email);
+    for (const k of [...this.pairs.keys()]) if (k.startsWith(`${ek}:`)) this.pairs.delete(k);
+    this.globals.delete(ek);
   }
 
   public async consumeEmailQuota(kind: string, email: string): Promise<boolean> {
@@ -179,21 +220,32 @@ export class InMemoryAuthSecurityStore implements AuthSecurityStore {
 
   public async createMfaChallenge(userId: string, _ttlSeconds?: number): Promise<string> {
     const token = crypto.randomBytes(32).toString('base64url');
-    this.challenges.set(hash(token), { userId, failures: 0 });
+    this.challenges.set(hash(token), { userId, attempts: 0 });
     return token;
   }
 
-  public async peekMfaChallenge(token: string): Promise<string | null> {
+  public async consumeMfaChallengeAttempt(token: string): Promise<string | null> {
     const c = this.challenges.get(hash(token));
-    return c && c.failures < this.config.maxMfaAttempts ? c.userId : null;
-  }
-
-  public async recordMfaChallengeFailure(token: string): Promise<void> {
-    const c = this.challenges.get(hash(token));
-    if (c) c.failures++;
+    if (!c) return null;
+    c.attempts++;
+    return c.attempts <= this.config.maxMfaAttempts ? c.userId : null;
   }
 
   public async deleteMfaChallenge(token: string): Promise<void> {
     this.challenges.delete(hash(token));
+  }
+
+  public async recordMfaFailure(userId: string): Promise<number> {
+    const n = (this.mfaFailures.get(userId) ?? 0) + 1;
+    this.mfaFailures.set(userId, n);
+    return n;
+  }
+
+  public async isMfaLocked(userId: string): Promise<boolean> {
+    return (this.mfaFailures.get(userId) ?? 0) >= this.config.maxMfaFailuresPerHour;
+  }
+
+  public async clearMfaFailures(userId: string): Promise<void> {
+    this.mfaFailures.delete(userId);
   }
 }

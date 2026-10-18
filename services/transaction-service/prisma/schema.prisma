@@ -38,9 +38,15 @@ enum OutboxStatus {
   FAILED
 }
 
+enum LedgerAccountKind {
+  CUSTOMER    // customer deposit account (a liability of the bank)
+  TELLER_CASH // a teller's cash drawer (an asset): every cash deposit/withdrawal is double-entry against it
+}
+
 // Authoritative local account representation within the ledger service boundary
 model LedgerAccount {
   id            String         @id @default(uuid())
+  kind          LedgerAccountKind @default(CUSTOMER)
   accountNumber String         @unique @map("account_number")
   customerId    String         @map("customer_id")
   currency      String         @default("INR")
@@ -49,6 +55,8 @@ model LedgerAccount {
   isActive      Boolean        @default(true) @map("is_active")
   // Set once, by the ledger itself, only when the balance is zero; a closed account can never reopen
   closedAt      DateTime?      @map("closed_at")
+  // Monotonic version of the control state (active/limit/closed) pushed by account-service; older writes are refused
+  controlVersion Int           @default(0) @map("control_version")
   createdAt     DateTime       @default(now()) @map("created_at")
   updatedAt     DateTime       @updatedAt @map("updated_at")
   entries       LedgerEntry[]
@@ -121,6 +129,7 @@ model IdempotencyRecord {
 // Transactional Outbox for reliable Kafka event publishing
 model OutboxEvent {
   id            String        @id @default(uuid())
+  seq           BigInt       @default(autoincrement()) // per-aggregate publish order
   aggregateType String        @map("aggregate_type") // e.g. "TRANSACTION"
   aggregateId   String        @map("aggregate_id")   // e.g. transaction.id
   eventType     String        @map("event_type")     // e.g. "transaction.completed.v1"
@@ -130,11 +139,13 @@ model OutboxEvent {
   lastError     String?       @map("last_error")
   nextAttemptAt DateTime?     @map("next_attempt_at")
   lockedUntil   DateTime?    @map("locked_until") // relay lease: a crashed relay's claim expires
+  lockedBy      String?      @map("locked_by") // fencing token of the relay holding the lease
   createdAt     DateTime      @default(now()) @map("created_at")
   publishedAt   DateTime?     @map("published_at")
 
   @@index([status, nextAttemptAt, createdAt])
-  @@index([aggregateId, status])
+  @@index([aggregateId, status, seq])
+  @@unique([seq])
   @@map("outbox_events")
 }
 
@@ -180,4 +191,66 @@ model AuditLog {
 
   @@index([actorId, createdAt])
   @@map("audit_log")
+}
+
+enum TellerSessionStatus {
+  OPEN
+  CLOSED      // closing count declared; awaiting supervisor sign-off
+  RECONCILED  // signed off by a different administrator
+}
+
+// A teller's business day: opening float -> cash operations -> closing count -> supervisor sign-off.
+// Expected closing cash = opening float + net drawer movement; any discrepancy is flagged.
+model TellerSession {
+  id              String              @id @default(uuid())
+  tellerId        String              @map("teller_id")
+  businessDate    String              @map("business_date") // IST calendar date, YYYY-MM-DD
+  drawerAccountId String              @map("drawer_account_id")
+  openingFloat    BigInt              @map("opening_float")
+  status          TellerSessionStatus @default(OPEN)
+  declaredClosing BigInt?             @map("declared_closing")
+  expectedClosing BigInt?             @map("expected_closing")
+  discrepancy     BigInt?
+  openedAt        DateTime            @default(now()) @map("opened_at")
+  closedAt        DateTime?           @map("closed_at")
+  signedOffBy     String?             @map("signed_off_by")
+  signedOffAt     DateTime?           @map("signed_off_at")
+
+  @@unique([tellerId, businessDate])
+  @@index([status, businessDate])
+  @@map("teller_sessions")
+}
+
+// A customer-generated, single-use authorisation for a cash withdrawal at a branch: the teller must enter
+// the code, so a teller can never withdraw from an account without the customer's consent.
+model WithdrawalAuthorization {
+  id              String    @id @default(uuid())
+  accountId       String    @map("account_id")
+  customerId      String    @map("customer_id")
+  amount          BigInt
+  codeHash        String    @map("code_hash")
+  expiresAt       DateTime  @map("expires_at")
+  usedAt          DateTime? @map("used_at")
+  cashOperationId String?   @map("cash_operation_id")
+  createdAt       DateTime  @default(now()) @map("created_at")
+
+  @@index([accountId, usedAt])
+  @@map("withdrawal_authorizations")
+}
+
+// Registered payees. Transfers to other customers' accounts require an active beneficiary: new ones
+// activate after a cooling-off period (immediately with an MFA session) and are capped for 24h.
+model Beneficiary {
+  id            String    @id @default(uuid())
+  customerId    String    @map("customer_id")
+  accountId     String    @map("account_id")
+  accountNumber String    @map("account_number")
+  nickname      String
+  activatesAt   DateTime  @map("activates_at")
+  revokedAt     DateTime? @map("revoked_at")
+  createdAt     DateTime  @default(now()) @map("created_at")
+
+  @@unique([customerId, accountId])
+  @@index([customerId])
+  @@map("beneficiaries")
 }

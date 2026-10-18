@@ -27,6 +27,7 @@ describe('AccountService (Account Lifecycle, Numbers, and Ownership)', () => {
     customerId: 'alice-cust-id',
     status: AccountStatus.ACTIVE,
     dailyLimit: 10000000n,
+    version: 3,
     ...overrides,
   });
 
@@ -38,7 +39,7 @@ describe('AccountService (Account Lifecycle, Numbers, and Ownership)', () => {
         findUniqueOrThrow: jest.fn(),
         findMany: jest.fn(),
         count: jest.fn().mockResolvedValue(0),
-        create: jest.fn(({ data }: any) => ({ ...data, createdAt: new Date(), updatedAt: new Date() })),
+        create: jest.fn(({ data }: any) => ({ version: 1, ...data, createdAt: new Date(), updatedAt: new Date() })),
         update: jest.fn(({ data }: any) => {
           calls.push('db');
           return account(data);
@@ -59,6 +60,7 @@ describe('AccountService (Account Lifecycle, Numbers, and Ownership)', () => {
       provisionAccount: jest.fn().mockResolvedValue(undefined),
       updateAccount: jest.fn(async () => {
         calls.push('ledger');
+        return { applied: true };
       }),
       closeAccount: jest.fn(async () => {
         calls.push('ledger-close');
@@ -86,7 +88,7 @@ describe('AccountService (Account Lifecycle, Numbers, and Ownership)', () => {
       const created = await accountService.createAccount({ customerId: 'alice-cust-id', accountType: AccountType.SAVINGS }, alice);
 
       expect(mockLedger.provisionAccount).toHaveBeenCalledWith(expect.objectContaining({ id: created.id, isActive: false }));
-      expect(mockLedger.updateAccount).toHaveBeenCalledWith(created.id, { isActive: true });
+      expect(mockLedger.updateAccount).toHaveBeenCalledWith(created.id, { isActive: true, dailyLimitPaise: '10000000', version: 1 });
       expect(mockPrisma.outboxEvent.create.mock.calls[0][0].data.eventType).toBe('account.created.v1');
       // Per-customer advisory lock serialises the account-count check
       expect(mockPrisma.$queryRaw).toHaveBeenCalled();
@@ -173,10 +175,32 @@ describe('AccountService (Account Lifecycle, Numbers, and Ownership)', () => {
   describe('reconcileWithLedger', () => {
     it('pushes the account state to the ledger when they diverge', async () => {
       mockPrisma.bankAccount.findMany.mockResolvedValueOnce([account({ status: AccountStatus.FROZEN })]).mockResolvedValue([]);
-      mockLedger.getAccounts.mockResolvedValue([{ id: 'acc-1', isActive: true, closed: false, dailyLimitPaise: '10000000', balanceInPaise: '0' }]);
+      mockLedger.getAccounts.mockResolvedValue([
+        { id: 'acc-1', isActive: true, closed: false, dailyLimitPaise: '10000000', balanceInPaise: '0', controlVersion: 2 },
+      ]);
       const result = await accountService.reconcileWithLedger();
       expect(result.repaired).toBe(1);
-      expect(mockLedger.updateAccount).toHaveBeenCalledWith('acc-1', { isActive: false, dailyLimitPaise: '10000000' });
+      // The push carries the account's version, so the ledger can reject it if it already has something newer
+      expect(mockLedger.updateAccount).toHaveBeenCalledWith('acc-1', { isActive: false, dailyLimitPaise: '10000000', version: 3 });
+    });
+
+    it('never pushes over a newer ledger state: it raises an alert instead', async () => {
+      mockPrisma.bankAccount.findMany.mockResolvedValueOnce([account({ status: AccountStatus.ACTIVE })]).mockResolvedValue([]);
+      mockLedger.getAccounts.mockResolvedValue([
+        { id: 'acc-1', isActive: false, closed: false, dailyLimitPaise: '10000000', balanceInPaise: '0', controlVersion: 4 },
+      ]);
+      const result = await accountService.reconcileWithLedger();
+      expect(result.repaired).toBe(0);
+      expect(mockLedger.updateAccount).not.toHaveBeenCalled();
+    });
+
+    it('counts a push the ledger ignored as not repaired', async () => {
+      mockLedger.updateAccount.mockResolvedValue({ applied: false });
+      mockPrisma.bankAccount.findMany.mockResolvedValueOnce([account({ status: AccountStatus.FROZEN })]).mockResolvedValue([]);
+      mockLedger.getAccounts.mockResolvedValue([
+        { id: 'acc-1', isActive: true, closed: false, dailyLimitPaise: '10000000', balanceInPaise: '0', controlVersion: 3 },
+      ]);
+      expect((await accountService.reconcileWithLedger()).repaired).toBe(0);
     });
   });
 });

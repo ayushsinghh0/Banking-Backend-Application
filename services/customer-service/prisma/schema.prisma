@@ -22,6 +22,8 @@ model CustomerProfile {
   address     String?
   dateOfBirth DateTime? @map("date_of_birth")
   kycStatus   KycStatus @default(PENDING) @map("kyc_status")
+  // Incremented on every change; a KYC decision must name the version the officer reviewed
+  version     Int       @default(1)
   createdAt   DateTime  @default(now()) @map("created_at")
   updatedAt   DateTime  @updatedAt @map("updated_at")
 
@@ -43,4 +45,18 @@ model KycEvent {
 
   @@index([userId, createdAt])
   @@map("kyc_events")
+}
+
+// Who on staff looked at which customer's data, and when (append-only)
+model StaffAccessLog {
+  id        String   @id @default(uuid())
+  actorId   String   @map("actor_id")
+  actorRole String   @map("actor_role")
+  userId    String   @map("user_id")
+  action    String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([userId, createdAt])
+  @@index([actorId, createdAt])
+  @@map("staff_access_log")
 }

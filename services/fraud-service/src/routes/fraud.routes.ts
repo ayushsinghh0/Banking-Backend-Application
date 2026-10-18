@@ -5,12 +5,12 @@ import { FraudController } from '../controllers/fraud.controller';
 export function createFraudRouter(controller: FraudController, authenticate: RequestHandler): Router {
   const router = Router();
 
-  // Risk data is compliance-only
-  router.use(authenticate, requireRoles('BANK_ADMIN', 'SUPPORT'));
+  // Risk data is compliance-only; triage is for fraud analysts (and supervisors)
+  router.use(authenticate, requireRoles('FRAUD_ANALYST', 'BANK_ADMIN', 'SUPPORT'));
 
-  router.post('/evaluate', controller.evaluate);
+  router.post('/evaluate', requireRoles('FRAUD_ANALYST'), controller.evaluate);
   router.get('/alerts', controller.getAlerts);
-  router.patch('/alerts/:alertId', controller.updateAlert);
+  router.patch('/alerts/:alertId', requireRoles('FRAUD_ANALYST', 'BANK_ADMIN'), controller.updateAlert);
   router.get('/alerts/:alertId/history', controller.getAlertHistory);
 
   return router;

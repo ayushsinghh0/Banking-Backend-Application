@@ -25,6 +25,7 @@ import { AuthService } from '../src/services/auth.service';
 import { PasswordService } from '../src/services/password.service';
 import { TokenService } from '../src/services/token.service';
 import { InMemoryAuthSecurityStore } from '../src/services/auth-security.store';
+import { AdminRequestService } from '../src/services/admin-requests.service';
 import { encryptSecret, generateTotpSecret, totpAt, currentStep, verifyTotp, base32Decode } from '../src/services/totp';
 import { createApp } from '../src/app';
 
@@ -36,7 +37,8 @@ function buildMockPrisma() {
   const prisma: any = {
     user: {
       findUnique: jest.fn(),
-      findUniqueOrThrow: jest.fn(),
+      // Session creation re-reads the user under its row lock; by default that sees the same row
+      findUniqueOrThrow: jest.fn((args: any) => prisma.user.findUnique(args)),
       findMany: jest.fn().mockResolvedValue([]),
       create: jest.fn(),
       update: jest.fn(),
@@ -44,6 +46,7 @@ function buildMockPrisma() {
     },
     refreshToken: {
       create: jest.fn(),
+      findFirst: jest.fn(),
       findUnique: jest.fn(),
       findUniqueOrThrow: jest.fn(),
       update: jest.fn(),
@@ -62,9 +65,22 @@ function buildMockPrisma() {
       updateMany: jest.fn().mockResolvedValue({ count: 1 }),
       deleteMany: jest.fn(),
     },
+    enrolmentToken: {
+      create: jest.fn(),
+      findUnique: jest.fn(),
+      updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+      deleteMany: jest.fn(),
+    },
+    adminRequest: {
+      create: jest.fn(({ data }: any) => ({ id: 'req-1', status: 'PENDING', ...data })),
+      findUniqueOrThrow: jest.fn(),
+      findMany: jest.fn().mockResolvedValue([]),
+      update: jest.fn(({ data }: any) => ({ id: 'req-1', ...data })),
+      updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+    },
     outboxEvent: { create: jest.fn() },
     auditLog: { create: jest.fn() },
-    $queryRaw: jest.fn().mockResolvedValue([]),
+    $queryRaw: jest.fn().mockResolvedValue([{ id: 'locked' }]),
   };
   prisma.$transaction = jest.fn((arg: any) => (typeof arg === 'function' ? arg(prisma) : Promise.all(arg)));
   return prisma;
@@ -109,6 +125,8 @@ describe('AuthService', () => {
         emailVerificationTtlHours: 24,
         sessionMaxDays: 30,
         mfaChallengeTtlSeconds: 300,
+        enrolmentTtlHours: 24,
+        staffEmailDomain: 'bank.com',
       },
     });
   });
@@ -130,7 +148,7 @@ describe('AuthService', () => {
 
     it('PRIVILEGE ESCALATION: always creates CUSTOMER even if a role is supplied', async () => {
       prisma.user.create.mockImplementation(({ data }: any) => activeUser(data));
-      await authService.register({ email: 'm@bank.com', password: 'Password1234', role: 'BANK_ADMIN' as any });
+      await authService.register({ email: 'm@bank.com', password: 'Password1234', role: 'BANK_ADMIN' } as any);
       expect(prisma.user.create.mock.calls[0][0].data.role).toBe('CUSTOMER');
     });
 
@@ -242,27 +260,66 @@ describe('AuthService', () => {
       for (let i = 0; i < 5; i++) {
         await expect(authService.completeMfaLogin(challenge, '000000')).rejects.toThrow(UnauthorizedError);
       }
-      expect(await security.peekMfaChallenge(challenge)).toBeNull();
+      // The challenge is gone: even a correct code can no longer use it
+      expect(await security.consumeMfaChallengeAttempt(challenge)).toBeNull();
     });
 
-    it('enrolment encrypts the secret, revokes old sessions and returns an MFA session', async () => {
-      prisma.user.findUnique.mockResolvedValue(activeUser());
-      prisma.user.update.mockImplementation(({ data }: any) => activeUser({ ...data, tokenVersion: 1 }));
-      const { secret, otpauthUri } = await authService.beginMfaSetup({ id: 'u1', email: 'alice@bank.com', role: 'CUSTOMER' });
+    const customer = { id: 'u1', email: 'alice@bank.com', role: 'CUSTOMER' as const, sessionId: 'fam-1' };
+
+    it('enrolment re-authenticates, encrypts the secret, revokes other sessions and upgrades the current one', async () => {
+      const passwordHash = await PasswordService.hash('Password1234');
+      prisma.user.findUnique.mockResolvedValue(activeUser({ passwordHash }));
+      await expect(authService.beginMfaSetup(customer, 'WrongPassword1')).rejects.toThrow(UnauthorizedError);
+
+      const { secret, otpauthUri } = await authService.beginMfaSetup(customer, 'Password1234');
       expect(otpauthUri).toMatch(/^otpauth:\/\/totp\//);
       const pendingEnc = prisma.user.update.mock.calls[0][0].data.mfaPendingSecretEnc;
       expect(pendingEnc).not.toContain(secret); // stored encrypted
 
-      prisma.user.findUnique.mockResolvedValue(activeUser({ mfaPendingSecretEnc: pendingEnc }));
-      const tokens = await authService.enableMfa({ id: 'u1', email: 'alice@bank.com', role: 'CUSTOMER' }, totpAt(secret, currentStep()));
-      expect(verifyAccessToken(tokens.accessToken).mfa).toBe(true);
-      expect(await tokenState.isAccessTokenRevoked('u1', 'old', 0)).toBe(true);
+      const familyExpiresAt = new Date(Date.now() + 86400_000);
+      prisma.user.findUnique.mockResolvedValue(activeUser({ passwordHash, mfaPendingSecretEnc: pendingEnc }));
+      prisma.user.update.mockImplementation(({ data }: any) => activeUser({ ...data, tokenVersion: 1 }));
+      prisma.refreshToken.findFirst.mockResolvedValue({ id: 'rt-current', familyId: 'fam-1', familyExpiresAt });
+      const tokens = await authService.enableMfa(customer, totpAt(secret, currentStep()));
+
+      const claims = verifyAccessToken(tokens.accessToken);
+      expect(claims.mfa).toBe(true);
+      // Same session (family and absolute expiry) rather than a brand-new 30-day one
+      expect(claims.sessionId).toBe('fam-1');
+      expect(prisma.refreshToken.create.mock.calls.at(-1)[0].data).toEqual(expect.objectContaining({ familyId: 'fam-1', familyExpiresAt }));
+      expect(await tokenState.isAccessTokenRevoked({ userId: 'u1', jti: 'old', tokenVersion: 0 })).toBe(true);
     });
 
-    it('staff cannot disable their own MFA; admins cannot reset their own', async () => {
+    it('STAFF ENROLMENT: staff need a one-time enrolment token, so a stolen password alone cannot enrol MFA', async () => {
+      const passwordHash = await PasswordService.hash('Password1234');
+      const teller = { id: 'u1', email: 't@bank.com', role: 'TELLER' as const, sessionId: 'fam-1' };
+      prisma.user.findUnique.mockResolvedValue(activeUser({ role: 'TELLER', passwordHash }));
+      prisma.enrolmentToken.findUnique.mockResolvedValue(null);
+      await expect(authService.beginMfaSetup(teller, 'Password1234')).rejects.toThrow(HttpError);
+      await expect(authService.beginMfaSetup(teller, 'Password1234', 'bogus-token')).rejects.toThrow('enrolment token');
+
+      prisma.enrolmentToken.findUnique.mockResolvedValue({
+        id: 'e1', userId: 'u1', purpose: 'MFA_ENROL', usedAt: null, expiresAt: new Date(Date.now() + 60_000),
+      });
+      await expect(authService.beginMfaSetup(teller, 'Password1234', 'raw-enrolment-token')).resolves.toHaveProperty('secret');
+      expect(prisma.enrolmentToken.findUnique.mock.calls.at(-1)[0].where.tokenHash).toBe(sha256('raw-enrolment-token'));
+    });
+
+    it('staff cannot disable their own MFA; a staff MFA reset needs a four-eyes request', async () => {
       prisma.user.findUnique.mockResolvedValue(activeUser({ role: 'BANK_ADMIN', mfaEnabled: true }));
       await expect(authService.disableMfa({ id: 'u1', email: 'a', role: 'BANK_ADMIN' }, 'x', '123456')).rejects.toThrow(ForbiddenError);
-      await expect(authService.adminResetMfa({ id: 'u1', email: 'a', role: 'BANK_ADMIN' }, 'u1')).rejects.toThrow(ForbiddenError);
+      await expect(authService.adminResetCustomerMfa({ id: 'a2', email: 'b', role: 'BANK_ADMIN' }, 'u1')).rejects.toThrow('four-eyes');
+    });
+
+    it('MFA LOCK: repeated wrong codes pause TOTP sign-in for the user across new challenges', async () => {
+      const secret = generateTotpSecret();
+      prisma.user.findUnique.mockResolvedValue(enrolledUser(secret));
+      for (let i = 0; i < 10; i++) {
+        const challenge = await security.createMfaChallenge('u1', 300);
+        await expect(authService.completeMfaLogin(challenge, '000000')).rejects.toThrow(UnauthorizedError);
+      }
+      const fresh = await security.createMfaChallenge('u1', 300);
+      await expect(authService.completeMfaLogin(fresh, totpAt(secret, currentStep()))).rejects.toThrow('Too many failed verification codes');
     });
 
     it('verifyTotp tolerates one step of clock drift and rejects malformed codes', () => {
@@ -292,7 +349,7 @@ describe('AuthService', () => {
       prisma.refreshToken.findUniqueOrThrow.mockResolvedValue(record());
       const tokens = await authService.refreshToken('valid');
       expect(prisma.$queryRaw).toHaveBeenCalled(); // SELECT ... FOR UPDATE
-      expect(prisma.refreshToken.update).toHaveBeenCalledWith({ where: { id: 'rt1' }, data: { isRevoked: true } });
+      expect(prisma.refreshToken.update).toHaveBeenCalledWith({ where: { id: 'rt1' }, data: { isRevoked: true, rotatedAt: expect.any(Date) } });
       expect(prisma.refreshToken.create.mock.calls[0][0].data.familyId).toBe('fam-1');
       expect(verifyAccessToken(tokens.accessToken).mfa).toBe(true);
     });
@@ -302,6 +359,16 @@ describe('AuthService', () => {
       prisma.refreshToken.findUniqueOrThrow.mockResolvedValue(record({ isRevoked: true }));
       await expect(authService.refreshToken('stolen')).rejects.toThrow(UnauthorizedError);
       expect(prisma.refreshToken.updateMany).toHaveBeenCalledWith({ where: { familyId: 'fam-1' }, data: { isRevoked: true } });
+      // ...and the session's access tokens die immediately (the thief may already hold one)
+      expect(await tokenState.isAccessTokenRevoked({ userId: 'u1', jti: 'any', tokenVersion: 0, sessionId: 'fam-1' })).toBe(true);
+      expect(await tokenState.isAccessTokenRevoked({ userId: 'u1', jti: 'any', tokenVersion: 0, sessionId: 'other-session' })).toBe(false);
+    });
+
+    it('CONCURRENT REFRESH: a token rotated seconds ago gets a retryable 409, not a family revocation', async () => {
+      prisma.refreshToken.findUnique.mockResolvedValue(record({ isRevoked: true, rotatedAt: new Date() }));
+      prisma.refreshToken.findUniqueOrThrow.mockResolvedValue(record({ isRevoked: true, rotatedAt: new Date() }));
+      await expect(authService.refreshToken('twin-tab')).rejects.toMatchObject({ statusCode: 409 });
+      expect(prisma.refreshToken.updateMany).not.toHaveBeenCalled();
     });
 
     it('ABSOLUTE LIFETIME: a session past its family expiry cannot be refreshed', async () => {
@@ -321,10 +388,11 @@ describe('AuthService', () => {
   describe('logout', () => {
     it('revokes the refresh family and denylists the presented access token', async () => {
       prisma.refreshToken.findUnique.mockResolvedValue({ id: 'rt1', userId: 'u1', familyId: 'fam-9' });
-      const claims = verifyAccessToken(signAccessToken({ sub: 'u1', email: 'a@b.com', role: 'CUSTOMER', tokenVersion: 0, mfa: false }));
+      const claims = verifyAccessToken(signAccessToken({ sub: 'u1', email: 'a@b.com', role: 'CUSTOMER', tokenVersion: 0, mfa: false, sessionId: 'fam-9' }));
       await authService.logout('refresh', claims);
       expect(prisma.refreshToken.updateMany).toHaveBeenCalledWith({ where: { familyId: 'fam-9' }, data: { isRevoked: true } });
-      expect(await tokenState.isAccessTokenRevoked('u1', claims.jti!, 0)).toBe(true);
+      expect(await tokenState.isAccessTokenRevoked({ userId: 'u1', jti: claims.jti!, tokenVersion: 0 })).toBe(true);
+      expect(await tokenState.isAccessTokenRevoked({ userId: 'u1', jti: 'sibling-token', tokenVersion: 0, sessionId: 'fam-9' })).toBe(true);
     });
   });
 
@@ -354,34 +422,112 @@ describe('AuthService', () => {
       expect(prisma.$queryRaw).toHaveBeenCalled();
       expect(prisma.user.update.mock.calls[0][0].data.tokenVersion).toEqual({ increment: 1 });
       expect(prisma.auditLog.create.mock.calls[0][0].data.action).toBe('PASSWORD_RESET');
-      expect(await tokenState.isAccessTokenRevoked('u1', 'any-jti', 0)).toBe(true);
+      expect(await tokenState.isAccessTokenRevoked({ userId: 'u1', jti: 'any-jti', tokenVersion: 0 })).toBe(true);
       expect(mailer.sent[0].subject).toMatch(/password was changed/);
     });
   });
 
   describe('administration', () => {
     const admin = { id: 'admin-1', email: 'admin@bank.com', role: 'BANK_ADMIN' as const, mfa: true };
+    const admin2 = { id: 'admin-2', email: 'admin2@bank.com', role: 'BANK_ADMIN' as const, mfa: true };
 
-    it('disabling a user bumps the token version (immediate lock-out) and is audited', async () => {
+    it('disabling a customer bumps the token version (immediate lock-out) and is audited', async () => {
       prisma.user.findUnique.mockResolvedValue(activeUser());
       prisma.user.update.mockResolvedValue(activeUser({ isActive: false, tokenVersion: 1 }));
-      await authService.setUserActive(admin, 'u1', false);
-      expect(await tokenState.isAccessTokenRevoked('u1', 'jti', 0)).toBe(true);
+      await authService.setCustomerActive(admin, 'u1', false);
+      expect(await tokenState.isAccessTokenRevoked({ userId: 'u1', jti: 'jti', tokenVersion: 0 })).toBe(true);
       expect(prisma.auditLog.create.mock.calls[0][0].data).toEqual(expect.objectContaining({ actorId: 'admin-1', action: 'USER_DISABLED' }));
     });
 
-    it('administrators cannot disable themselves', async () => {
-      await expect(authService.setUserActive(admin, 'admin-1', false)).rejects.toThrow(ForbiddenError);
+    it('administrators cannot disable themselves; staff accounts need an approval request', async () => {
+      await expect(authService.setCustomerActive(admin, 'admin-1', false)).rejects.toThrow(ForbiddenError);
+      prisma.user.findUnique.mockResolvedValue(activeUser({ role: 'TELLER' }));
+      await expect(authService.setCustomerActive(admin, 'u1', false)).rejects.toMatchObject({ errorCode: 'APPROVAL_REQUIRED' });
+    });
+
+    describe('four-eyes admin requests', () => {
+      let requests: AdminRequestService;
+      const pending = (overrides: Partial<any> = {}) => ({
+        id: 'req-1',
+        type: 'CREATE_STAFF',
+        status: 'PENDING',
+        payload: { email: 'new.teller@bank.com', role: 'TELLER' },
+        targetUserId: null,
+        requestedBy: 'admin-1',
+        expiresAt: new Date(Date.now() + 3600_000),
+        ...overrides,
+      });
+
+      beforeEach(() => {
+        requests = new AdminRequestService(prisma, authService);
+      });
+
+      it('staff creation is only requested; nothing is created until a second admin approves', async () => {
+        prisma.user.findUnique.mockResolvedValue(null);
+        const created = await requests.request(admin, { type: 'CREATE_STAFF', email: 'New.Teller@bank.com', role: 'TELLER' as any });
+        expect(created.status).toBe('PENDING');
+        expect(prisma.adminRequest.create.mock.calls[0][0].data.payload).toEqual({ email: 'new.teller@bank.com', role: 'TELLER' });
+        expect(prisma.user.create).not.toHaveBeenCalled();
+      });
+
+      it('staff emails must use the bank domain; CUSTOMER is not a staff role', async () => {
+        prisma.user.findUnique.mockResolvedValue(null);
+        await expect(requests.request(admin, { type: 'CREATE_STAFF', email: 'x@gmail.com', role: 'TELLER' as any })).rejects.toThrow('@bank.com');
+        await expect(requests.request(admin, { type: 'CREATE_STAFF', email: 'x@bank.com', role: 'CUSTOMER' as any })).rejects.toThrow('staff roles');
+      });
+
+      it('SELF-APPROVAL: the requesting admin can never approve, nor can the target of the request', async () => {
+        prisma.adminRequest.findUniqueOrThrow.mockResolvedValue(pending());
+        await expect(requests.approve(admin, 'req-1')).rejects.toThrow(ForbiddenError);
+        prisma.adminRequest.findUniqueOrThrow.mockResolvedValue(pending({ type: 'SET_USER_ACTIVE', targetUserId: 'admin-2', payload: { userId: 'admin-2', isActive: true } }));
+        await expect(requests.approve(admin2, 'req-1')).rejects.toThrow(ForbiddenError);
+        expect(prisma.user.create).not.toHaveBeenCalled();
+      });
+
+      it('approval by a second admin creates the staff user without any password and emails an activation link', async () => {
+        prisma.adminRequest.findUniqueOrThrow.mockResolvedValue(pending());
+        prisma.user.create.mockImplementation(({ data }: any) => activeUser({ id: 'staff-1', ...data }));
+        const { outcome } = await requests.approve(admin2, 'req-1');
+        await authService.drainBackgroundTasks();
+
+        expect(outcome).toEqual({ userId: 'staff-1', email: 'new.teller@bank.com', role: 'TELLER' });
+        expect(prisma.user.create.mock.calls[0][0].data).toEqual(expect.objectContaining({ role: 'TELLER', createdBy: 'req-1' }));
+        expect(prisma.adminRequest.update.mock.calls.at(-1)[0].data).toEqual(expect.objectContaining({ status: 'APPROVED', decidedBy: 'admin-2' }));
+        const raw = tokenFromEmail(mailer.sent[0].text);
+        expect(prisma.enrolmentToken.create.mock.calls[0][0].data).toEqual(expect.objectContaining({ purpose: 'ACTIVATE', tokenHash: sha256(raw) }));
+      });
+
+      it('expired and already-decided requests cannot be approved', async () => {
+        prisma.adminRequest.findUniqueOrThrow.mockResolvedValue(pending({ expiresAt: new Date(Date.now() - 1) }));
+        await expect(requests.approve(admin2, 'req-1')).rejects.toThrow('expired');
+        prisma.adminRequest.findUniqueOrThrow.mockResolvedValue(pending({ status: 'APPROVED' }));
+        await expect(requests.approve(admin2, 'req-1')).rejects.toThrow('already APPROVED');
+      });
+    });
+
+    it('staff activation sets the chosen password once and returns an MFA enrolment token', async () => {
+      prisma.enrolmentToken.findUnique.mockResolvedValue({
+        id: 'e1', userId: 'u1', purpose: 'ACTIVATE', usedAt: null, expiresAt: new Date(Date.now() + 60_000),
+      });
+      prisma.user.update.mockImplementation(({ data }: any) => activeUser({ role: 'TELLER', tokenVersion: 1, passwordHash: data.passwordHash }));
+      prisma.user.findUnique.mockResolvedValue(activeUser({ role: 'TELLER', tokenVersion: 1 }));
+      const { tokens, enrolmentToken } = await authService.activateStaff('activation-token', 'ChosenPassword1');
+      expect(verifyAccessToken(tokens.accessToken).mfa).toBe(false);
+      expect(enrolmentToken).toEqual(expect.any(String));
+      expect(prisma.enrolmentToken.updateMany.mock.calls[0][0]).toEqual({ where: { id: 'e1', usedAt: null }, data: { usedAt: expect.any(Date) } });
+
+      prisma.enrolmentToken.updateMany.mockResolvedValueOnce({ count: 0 }); // consumed concurrently
+      await expect(authService.activateStaff('activation-token', 'ChosenPassword1')).rejects.toThrow('invalid or has expired');
     });
   });
 });
 
 describe('JWT (ES256)', () => {
   it('issues ES256 tokens with kid, jti, token version and mfa that verify round-trip', () => {
-    const token = new TokenService().generateAccessToken({ userId: 'u-1', email: 'a@b.com', role: 'CUSTOMER', tokenVersion: 2, mfa: true });
+    const token = new TokenService().generateAccessToken({ userId: 'u-1', email: 'a@b.com', role: 'CUSTOMER', tokenVersion: 2, mfa: true, sessionId: 'fam-1' });
     const header = JSON.parse(Buffer.from(token.split('.')[0], 'base64url').toString());
     expect(header).toEqual(expect.objectContaining({ alg: 'ES256', kid: 'test-kid' }));
-    expect(verifyAccessToken(token)).toEqual(expect.objectContaining({ id: 'u-1', tokenVersion: 2, mfa: true }));
+    expect(verifyAccessToken(token)).toEqual(expect.objectContaining({ id: 'u-1', tokenVersion: 2, mfa: true, sessionId: 'fam-1' }));
   });
 
   it('rejects alg=none and HS256 tokens (algorithm confusion with the public key)', () => {
@@ -399,7 +545,7 @@ describe('JWT (ES256)', () => {
     const other = generateJwtKeyPair();
     const saved = process.env.JWT_SIGNING_KEY;
     process.env.JWT_SIGNING_KEY = other.privateKeyB64;
-    const forged = signAccessToken({ sub: 'u-1', email: 'a@b.com', role: 'BANK_ADMIN', tokenVersion: 0, mfa: true });
+    const forged = signAccessToken({ sub: 'u-1', email: 'a@b.com', role: 'BANK_ADMIN', tokenVersion: 0, mfa: true, sessionId: 's' });
     process.env.JWT_SIGNING_KEY = saved;
     expect(() => verifyAccessToken(forged)).toThrow(UnauthorizedError);
   });
@@ -412,7 +558,7 @@ describe('createAuthenticate', () => {
     app.use(errorHandlerMiddleware);
     return app;
   };
-  const tokenFor = (role: any, mfa: boolean, tv = 0) => signAccessToken({ sub: 'u1', email: 'a@b.com', role, tokenVersion: tv, mfa });
+  const tokenFor = (role: any, mfa: boolean, tv = 0) => signAccessToken({ sub: 'u1', email: 'a@b.com', role, tokenVersion: tv, mfa, sessionId: 's1' });
 
   it('rejects a token issued before a password change', async () => {
     const store = new InMemoryTokenStateStore();
@@ -430,6 +576,17 @@ describe('createAuthenticate', () => {
     expect(res.body.error.code).toBe('MFA_REQUIRED');
     expect((await request(build(store)).get('/x').set('Authorization', `Bearer ${tokenFor('BANK_ADMIN', true)}`)).status).toBe(200);
     expect((await request(build(store, { allowStaffWithoutMfa: true })).get('/x').set('Authorization', `Bearer ${tokenFor('SUPPORT', false)}`)).status).toBe(200);
+  });
+
+  it('FAIL CLOSED: a Redis outage anywhere in a request is a retryable 503, never a 500', async () => {
+    const app = express();
+    app.get('/y', () => {
+      throw new Error("Stream isn't writeable and enableOfflineQueue options is false");
+    });
+    app.use(errorHandlerMiddleware);
+    const res = await request(app).get('/y');
+    expect(res.status).toBe(503);
+    expect(res.body.error.code).toBe('SERVICE_UNAVAILABLE');
   });
 
   it('FAIL CLOSED: 503 when the token store is unavailable', async () => {
@@ -451,11 +608,20 @@ describe('Auth HTTP routes', () => {
   });
 
   it('requires BANK_ADMIN with MFA to create staff users', async () => {
-    const customer = signAccessToken({ sub: 'u-1', email: 'c@b.com', role: 'CUSTOMER', tokenVersion: 0, mfa: false });
-    const adminNoMfa = signAccessToken({ sub: 'a-1', email: 'a@b.com', role: 'BANK_ADMIN', tokenVersion: 0, mfa: false });
-    const body = { email: 'x@b.com', password: 'Password1234', role: 'BANK_ADMIN' };
+    const customer = signAccessToken({ sub: 'u-1', email: 'c@b.com', role: 'CUSTOMER', tokenVersion: 0, mfa: false, sessionId: 's1' });
+    const adminNoMfa = signAccessToken({ sub: 'a-1', email: 'a@b.com', role: 'BANK_ADMIN', tokenVersion: 0, mfa: false, sessionId: 's2' });
+    const body = { email: 'x@b.com', role: 'TELLER' };
     expect((await request(app).post('/api/v1/auth/admin/users').set('Authorization', `Bearer ${customer}`).send(body)).status).toBe(403);
     expect((await request(app).post('/api/v1/auth/admin/users').set('Authorization', `Bearer ${adminNoMfa}`).send(body)).body.error.code).toBe('MFA_REQUIRED');
+  });
+
+  it('staff creation never accepts an administrator-chosen password', async () => {
+    const admin = signAccessToken({ sub: 'a-1', email: 'a@b.com', role: 'BANK_ADMIN', tokenVersion: 0, mfa: true, sessionId: 's3' });
+    const res = await request(app)
+      .post('/api/v1/auth/admin/users')
+      .set('Authorization', `Bearer ${admin}`)
+      .send({ email: 'x@b.com', role: 'TELLER', password: 'AdminKnowsThis1' });
+    expect(res.status).toBe(400);
   });
 
   it('forgot-password answers 202 regardless of the address', async () => {

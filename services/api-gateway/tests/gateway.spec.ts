@@ -92,6 +92,22 @@ describe('API Gateway', () => {
     expect(denied.headers['access-control-allow-origin']).toBeUndefined();
   });
 
+  it('STAFF NETWORK: staff-only paths are refused from outside STAFF_ALLOWED_CIDRS', async () => {
+    process.env.STAFF_ALLOWED_CIDRS = '10.20.0.0/16';
+    try {
+      const app = createGateway({
+        routes: [{ name: 'transaction-service', prefix: '/api/v1/transactions', target: upstreamUrl }],
+      });
+      const staff = await request(app).post('/api/v1/transactions/deposit').send({});
+      expect(staff.status).toBe(403);
+      expect(staff.body.error.code).toBe('NETWORK_NOT_ALLOWED');
+      const customer = await request(app).post('/api/v1/transactions/transfer').send({});
+      expect(customer.status).toBe(200);
+    } finally {
+      delete process.env.STAFF_ALLOWED_CIDRS;
+    }
+  });
+
   it('returns 502 JSON when an upstream is down', async () => {
     const app = createGateway({
       routes: [{ name: 'auth-service', prefix: '/api/v1/auth', target: 'http://127.0.0.1:1' }],

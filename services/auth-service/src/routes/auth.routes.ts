@@ -43,11 +43,16 @@ export function createAuthRouter(
   router.post('/mfa/setup', limiters.credentials, auth.authenticateForEnrolment, controller.mfaSetup);
   router.post('/mfa/enable', limiters.credentials, auth.authenticateForEnrolment, controller.mfaEnable);
   router.post('/mfa/disable', limiters.credentials, auth.authenticate, controller.mfaDisable);
+  router.post('/staff/activate', limiters.recovery, controller.activateStaff);
 
-  // Staff administration (BANK_ADMIN with an MFA session)
-  router.post('/admin/users', auth.authenticate, requireRoles('BANK_ADMIN'), controller.createStaffUser);
-  router.patch('/admin/users/:userId/status', auth.authenticate, requireRoles('BANK_ADMIN'), controller.setUserStatus);
-  router.post('/admin/users/:userId/mfa/reset', auth.authenticate, requireRoles('BANK_ADMIN'), controller.resetUserMfa);
+  // Staff administration (BANK_ADMIN with an MFA session). Staff changes are four-eyes requests.
+  const admin = [auth.authenticate, requireRoles('BANK_ADMIN')];
+  router.post('/admin/users', ...admin, controller.createStaffUser);
+  router.patch('/admin/users/:userId/status', ...admin, controller.setUserStatus);
+  router.post('/admin/users/:userId/mfa/reset', ...admin, controller.resetUserMfa);
+  router.get('/admin/requests', ...admin, controller.listAdminRequests);
+  router.post('/admin/requests/:requestId/approve', ...admin, controller.approveAdminRequest);
+  router.post('/admin/requests/:requestId/reject', ...admin, controller.rejectAdminRequest);
 
   return router;
 }

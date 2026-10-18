@@ -26,6 +26,7 @@ import {
 import { TokenService } from './services/token.service';
 import { AuthService } from './services/auth.service';
 import { AuthController } from './controllers/auth.controller';
+import { AdminRequestService } from './services/admin-requests.service';
 import { createAuthRouter, AuthRateLimiters } from './routes/auth.routes';
 import { AuthSecurityStore, RedisAuthSecurityStore } from './services/auth-security.store';
 import { assertMfaEncryptionConfigured } from './services/totp';
@@ -34,8 +35,10 @@ export interface AuthAppDeps {
   tokenState: TokenStateStore;
   security: AuthSecurityStore;
   mailer: Mailer;
-  /** Enables Redis-backed per-IP rate limits (omitted in unit tests) */
+  /** Security Redis (token state); used by /health */
   redis?: Redis;
+  /** Evictable Redis for per-IP rate limits (omitted in unit tests) */
+  rateLimitRedis?: Redis;
 }
 
 export function createApp(prisma: PrismaClient, deps: AuthAppDeps) {
@@ -51,7 +54,7 @@ export function createApp(prisma: PrismaClient, deps: AuthAppDeps) {
     security: deps.security,
     mailer: deps.mailer,
   });
-  const authController = new AuthController(authService);
+  const authController = new AuthController(authService, new AdminRequestService(prisma, authService));
   const auth = {
     authenticate: createAuthenticate(deps.tokenState),
     authenticateForEnrolment: createAuthenticate(deps.tokenState, { allowStaffWithoutMfa: true }),
@@ -59,14 +62,14 @@ export function createApp(prisma: PrismaClient, deps: AuthAppDeps) {
 
   // Per-IP brute-force protection. Fails closed: if Redis is down these endpoints return 503.
   const ipLimiter = (prefix: string, windowMs: number, maxRequests: number) =>
-    createRateLimiter(deps.redis!, {
+    createRateLimiter(deps.rateLimitRedis!, {
       windowMs,
       maxRequests,
       keyPrefix: `rl:auth:${prefix}:`,
       failOpen: false,
       keyGenerator: (req) => clientIpKey(req.ip),
     });
-  const limiters: AuthRateLimiters | undefined = deps.redis
+  const limiters: AuthRateLimiters | undefined = deps.rateLimitRedis
     ? {
         credentials: ipLimiter('credentials', 15 * 60_000, Number(process.env.AUTH_RATE_LIMIT_MAX || 30)),
         refresh: ipLimiter('refresh', 60_000, 60),
@@ -124,13 +127,15 @@ export function createApp(prisma: PrismaClient, deps: AuthAppDeps) {
 async function main(): Promise<void> {
   const prisma = new PrismaClient(prismaClientOptions());
   const redis = await connectRedis();
+  const rateLimitRedis = await connectRedis(process.env.RATE_LIMIT_REDIS_URL || process.env.REDIS_URL);
   const mailer = createMailerFromEnv();
   const tokenState = new RedisTokenStateStore(redis);
   const { app, authService } = createApp(prisma, {
     tokenState,
-    security: new RedisAuthSecurityStore(redis),
+    security: new RedisAuthSecurityStore(rateLimitRedis, redis),
     mailer,
     redis,
+    rateLimitRedis,
   });
 
   const synced = await authService.syncTokenVersions();
@@ -138,7 +143,7 @@ async function main(): Promise<void> {
   // Repairs any token-version write that failed (e.g. Redis blip during a password reset) within 30s
   const versionSync = setInterval(() => {
     authService
-      .syncTokenVersions(new Date(Date.now() - 10 * 60_000))
+      .syncTokenVersions(new Date(Date.now() - authService.syncLookbackMs()))
       .catch((err) => logger.warn({ err }, 'Periodic token version sync failed'));
   }, 30_000);
 
@@ -158,6 +163,7 @@ async function main(): Promise<void> {
     () => kafka?.disconnect(),
     () => prisma.$disconnect(),
     () => redis.quit(),
+    () => rateLimitRedis.quit(),
   ]);
 }
 
