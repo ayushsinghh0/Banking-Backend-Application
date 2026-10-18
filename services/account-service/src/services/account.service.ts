@@ -1,16 +1,17 @@
 import crypto from 'crypto';
-import { PrismaClient, BankAccount, AccountType, AccountStatus } from '../../generated/client';
+import { PrismaClient, Prisma, BankAccount, AccountType, AccountStatus } from '../../generated/client';
 import {
   NotFoundError,
   ForbiddenError,
   ConflictError,
   BadRequestError,
   AuthenticatedUser,
+  HttpError,
   isStaff,
-  logger,
 } from '@banksphere/common';
 import { AccountNumberGenerator } from '../utils/account-number.generator';
 import { LedgerClient } from '../clients/ledger.client';
+import { CustomerClient } from '../clients/customer.client';
 
 export const DEFAULT_DAILY_LIMIT_PAISE = 10000000n; // ₹1,00,000.00
 export const MAX_CUSTOMER_DAILY_LIMIT_PAISE = BigInt(
@@ -25,15 +26,11 @@ export interface CreateAccountDTO {
   dailyLimitPaise?: bigint;
 }
 
-export interface KafkaPublisher {
-  publish(topic: string, key: string, payload: any): Promise<void>;
-}
-
 export class AccountService {
   constructor(
     private readonly prisma: PrismaClient,
     private readonly ledgerClient: LedgerClient,
-    private readonly kafkaPublisher?: KafkaPublisher | null
+    private readonly customerClient: CustomerClient
   ) {}
 
   /**
@@ -47,6 +44,16 @@ export class AccountService {
     if (currency !== 'INR') {
       // The ledger has no FX support; mixed-currency transfers would silently mis-value money
       throw new BadRequestError('Only INR accounts are supported');
+    }
+
+    // Regulatory gate: no account without a completed KYC review
+    const kycStatus = await this.customerClient.getKycStatus(dto.customerId);
+    if (kycStatus !== 'VERIFIED') {
+      throw new HttpError(
+        403,
+        'KYC_NOT_VERIFIED',
+        'Your identity verification (KYC) must be approved before you can open an account'
+      );
     }
 
     const existingCount = await this.prisma.bankAccount.count({
@@ -84,6 +91,15 @@ export class AccountService {
               isActive: true,
             });
 
+            await this.stageEvent(tx, 'account.created.v1', created.id, {
+              accountId: created.id,
+              accountNumber: created.accountNumber,
+              customerId: created.customerId,
+              accountType: created.accountType,
+              currency: created.currency,
+              status: created.status,
+            });
+
             return created;
           },
           { timeout: 15000 }
@@ -98,15 +114,6 @@ export class AccountService {
     if (!account) {
       throw new ConflictError('Failed to allocate unique account number. Please retry.');
     }
-
-    await this.publish('account.created.v1', account.id, {
-      accountId: account.id,
-      accountNumber: account.accountNumber,
-      customerId: account.customerId,
-      accountType: account.accountType,
-      currency: account.currency,
-      status: account.status,
-    });
 
     return account;
   }
@@ -189,18 +196,18 @@ export class AccountService {
           isActive: status === AccountStatus.ACTIVE,
         });
 
+        await this.stageEvent(tx, 'account.status.changed.v1', accountId, {
+          accountId,
+          customerId: account.customerId,
+          previousStatus: account.status,
+          status,
+          changedBy: actor.id,
+        });
+
         return tx.bankAccount.findUniqueOrThrow({ where: { id: accountId } });
       },
       { timeout: 15000 }
     );
-
-    await this.publish('account.status.changed.v1', updated.id, {
-      accountId: updated.id,
-      customerId: updated.customerId,
-      previousStatus: account.status,
-      status: updated.status,
-      changedBy: actor.id,
-    });
 
     return updated;
   }
@@ -246,18 +253,25 @@ export class AccountService {
     }
   }
 
-  private async publish(eventType: string, key: string, data: Record<string, unknown>): Promise<void> {
-    if (!this.kafkaPublisher) return;
-    try {
-      await this.kafkaPublisher.publish(eventType, key, {
-        eventId: crypto.randomUUID(),
+  private async stageEvent(
+    tx: Prisma.TransactionClient,
+    eventType: string,
+    aggregateId: string,
+    data: Record<string, unknown>
+  ): Promise<void> {
+    // TRANSACTIONAL OUTBOX: committed together with the account change, relayed to Kafka afterwards
+    await tx.outboxEvent.create({
+      data: {
+        aggregateType: 'ACCOUNT',
+        aggregateId,
         eventType,
-        timestamp: new Date().toISOString(),
-        ...data,
-      });
-    } catch (err) {
-      // Notification-only events: the ledger has already been updated synchronously
-      logger.error({ err, eventType, key }, 'Failed to publish account event to Kafka');
-    }
+        payload: {
+          eventId: crypto.randomUUID(),
+          eventType,
+          timestamp: new Date().toISOString(),
+          ...data,
+        } as Prisma.InputJsonValue,
+      },
+    });
   }
 }

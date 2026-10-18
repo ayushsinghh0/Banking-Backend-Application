@@ -1,8 +1,8 @@
-import { Router } from 'express';
-import { authenticate, requireRoles } from '@banksphere/common';
+import { RequestHandler, Router } from 'express';
+import { requireRoles } from '@banksphere/common';
 import { FraudController } from '../controllers/fraud.controller';
 
-export function createFraudRouter(controller: FraudController): Router {
+export function createFraudRouter(controller: FraudController, authenticate: RequestHandler): Router {
   const router = Router();
 
   // Risk data is compliance-only

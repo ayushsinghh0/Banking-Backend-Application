@@ -1,20 +1,25 @@
 import { Request, Response, NextFunction } from 'express';
 import Redis from 'ioredis';
-import { RateLimitExceededError } from '../errors/app-error';
+import { RateLimitExceededError, ServiceUnavailableError } from '../errors/app-error';
 
 export interface RateLimiterOptions {
   windowMs: number; // e.g. 60000 for 1 minute
   maxRequests: number; // e.g. 100 requests per window
   keyPrefix?: string;
   skipFailedRequests?: boolean;
+  /** When Redis is unavailable: true lets traffic through, false rejects with 503 (use for credential endpoints) */
+  failOpen?: boolean;
+  /** Custom bucket key; defaults to authenticated user id, then client IP */
+  keyGenerator?: (req: Request) => string;
 }
 
 export function createRateLimiter(redis: Redis, options: RateLimiterOptions) {
-  const { windowMs, maxRequests, keyPrefix = 'rl:' } = options;
+  const { windowMs, maxRequests, keyPrefix = 'rl:', failOpen = true, keyGenerator } = options;
 
   return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     // Determine client identifier: authenticated user ID or client IP
-    const identifier = (req as any).user?.id || req.ip || req.socket.remoteAddress || 'unknown';
+    const identifier =
+      keyGenerator?.(req) || req.user?.id || req.ip || req.socket.remoteAddress || 'unknown';
     const key = `${keyPrefix}${identifier}`;
     const now = Date.now();
     const windowStart = now - windowMs;
@@ -54,11 +59,14 @@ export function createRateLimiter(redis: Redis, options: RateLimiterOptions) {
         next(error);
         return;
       }
-      // Fail-open: If Redis is unavailable, log and allow traffic to keep core banking alive
       if (req.log) {
-        req.log.warn({ error }, 'Rate limiter Redis failure, failing open');
+        req.log.warn({ err: error }, `Rate limiter Redis failure, failing ${failOpen ? 'open' : 'closed'}`);
       }
-      next();
+      if (failOpen) {
+        next();
+      } else {
+        next(new ServiceUnavailableError('Temporarily unavailable, please retry shortly'));
+      }
     }
   };
 }

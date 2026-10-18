@@ -1,0 +1,43 @@
+# Local development overlay:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+# - publishes Postgres, Redis and Kafka on 127.0.0.1 so services can also run natively (npm start)
+# - adds Mailpit, a local SMTP server that captures every email (web UI: http://localhost:8025)
+# Never use this overlay in production.
+
+services:
+  postgres:
+    ports: ["127.0.0.1:5432:5432"]
+
+  redis:
+    # 6380 on the host so it does not clash with a locally installed Redis
+    ports: ["127.0.0.1:${DEV_REDIS_PORT:-6380}:6379"]
+
+  kafka:
+    ports: ["127.0.0.1:9092:9092"]
+
+  mailpit:
+    image: axllent/mailpit:v1.21
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:1025:1025"
+      - "127.0.0.1:8025:8025"
+    environment:
+      MP_MAX_MESSAGES: 5000
+
+  auth-service:
+    environment:
+      SMTP_HOST: mailpit
+      SMTP_PORT: 1025
+      SMTP_SECURE: "false"
+      SMTP_REQUIRE_TLS: "false"
+    depends_on:
+      mailpit: { condition: service_started }
+
+  notification-service:
+    environment:
+      SMTP_HOST: mailpit
+      SMTP_PORT: 1025
+      SMTP_SECURE: "false"
+      SMTP_REQUIRE_TLS: "false"
+    depends_on:
+      mailpit: { condition: service_started }

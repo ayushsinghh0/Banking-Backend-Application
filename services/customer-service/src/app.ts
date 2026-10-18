@@ -3,27 +3,28 @@ import { Request, Response } from 'express';
 import { PrismaClient } from '../generated/client';
 import Redis from 'ioredis';
 import {
+  connectRedis,
+  createAuthenticate,
   createBaseApp,
   errorHandlerMiddleware,
+  getInternalServiceToken,
   getJwtAccessSecret,
   isSwaggerEnabled,
   logger,
   notFoundHandler,
+  RedisTokenStateStore,
   setupSwagger,
+  startHttpServer,
+  TokenStateStore,
 } from '@banksphere/common';
 import { CustomerService } from './services/customer.service';
 import { CustomerController } from './controllers/customer.controller';
-import { createCustomerRouter } from './routes/customer.routes';
+import { createCustomerRouter, createInternalCustomerRouter } from './routes/customer.routes';
 
-export function createApp(prisma: PrismaClient, redisClient?: Redis) {
+export function createApp(prisma: PrismaClient, redis: Redis, tokenState: TokenStateStore) {
   getJwtAccessSecret(); // Fail fast on a missing/weak signing secret
+  getInternalServiceToken();
   const app = createBaseApp();
-
-  const redis =
-    redisClient ||
-    new Redis(process.env.REDIS_URL || 'redis://localhost:6379', {
-      maxRetriesPerRequest: 2,
-    });
 
   const customerService = new CustomerService(
     prisma,
@@ -33,7 +34,8 @@ export function createApp(prisma: PrismaClient, redisClient?: Redis) {
   const customerController = new CustomerController(customerService);
 
   // Routes
-  app.use('/api/v1/customers', createCustomerRouter(customerController));
+  app.use('/api/v1/customers', createCustomerRouter(customerController, createAuthenticate(tokenState)));
+  app.use('/internal/v1', createInternalCustomerRouter(customerService));
 
   // OpenAPI Swagger Docs
   if (isSwaggerEnabled()) setupSwagger(app, {
@@ -86,26 +88,19 @@ export function createApp(prisma: PrismaClient, redisClient?: Redis) {
   return { app, prisma, redis };
 }
 
-// Direct server startup
-if (require.main === module) {
+async function main(): Promise<void> {
   const prisma = new PrismaClient();
-  const { app, redis } = createApp(prisma);
-  const PORT = process.env.PORT || 8002;
+  const redis = await connectRedis();
+  const { app } = createApp(prisma, redis, new RedisTokenStateStore(redis));
+  startHttpServer(app, process.env.PORT || 8002, 'customer-service', [
+    () => prisma.$disconnect(),
+    () => redis.quit(),
+  ]);
+}
 
-  const server = app.listen(PORT, () => {
-    logger.info(`BankSphere Customer Service running on port ${PORT}`);
+if (require.main === module) {
+  main().catch((err) => {
+    logger.fatal({ err }, 'customer-service failed to start');
+    process.exit(1);
   });
-
-  const shutdown = async () => {
-    console.log('Shutting down Customer Service gracefully...');
-    server.close(async () => {
-      await prisma.$disconnect();
-      await redis.quit();
-      console.log('Customer Service connections closed.');
-      process.exit(0);
-    });
-  };
-
-  process.on('SIGTERM', shutdown);
-  process.on('SIGINT', shutdown);
 }

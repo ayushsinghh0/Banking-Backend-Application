@@ -59,13 +59,16 @@ export class LedgerService {
     if (tx) return work(tx);
     return this.prisma.$transaction(work, {
       isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted,
-      timeout: 10000,
+      maxWait: 10_000,
+      timeout: 15_000,
     });
   }
 
   private async lockAccounts(tx: TxClient, ids: string[]): Promise<LockedAccount[]> {
     // DEADLOCK PREVENTION: rows are always locked in ascending id order
     const sorted = [...new Set(ids)].sort();
+    // Don't queue forever behind a hot account: give up after 5s and let the client retry (503)
+    await tx.$executeRaw`SET LOCAL lock_timeout = '5s'`;
     return tx.$queryRaw<LockedAccount[]>`
       SELECT id, balance, is_active, account_number, customer_id, currency, daily_limit
       FROM ledger_accounts

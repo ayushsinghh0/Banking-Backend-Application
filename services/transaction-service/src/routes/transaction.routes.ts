@@ -1,8 +1,8 @@
-import { Router } from 'express';
-import { authenticate, requireRoles } from '@banksphere/common';
+import { RequestHandler, Router } from 'express';
+import { requireRoles } from '@banksphere/common';
 import { TransactionController } from '../controllers/transaction.controller';
 
-export function createTransactionRouter(controller: TransactionController): Router {
+export function createTransactionRouter(controller: TransactionController, authenticate: RequestHandler): Router {
   const router = Router();
 
   router.use(authenticate);

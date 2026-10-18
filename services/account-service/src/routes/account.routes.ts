@@ -1,8 +1,7 @@
-import { Router } from 'express';
-import { authenticate } from '@banksphere/common';
+import { RequestHandler, Router } from 'express';
 import { AccountController } from '../controllers/account.controller';
 
-export function createAccountRouter(controller: AccountController): Router {
+export function createAccountRouter(controller: AccountController, authenticate: RequestHandler): Router {
   const router = Router();
 
   router.use(authenticate);

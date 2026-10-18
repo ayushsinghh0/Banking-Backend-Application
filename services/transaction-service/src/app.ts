@@ -1,7 +1,10 @@
 import 'dotenv/config';
 import { Request, Response } from 'express';
+import Redis from 'ioredis';
 import { PrismaClient } from '../generated/client';
 import {
+  connectRedis,
+  createAuthenticate,
   createBaseApp,
   createEventPublisher,
   errorHandlerMiddleware,
@@ -10,20 +13,24 @@ import {
   isSwaggerEnabled,
   logger,
   notFoundHandler,
+  OutboxRelay,
+  RedisTokenStateStore,
   setupSwagger,
+  startHttpServer,
+  TokenStateStore,
 } from '@banksphere/common';
 import { LedgerService } from './services/ledger.service';
 import { IdempotencyService } from './services/idempotency.service';
-import { OutboxService, KafkaPublisher } from './services/outbox.service';
 import { TransactionController } from './controllers/transaction.controller';
 import { createTransactionRouter } from './routes/transaction.routes';
 import { createInternalRouter } from './routes/internal.routes';
 
-export interface TransactionAppOptions {
-  kafkaPublisher?: KafkaPublisher | null;
+export interface TransactionAppDeps {
+  tokenState: TokenStateStore;
+  redis?: Redis;
 }
 
-export function createApp(prisma: PrismaClient, options: TransactionAppOptions = {}) {
+export function createApp(prisma: PrismaClient, deps: TransactionAppDeps) {
   getJwtAccessSecret(); // Fail fast on a missing/weak signing secret
   getInternalServiceToken();
   const app = createBaseApp();
@@ -32,25 +39,19 @@ export function createApp(prisma: PrismaClient, options: TransactionAppOptions =
   const ledgerService = new LedgerService(prisma);
   const idempotencyService = new IdempotencyService(prisma);
 
-  // The outbox relay only runs with a real publisher. Without Kafka, events stay PENDING
-  // (and are delivered once Kafka is configured) instead of being marked PUBLISHED and lost.
-  const outboxService = options.kafkaPublisher
-    ? new OutboxService(prisma, options.kafkaPublisher)
-    : null;
-
   // Controller & Router
   const controller = new TransactionController(ledgerService, idempotencyService);
-  app.use('/api/v1/transactions', createTransactionRouter(controller));
+  app.use('/api/v1/transactions', createTransactionRouter(controller, createAuthenticate(deps.tokenState)));
   app.use('/internal/v1', createInternalRouter(ledgerService));
 
   // Health and readiness endpoints
   app.get('/health', async (req: Request, res: Response) => {
     try {
       await prisma.$queryRaw`SELECT 1`;
+      if (deps.redis) await deps.redis.ping();
       res.json({
         status: 'UP',
         service: 'transaction-and-ledger-service',
-        outboxRelay: outboxService ? 'running' : 'disabled',
         timestamp: new Date().toISOString(),
       });
     } catch (err) {
@@ -95,37 +96,36 @@ export function createApp(prisma: PrismaClient, options: TransactionAppOptions =
   // Centralized Error Handling Middleware
   app.use(errorHandlerMiddleware);
 
-  return { app, outboxService, idempotencyService, prisma };
+  return { app, idempotencyService, prisma };
 }
 
-// Server startup if executed directly
-if (require.main === module) {
+async function main(): Promise<void> {
   const prisma = new PrismaClient();
-  const { publisher, kafka } = createEventPublisher(process.env.KAFKA_CLIENT_ID || 'transaction-service');
-  const { app, outboxService, idempotencyService } = createApp(prisma, { kafkaPublisher: publisher });
-  const PORT = process.env.PORT || 8004;
+  const redis = await connectRedis();
+  const { app, idempotencyService } = createApp(prisma, { tokenState: new RedisTokenStateStore(redis), redis });
 
-  outboxService?.start(Number(process.env.OUTBOX_POLL_INTERVAL_MS || 3000));
+  // The relay only runs with a real publisher. Without Kafka, events stay PENDING and are
+  // delivered once Kafka is configured, instead of being marked PUBLISHED and lost.
+  const { publisher, kafka } = createEventPublisher(process.env.KAFKA_CLIENT_ID || 'transaction-service');
+  const relay = publisher ? new OutboxRelay(prisma, publisher) : null;
+  relay?.start(Number(process.env.OUTBOX_POLL_INTERVAL_MS || 2000));
+
   const purgeTimer = setInterval(() => {
     idempotencyService.purgeExpired().catch((err) => logger.error({ err }, 'Idempotency purge failed'));
   }, 60 * 60 * 1000);
 
-  const server = app.listen(PORT, () => {
-    logger.info(`BankSphere Transaction & Ledger Service running on port ${PORT}`);
+  startHttpServer(app, process.env.PORT || 8004, 'transaction-service', [
+    () => clearInterval(purgeTimer),
+    () => relay?.stop(),
+    () => kafka?.disconnect(),
+    () => prisma.$disconnect(),
+    () => redis.quit(),
+  ]);
+}
+
+if (require.main === module) {
+  main().catch((err) => {
+    logger.fatal({ err }, 'transaction-service failed to start');
+    process.exit(1);
   });
-
-  // Graceful shutdown
-  const shutdown = async () => {
-    logger.info('Shutting down Transaction & Ledger Service gracefully...');
-    outboxService?.stop();
-    clearInterval(purgeTimer);
-    server.close(async () => {
-      await prisma.$disconnect();
-      await kafka?.disconnect().catch(() => {});
-      process.exit(0);
-    });
-  };
-
-  process.on('SIGTERM', shutdown);
-  process.on('SIGINT', shutdown);
 }

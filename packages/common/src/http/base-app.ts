@@ -10,8 +10,9 @@ import { NotFoundError } from '../errors/app-error';
 export function createBaseApp(): Express {
   const app = express();
   app.disable('x-powered-by');
-  if (process.env.TRUST_PROXY) {
-    app.set('trust proxy', process.env.TRUST_PROXY);
+  const trustProxy = parseTrustProxy(process.env.TRUST_PROXY);
+  if (trustProxy !== undefined) {
+    app.set('trust proxy', trustProxy);
   }
   app.use(helmet());
   app.use(express.json({ limit: '100kb' }));
@@ -41,4 +42,17 @@ export function parsePagination(
     : defaults.limit;
   const offset = Number.isFinite(rawOffset) ? Math.max(rawOffset, 0) : 0;
   return { limit, offset };
+}
+
+/**
+ * TRUST_PROXY: a hop count ("1" = trust only the API gateway / load balancer directly in front),
+ * "true"/"false", or a comma-separated list of trusted proxy addresses/subnets. A numeric string
+ * must become a number: Express would otherwise treat "1" as an IP address.
+ */
+export function parseTrustProxy(value: string | undefined): boolean | number | string | undefined {
+  if (!value) return undefined;
+  if (/^\d+$/.test(value)) return Number(value);
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  return value;
 }

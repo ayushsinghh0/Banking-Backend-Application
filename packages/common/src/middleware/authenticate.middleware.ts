@@ -1,7 +1,9 @@
 import crypto from 'crypto';
-import { Request, Response, NextFunction } from 'express';
+import { Request, Response, NextFunction, RequestHandler } from 'express';
 import { AuthenticatedUser, UserRole, verifyAccessToken } from '../auth/jwt';
-import { ForbiddenError, UnauthorizedError } from '../errors/app-error';
+import { TokenStateStore } from '../auth/token-state';
+import { ForbiddenError, ServiceUnavailableError, UnauthorizedError } from '../errors/app-error';
+import { logger } from '../logger/logger';
 
 declare global {
   namespace Express {
@@ -11,22 +13,46 @@ declare global {
   }
 }
 
+export function readBearerToken(req: Request): string | null {
+  const header = req.header('authorization');
+  if (!header || !header.startsWith('Bearer ')) return null;
+  return header.slice('Bearer '.length).trim() || null;
+}
+
 /**
- * Verifies the Bearer access token on every request and attaches the caller identity.
- * Identity is only ever taken from a signed token, never from client-controlled
- * headers such as x-user-id / x-user-role.
+ * Builds the authentication middleware. It verifies the Bearer access token and then checks the
+ * shared token-state store, so logged-out tokens and tokens issued before a password change /
+ * reset / account disable are rejected immediately rather than when they expire.
+ *
+ * Identity is only ever taken from a signed token, never from client-controlled headers.
+ * If the token-state store is unreachable the request is refused (fail closed).
  */
-export function authenticate(req: Request, _res: Response, next: NextFunction): void {
-  try {
-    const header = req.header('authorization');
-    if (!header || !header.startsWith('Bearer ')) {
-      throw new UnauthorizedError('Missing Bearer access token');
+export function createAuthenticate(tokenState: TokenStateStore): RequestHandler {
+  return async (req: Request, _res: Response, next: NextFunction): Promise<void> => {
+    try {
+      const token = readBearerToken(req);
+      if (!token) {
+        throw new UnauthorizedError('Missing Bearer access token');
+      }
+      const user = verifyAccessToken(token);
+
+      let revoked: boolean;
+      try {
+        revoked = await tokenState.isAccessTokenRevoked(user.id, user.jti!, user.tokenVersion!);
+      } catch (err) {
+        logger.error({ err }, 'Token state store unavailable; refusing request');
+        throw new ServiceUnavailableError('Authentication temporarily unavailable');
+      }
+      if (revoked) {
+        throw new UnauthorizedError('Access token has been revoked');
+      }
+
+      req.user = user;
+      next();
+    } catch (error) {
+      next(error);
     }
-    req.user = verifyAccessToken(header.slice('Bearer '.length).trim());
-    next();
-  } catch (error) {
-    next(error);
-  }
+  };
 }
 
 export function requireRoles(...roles: UserRole[]) {
@@ -58,8 +84,8 @@ export const INTERNAL_TOKEN_HEADER = 'x-internal-service-token';
 
 export function getInternalServiceToken(): string {
   const token = process.env.INTERNAL_SERVICE_TOKEN;
-  if (!token || token.length < 32) {
-    throw new Error('INTERNAL_SERVICE_TOKEN must be set and at least 32 characters long');
+  if (!token || token.length < 32 || /CHANGE_ME/i.test(token)) {
+    throw new Error('INTERNAL_SERVICE_TOKEN must be set to a random value of at least 32 characters');
   }
   return token;
 }

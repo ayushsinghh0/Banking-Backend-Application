@@ -11,6 +11,7 @@ import {
   INTERNAL_TOKEN_HEADER,
   logger,
   notFoundHandler,
+  parseTrustProxy,
 } from '@banksphere/common';
 
 export interface RouteTarget {
@@ -43,8 +44,9 @@ export function createGateway(options: GatewayOptions = {}) {
   const routes = options.routes ?? defaultRoutes();
   const app = express();
   app.disable('x-powered-by');
-  if (process.env.TRUST_PROXY) {
-    app.set('trust proxy', process.env.TRUST_PROXY);
+  const trustProxy = parseTrustProxy(process.env.TRUST_PROXY);
+  if (trustProxy !== undefined) {
+    app.set('trust proxy', trustProxy);
   }
   app.use(helmet());
   app.use(correlationIdMiddleware);
@@ -114,6 +116,8 @@ export function createGateway(options: GatewayOptions = {}) {
       on: {
         proxyReq: (proxyReq, req) => {
           proxyReq.setHeader('x-correlation-id', req.correlationId);
+          // Overwrite (never append to) X-Forwarded-For with the client IP as resolved by this gateway,
+          // so a client can't spoof its IP to the per-IP rate limits behind it
           proxyReq.setHeader('x-forwarded-for', req.ip || '');
         },
         error: (err, req, res) => {

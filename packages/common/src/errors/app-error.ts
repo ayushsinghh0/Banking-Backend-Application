@@ -82,3 +82,17 @@ export class ServiceUnavailableError extends AppError {
     super(message);
   }
 }
+
+/**
+ * Operational error with an explicit status and machine-readable code, for cases that don't
+ * warrant a dedicated class (e.g. EMAIL_NOT_VERIFIED, INVALID_OR_EXPIRED_TOKEN).
+ */
+export class HttpError extends AppError {
+  constructor(
+    public readonly statusCode: number,
+    public readonly errorCode: string,
+    message: string
+  ) {
+    super(message);
+  }
+}

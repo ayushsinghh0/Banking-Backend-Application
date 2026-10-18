@@ -5,6 +5,7 @@ export interface TokenPayload {
   userId: string;
   email: string;
   role: string;
+  tokenVersion: number;
 }
 
 export interface GeneratedTokens {
@@ -40,7 +41,12 @@ export class TokenService {
    */
   public generateAccessToken(payload: TokenPayload): string {
     return signAccessToken(
-      { sub: payload.userId, email: payload.email, role: payload.role as UserRole },
+      {
+        sub: payload.userId,
+        email: payload.email,
+        role: payload.role as UserRole,
+        tokenVersion: payload.tokenVersion,
+      },
       this.accessExpiration
     );
   }

@@ -65,6 +65,23 @@ export function errorHandlerMiddleware(
     return;
   }
 
+  // Database contention: connection-pool exhaustion, lock timeouts, deadlocks, serialization failures.
+  // The whole DB transaction (including any idempotency claim) was rolled back, so retrying is safe.
+  if (isRetryableDatabaseError(err)) {
+    if (req.log) {
+      req.log.warn({ code: (err as any).code, correlationId }, 'Database busy, asking client to retry');
+    }
+    res.setHeader('Retry-After', '1');
+    res.status(503).json({
+      error: {
+        code: 'SERVICE_BUSY',
+        message: 'The service is busy processing other requests for this resource. Please retry shortly.',
+        correlationId,
+      },
+    });
+    return;
+  }
+
   // Unique-constraint races that slipped past application-level checks
   if ((err as any).code === 'P2002') {
     res.status(409).json({
@@ -87,4 +104,21 @@ export function errorHandlerMiddleware(
       correlationId,
     },
   });
+}
+
+const RETRYABLE_PRISMA_CODES = new Set([
+  'P2024', // timed out fetching a connection from the pool
+  'P2028', // interactive transaction could not start in time / expired
+  'P2034', // write conflict or deadlock, retry the transaction
+]);
+const RETRYABLE_PG_STATES = ['55P03', '40P01', '40001']; // lock_not_available, deadlock, serialization failure
+
+export function isRetryableDatabaseError(err: unknown): boolean {
+  const e = err as any;
+  if (!e || typeof e !== 'object') return false;
+  if (RETRYABLE_PRISMA_CODES.has(e.code)) return true;
+  const pgCode = e.meta?.code ?? e.meta?.database_error_code;
+  if (RETRYABLE_PG_STATES.includes(pgCode)) return true;
+  const message = String(e.message ?? '');
+  return /lock timeout|deadlock detected|could not serialize access/i.test(message);
 }

@@ -127,7 +127,7 @@ export class IdempotencyService {
           await this.complete(tx, ctx, 201, body);
           return body;
         },
-        { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, timeout: 10000 }
+        { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, maxWait: 10_000, timeout: 15_000 }
       );
       return { statusCode: 201, responseBody, replayed: false };
     } catch (err: any) {

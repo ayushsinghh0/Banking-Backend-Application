@@ -192,7 +192,7 @@ export class NotificationService {
     const emailOptions: EmailDispatchOptions = {
       recipient: this.securityTeamEmail,
       subject: `URGENT SECURITY ALERT: [${event.severity}] Risk Activity Detected`,
-      body: `Security Operations Alert,\n\nA transaction has triggered risk rule evaluation.\n\nTransaction ID: ${event.transactionId}\nAccount ID: ${event.accountId}\nSeverity: ${event.severity}\nReason: ${event.reason}\n\nPlease review immediately.`,
+      body: `Security Operations team,\n\nA transaction has triggered risk rule evaluation.\n\nTransaction ID: ${event.transactionId}\nAccount ID: ${event.accountId}\nSeverity: ${event.severity}\nReason: ${event.reason}\n\nPlease review immediately.`,
       metadata: { alertId: event.alertId, transactionId: event.transactionId },
     };
 

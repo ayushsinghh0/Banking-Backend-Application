@@ -1,34 +1,22 @@
+import { Mailer, renderEmail } from '@banksphere/common';
 import { EmailDispatchOptions } from '../types';
 
 export interface EmailProvider {
   sendEmail(options: EmailDispatchOptions): Promise<{ messageId: string }>;
 }
 
-export class SimulatedEmailProvider implements EmailProvider {
-  private shouldFailNext = false;
-
-  /**
-   * For testing retries and DLQ: configure the provider to simulate a network outage
-   */
-  public simulateFailure(fail: boolean): void {
-    this.shouldFailNext = fail;
-  }
+/**
+ * Production provider: renders the branded text + HTML email and sends it through the configured
+ * Mailer (SMTP in production, see createMailerFromEnv).
+ */
+export class MailerEmailProvider implements EmailProvider {
+  constructor(private readonly mailer: Mailer) {}
 
   public async sendEmail(options: EmailDispatchOptions): Promise<{ messageId: string }> {
-    if (this.shouldFailNext) {
-      throw new Error('SMTP Connection Timeout: Remote mail server unreachable');
-    }
-
-    const messageId = `msg-${Date.now()}-${Math.random().toString(16).substring(2, 8)}`;
-
-    console.log('\n================== [SIMULATED EMAIL DISPATCH] ==================');
-    console.log(`To:      ${options.recipient}`);
-    console.log(`Subject: ${options.subject}`);
-    console.log(`Date:    ${new Date().toISOString()}`);
-    console.log('----------------------------------------------------------------');
-    console.log(options.body);
-    console.log('================================================================\n');
-
-    return { messageId };
+    // The first paragraph is used as the greeting when it looks like one ("Dear Customer,")
+    const paragraphs = options.body.split(/\n{2,}/);
+    const greeting = /,$/.test(paragraphs[0] ?? '') ? paragraphs.shift() : undefined;
+    const { text, html } = renderEmail({ greeting, paragraphs });
+    return this.mailer.send({ to: options.recipient, subject: options.subject, text, html });
   }
 }

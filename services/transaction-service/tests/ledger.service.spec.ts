@@ -35,6 +35,7 @@ describe('LedgerService (Financial Invariants and Concurrency)', () => {
     mockPrisma = {
       $transaction: jest.fn((callback) => callback(mockPrisma)),
       $queryRaw: jest.fn(),
+      $executeRaw: jest.fn(),
       transaction: { create: jest.fn() },
       ledgerEntry: {
         create: jest.fn(),

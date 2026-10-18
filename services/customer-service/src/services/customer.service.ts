@@ -147,6 +147,18 @@ export class CustomerService {
   }
 
   /**
+   * Authoritative KYC status (bypasses the cache: used for account-opening decisions).
+   * Customers without a profile are reported as PENDING.
+   */
+  public async getKycStatus(userId: string): Promise<KycStatus> {
+    const profile = await this.prisma.customerProfile.findUnique({
+      where: { userId },
+      select: { kycStatus: true },
+    });
+    return profile?.kycStatus ?? KycStatus.PENDING;
+  }
+
+  /**
    * KYC review outcome, set by bank staff only
    */
   public async updateKycStatus(userId: string, kycStatus: KycStatus): Promise<CustomerProfile> {

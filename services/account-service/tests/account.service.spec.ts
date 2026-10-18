@@ -16,7 +16,7 @@ const support: AuthenticatedUser = { id: 'support-user-id', email: 'support@bank
 
 describe('AccountService (Account Lifecycle, Numbers, and Ownership)', () => {
   let mockPrisma: any;
-  let mockKafka: any;
+  let mockCustomer: any;
   let mockLedger: any;
   let accountService: AccountService;
 
@@ -38,17 +38,18 @@ describe('AccountService (Account Lifecycle, Numbers, and Ownership)', () => {
         update: jest.fn(),
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
       },
+      outboxEvent: { create: jest.fn() },
       $transaction: jest.fn((cb: any) => cb(mockPrisma)),
     };
 
-    mockKafka = { publish: jest.fn().mockResolvedValue(undefined) };
+    mockCustomer = { getKycStatus: jest.fn().mockResolvedValue('VERIFIED') };
     mockLedger = {
       provisionAccount: jest.fn().mockResolvedValue(undefined),
       updateAccount: jest.fn().mockResolvedValue(undefined),
       getAccount: jest.fn().mockResolvedValue({ id: 'acc-1', balanceInPaise: '0', isActive: true }),
     };
 
-    accountService = new AccountService(mockPrisma, mockLedger, mockKafka);
+    accountService = new AccountService(mockPrisma, mockLedger, mockCustomer);
   });
 
   describe('AccountNumberGenerator', () => {
@@ -78,7 +79,7 @@ describe('AccountService (Account Lifecycle, Numbers, and Ownership)', () => {
       }));
     });
 
-    it('provisions the ledger account and publishes account.created.v1', async () => {
+    it('provisions the ledger account and stages account.created.v1 in the outbox', async () => {
       const account = await accountService.createAccount(
         { customerId: 'alice-cust-id', accountType: AccountType.SAVINGS },
         alice
@@ -89,11 +90,22 @@ describe('AccountService (Account Lifecycle, Numbers, and Ownership)', () => {
       expect(mockLedger.provisionAccount).toHaveBeenCalledWith(
         expect.objectContaining({ id: account.id, customerId: 'alice-cust-id', isActive: true })
       );
-      expect(mockKafka.publish).toHaveBeenCalledWith(
-        'account.created.v1',
-        account.id,
-        expect.objectContaining({ eventType: 'account.created.v1', customerId: 'alice-cust-id' })
+      expect(mockPrisma.outboxEvent.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          eventType: 'account.created.v1',
+          aggregateId: account.id,
+          payload: expect.objectContaining({ eventType: 'account.created.v1', customerId: 'alice-cust-id' }),
+        }),
+      });
+    });
+
+    it('KYC: refuses to open an account until KYC is VERIFIED', async () => {
+      mockCustomer.getKycStatus.mockResolvedValue('PENDING');
+      await expect(accountService.createAccount({ customerId: 'alice-cust-id' }, alice)).rejects.toThrow(
+        'identity verification'
       );
+      expect(mockPrisma.bankAccount.create).not.toHaveBeenCalled();
+      expect(mockLedger.provisionAccount).not.toHaveBeenCalled();
     });
 
     it('fails (and rolls back) when the ledger cannot provision the account', async () => {
@@ -102,7 +114,6 @@ describe('AccountService (Account Lifecycle, Numbers, and Ownership)', () => {
       await expect(
         accountService.createAccount({ customerId: 'alice-cust-id' }, alice)
       ).rejects.toThrow(BadGatewayError);
-      expect(mockKafka.publish).not.toHaveBeenCalled();
     });
 
     it('LIMIT ABUSE: customers cannot grant themselves a daily limit above the cap', async () => {

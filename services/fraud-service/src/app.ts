@@ -1,7 +1,10 @@
 import 'dotenv/config';
 import { Request, Response } from 'express';
+import Redis from 'ioredis';
 import { PrismaClient } from '../generated/client';
 import {
+  connectRedis,
+  createAuthenticate,
   createBaseApp,
   createEventPublisher,
   errorHandlerMiddleware,
@@ -9,7 +12,10 @@ import {
   isSwaggerEnabled,
   logger,
   notFoundHandler,
+  RedisTokenStateStore,
   setupSwagger,
+  startHttpServer,
+  TokenStateStore,
 } from '@banksphere/common';
 import { FraudService, KafkaAlertPublisher } from './services/fraud.service';
 import { FraudController } from './controllers/fraud.controller';
@@ -21,15 +27,21 @@ import { KafkaFraudConsumer } from './consumers/kafka-fraud.consumer';
   return this.toString();
 };
 
-export function createApp(prisma: PrismaClient, alertPublisher?: KafkaAlertPublisher | null) {
+export interface FraudAppDeps {
+  tokenState: TokenStateStore;
+  alertPublisher?: KafkaAlertPublisher | null;
+  redis?: Redis;
+}
+
+export function createApp(prisma: PrismaClient, deps: FraudAppDeps) {
   getJwtAccessSecret(); // Fail fast on a missing/weak signing secret
   const app = createBaseApp();
 
-  const fraudService = new FraudService(prisma, alertPublisher ?? undefined);
+  const fraudService = new FraudService(prisma, deps.alertPublisher ?? undefined);
   const fraudController = new FraudController(fraudService);
 
   // Routes
-  app.use('/api/v1/fraud', createFraudRouter(fraudController));
+  app.use('/api/v1/fraud', createFraudRouter(fraudController, createAuthenticate(deps.tokenState)));
 
   // Swagger Documentation
   if (isSwaggerEnabled()) {
@@ -55,6 +67,7 @@ export function createApp(prisma: PrismaClient, alertPublisher?: KafkaAlertPubli
   app.get('/health', async (req: Request, res: Response) => {
     try {
       await prisma.$queryRaw`SELECT 1`;
+      if (deps.redis) await deps.redis.ping();
       res.json({
         status: 'UP',
         service: 'fraud-service',
@@ -74,37 +87,34 @@ export function createApp(prisma: PrismaClient, alertPublisher?: KafkaAlertPubli
   return { app, fraudService, prisma };
 }
 
-// Direct server launch
-if (require.main === module) {
+async function main(): Promise<void> {
   const prisma = new PrismaClient();
+  const redis = await connectRedis();
   const { publisher, kafka } = createEventPublisher(process.env.KAFKA_CLIENT_ID || 'fraud-service');
-  const { app, fraudService } = createApp(prisma, publisher);
-  const PORT = process.env.PORT || 8006;
-  let consumer: KafkaFraudConsumer | null = null;
-
-  const server = app.listen(PORT, async () => {
-    logger.info(`BankSphere Fraud & Risk Service running on port ${PORT}`);
-
-    if (!kafka) return;
-    try {
-      consumer = new KafkaFraudConsumer(kafka, fraudService);
-      await consumer.start();
-      logger.info('Kafka Fraud Consumer subscribed to transaction.completed.v1');
-    } catch (err) {
-      logger.error({ err }, 'Kafka broker not reachable; fraud consumer not started');
-    }
+  const { app, fraudService } = createApp(prisma, {
+    tokenState: new RedisTokenStateStore(redis),
+    alertPublisher: publisher,
+    redis,
   });
 
-  const shutdown = async () => {
-    logger.info('Shutting down Fraud & Risk Service gracefully...');
-    server.close(async () => {
-      await consumer?.stop().catch(() => {});
-      await kafka?.disconnect().catch(() => {});
-      await prisma.$disconnect();
-      process.exit(0);
-    });
-  };
+  let consumer: KafkaFraudConsumer | null = null;
+  if (kafka) {
+    consumer = new KafkaFraudConsumer(kafka, fraudService);
+    // Kafka being unavailable must not take the API down; KafkaJS keeps retrying the connection
+    consumer.start().catch((err) => logger.error({ err }, 'Fraud consumer failed to start'));
+  }
 
-  process.on('SIGTERM', shutdown);
-  process.on('SIGINT', shutdown);
+  startHttpServer(app, process.env.PORT || 8006, 'fraud-service', [
+    () => consumer?.stop(),
+    () => kafka?.disconnect(),
+    () => prisma.$disconnect(),
+    () => redis.quit(),
+  ]);
+}
+
+if (require.main === module) {
+  main().catch((err) => {
+    logger.fatal({ err }, 'fraud-service failed to start');
+    process.exit(1);
+  });
 }

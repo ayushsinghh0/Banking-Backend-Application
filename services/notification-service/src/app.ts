@@ -1,10 +1,13 @@
 import 'dotenv/config';
 import { Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
+import Redis from 'ioredis';
 import { PrismaClient } from '../generated/client';
 import {
-  authenticate,
+  connectRedis,
+  createAuthenticate,
   createBaseApp,
+  createMailerFromEnv,
   createEventPublisher,
   errorHandlerMiddleware,
   getJwtAccessSecret,
@@ -12,25 +15,31 @@ import {
   logger,
   notFoundHandler,
   parsePagination,
+  RedisTokenStateStore,
   requireRoles,
   setupSwagger,
+  startHttpServer,
+  TokenStateStore,
 } from '@banksphere/common';
-import { EmailProvider, SimulatedEmailProvider } from './providers/email.provider';
+import { EmailProvider, MailerEmailProvider } from './providers/email.provider';
 import { NotificationService, KafkaDLQPublisher } from './services/notification.service';
 import { KafkaNotificationConsumer } from './consumers/kafka-notification.consumer';
 
 const logsQuerySchema = z.object({ recipient: z.string().trim().max(254).optional() });
 
-export function createApp(
-  prisma: PrismaClient,
-  emailProvider?: EmailProvider,
-  dlqPublisher?: KafkaDLQPublisher | null
-) {
+export interface NotificationAppDeps {
+  tokenState: TokenStateStore;
+  emailProvider: EmailProvider;
+  dlqPublisher?: KafkaDLQPublisher | null;
+  redis?: Redis;
+}
+
+export function createApp(prisma: PrismaClient, deps: NotificationAppDeps) {
   getJwtAccessSecret(); // Fail fast on a missing/weak signing secret
   const app = createBaseApp();
 
-  const provider = emailProvider || new SimulatedEmailProvider();
-  const notificationService = new NotificationService(prisma, provider, dlqPublisher);
+  const notificationService = new NotificationService(prisma, deps.emailProvider, deps.dlqPublisher);
+  const authenticate = createAuthenticate(deps.tokenState);
 
   // Notification logs contain customer emails and message bodies: staff only
   app.get(
@@ -67,6 +76,7 @@ export function createApp(
   app.get('/health', async (req: Request, res: Response) => {
     try {
       await prisma.$queryRaw`SELECT 1`;
+      if (deps.redis) await deps.redis.ping();
       res.json({
         status: 'UP',
         service: 'notification-service',
@@ -86,37 +96,35 @@ export function createApp(
   return { app, notificationService, prisma };
 }
 
-// Direct server launch
-if (require.main === module) {
+async function main(): Promise<void> {
   const prisma = new PrismaClient();
+  const redis = await connectRedis();
   const { publisher, kafka } = createEventPublisher(process.env.KAFKA_CLIENT_ID || 'notification-service');
-  const { app, notificationService } = createApp(prisma, new SimulatedEmailProvider(), publisher);
-  const PORT = process.env.PORT || 8005;
-  let consumer: KafkaNotificationConsumer | null = null;
-
-  const server = app.listen(PORT, async () => {
-    logger.info(`BankSphere Notification Service running on port ${PORT}`);
-
-    if (!kafka) return;
-    try {
-      consumer = new KafkaNotificationConsumer(kafka, notificationService);
-      await consumer.start();
-      logger.info('Kafka Notification Consumer subscribed to topics');
-    } catch (err) {
-      logger.error({ err }, 'Kafka broker not reachable; notification consumer not started');
-    }
+  const { app, notificationService } = createApp(prisma, {
+    tokenState: new RedisTokenStateStore(redis),
+    emailProvider: new MailerEmailProvider(createMailerFromEnv()),
+    dlqPublisher: publisher,
+    redis,
   });
 
-  const shutdown = async () => {
-    logger.info('Shutting down Notification Service gracefully...');
-    server.close(async () => {
-      await consumer?.stop().catch(() => {});
-      await kafka?.disconnect().catch(() => {});
-      await prisma.$disconnect();
-      process.exit(0);
-    });
-  };
+  let consumer: KafkaNotificationConsumer | null = null;
+  if (kafka) {
+    consumer = new KafkaNotificationConsumer(kafka, notificationService);
+    // Kafka being unavailable must not take the API down; KafkaJS keeps retrying the connection
+    consumer.start().catch((err) => logger.error({ err }, 'Notification consumer failed to start'));
+  }
 
-  process.on('SIGTERM', shutdown);
-  process.on('SIGINT', shutdown);
+  startHttpServer(app, process.env.PORT || 8005, 'notification-service', [
+    () => consumer?.stop(),
+    () => kafka?.disconnect(),
+    () => prisma.$disconnect(),
+    () => redis.quit(),
+  ]);
+}
+
+if (require.main === module) {
+  main().catch((err) => {
+    logger.fatal({ err }, 'notification-service failed to start');
+    process.exit(1);
+  });
 }

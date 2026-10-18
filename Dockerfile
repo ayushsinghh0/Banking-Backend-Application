@@ -1,9 +1,10 @@
 # One Dockerfile for every service:  docker build --build-arg SERVICE=auth-service .
 # The "build" stage keeps dev tooling (Prisma CLI) and doubles as the migration runner image.
 
-FROM node:20-alpine AS build
+FROM node:24-alpine AS build
 RUN apk add --no-cache openssl
 WORKDIR /app
+ENV CI=true
 COPY package.json package-lock.json tsconfig.json ./
 COPY packages/common/package.json packages/common/
 COPY services/api-gateway/package.json services/api-gateway/
@@ -13,23 +14,24 @@ COPY services/account-service/package.json services/account-service/
 COPY services/transaction-service/package.json services/transaction-service/
 COPY services/notification-service/package.json services/notification-service/
 COPY services/fraud-service/package.json services/fraud-service/
-RUN npm ci
+RUN npm ci --no-audit --no-fund
 COPY packages ./packages
 COPY services ./services
 RUN npm run build
 
 FROM build AS prune
-RUN npm prune --omit=dev
+RUN npm prune --omit=dev --no-audit --no-fund
 
-FROM node:20-alpine AS runtime
-RUN apk add --no-cache openssl
+FROM node:24-alpine AS runtime
+RUN apk add --no-cache openssl && apk upgrade --no-cache
 ENV NODE_ENV=production
 WORKDIR /app
-COPY --from=prune --chown=node:node /app/node_modules ./node_modules
-COPY --from=prune --chown=node:node /app/packages ./packages
-COPY --from=prune --chown=node:node /app/services ./services
+COPY --from=prune --chown=root:root /app/node_modules ./node_modules
+COPY --from=prune --chown=root:root /app/packages ./packages
+COPY --from=prune --chown=root:root /app/services ./services
 ARG SERVICE
 ENV SERVICE=${SERVICE}
 WORKDIR /app/services/${SERVICE}
+# Code is owned by root and read-only to the runtime user
 USER node
 CMD ["node", "dist/app.js"]
