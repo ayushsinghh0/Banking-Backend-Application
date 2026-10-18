@@ -1,5 +1,5 @@
 import { Consumer } from 'kafkajs';
-import { KafkaService } from '@banksphere/common';
+import { KafkaService, logger } from '@banksphere/common';
 import { FraudService } from '../services/fraud.service';
 
 export class KafkaFraudConsumer {
@@ -16,8 +16,18 @@ export class KafkaFraudConsumer {
       this.groupId,
       ['transaction.completed.v1'],
       async (_topic: string, payload: any) => {
-        const amountInPaise = BigInt(payload.amountInPaise || '0');
-        const accountId = payload.sourceAccountId || payload.destinationAccountId || 'unknown-account';
+        const accountId = payload?.sourceAccountId || payload?.destinationAccountId;
+        if (
+          typeof payload?.eventId !== 'string' ||
+          typeof payload?.transactionId !== 'string' ||
+          typeof accountId !== 'string' ||
+          !/^\d{1,18}$/.test(String(payload?.amountInPaise))
+        ) {
+          // Poison message: skip (offset is committed) rather than block the partition forever
+          logger.error({ eventId: payload?.eventId }, 'Malformed transaction.completed.v1 event skipped');
+          return;
+        }
+        const amountInPaise = BigInt(payload.amountInPaise);
 
         await this.fraudService.evaluateTransaction(
           {

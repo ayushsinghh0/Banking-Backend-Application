@@ -1,10 +1,10 @@
 import { Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import { CustomerService } from '../services/customer.service';
-import { UnauthorizedError } from '@banksphere/common';
+import { getAuthenticatedUser } from '@banksphere/common';
 
 const createProfileSchema = z.object({
-  fullName: z.string().min(2).max(100),
+  fullName: z.string().trim().min(2).max(100),
   phoneNumber: z.string().regex(/^\+?[1-9]\d{7,14}$/, { message: 'Invalid phone number format' }),
   address: z.string().max(255).optional(),
   dateOfBirth: z
@@ -15,7 +15,7 @@ const createProfileSchema = z.object({
 });
 
 const updateProfileSchema = z.object({
-  fullName: z.string().min(2).max(100).optional(),
+  fullName: z.string().trim().min(2).max(100).optional(),
   phoneNumber: z.string().regex(/^\+?[1-9]\d{7,14}$/).optional(),
   address: z.string().max(255).optional(),
   dateOfBirth: z
@@ -25,18 +25,18 @@ const updateProfileSchema = z.object({
     .transform((val) => (val ? new Date(val) : undefined)),
 });
 
+const userIdParamsSchema = z.object({ userId: z.string().uuid() });
+
+const kycSchema = z.object({ kycStatus: z.enum(['PENDING', 'VERIFIED', 'REJECTED']) }).strict();
+
 export class CustomerController {
   constructor(private readonly customerService: CustomerService) {}
 
   /**
-   * Helper to resolve authenticated user identity passed from Gateway
+   * Identity comes only from the verified access token (see authenticate middleware)
    */
   private getAuthenticatedUserId(req: Request): string {
-    const userId = (req.headers['x-user-id'] as string) || (req as any).user?.id;
-    if (!userId) {
-      throw new UnauthorizedError('Authentication required: Missing user identification headers');
-    }
-    return userId;
+    return getAuthenticatedUser(req).id;
   }
 
   public getMe = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
@@ -87,6 +87,27 @@ export class CustomerController {
         success: true,
         data: updated,
       });
+    } catch (error) {
+      next(error);
+    }
+  };
+
+  public getByUserId = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    try {
+      const { userId } = userIdParamsSchema.parse(req.params);
+      const { profile } = await this.customerService.getProfileByUserId(userId);
+      res.status(200).json({ success: true, data: profile });
+    } catch (error) {
+      next(error);
+    }
+  };
+
+  public updateKycStatus = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    try {
+      const { userId } = userIdParamsSchema.parse(req.params);
+      const { kycStatus } = kycSchema.parse(req.body);
+      const profile = await this.customerService.updateKycStatus(userId, kycStatus);
+      res.status(200).json({ success: true, data: profile });
     } catch (error) {
       next(error);
     }

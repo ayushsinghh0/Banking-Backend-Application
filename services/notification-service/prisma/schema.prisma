@@ -5,7 +5,7 @@ datasource db {
 
 generator client {
   provider = "prisma-client-js"
-  output   = "../src/generated/client"
+  output   = "../generated/client"
 }
 
 enum NotificationChannel {
@@ -47,4 +47,25 @@ model NotificationLog {
   @@index([recipient])
   @@index([status])
   @@map("notification_logs")
+}
+
+// Local read model built from user.registered.v1: lets the service resolve a user's email
+// without a synchronous call to the auth service
+model UserContact {
+  userId    String   @id @map("user_id")
+  email     String
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("user_contacts")
+}
+
+// Local read model built from account.created.v1: maps ledger account IDs to their owner
+model AccountOwner {
+  accountId     String   @id @map("account_id")
+  customerId    String   @map("customer_id")
+  accountNumber String   @map("account_number")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  @@index([customerId])
+  @@map("account_owners")
 }

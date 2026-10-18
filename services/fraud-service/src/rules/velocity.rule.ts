@@ -1,6 +1,6 @@
 import { IRiskRule } from './risk-rule.interface';
 import { TransactionEvaluationContext, RiskRuleResult } from '../types';
-import { PrismaClient, RiskLevel } from '../generated/client';
+import { PrismaClient, RiskLevel } from '../../generated/client';
 
 export class VelocityRule implements IRiskRule {
   readonly id = 'RULE_VELOCITY_CHECK';

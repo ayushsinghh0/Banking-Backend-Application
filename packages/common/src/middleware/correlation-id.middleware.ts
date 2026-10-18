@@ -16,8 +16,10 @@ export function correlationIdMiddleware(
   res: Response,
   next: NextFunction
 ): void {
+  // Only accept well-formed client IDs so attacker-controlled values can't forge or split log lines
+  const incoming = req.header('x-correlation-id');
   const correlationId =
-    (req.header('x-correlation-id') as string) || crypto.randomUUID();
+    incoming && /^[A-Za-z0-9._-]{1,64}$/.test(incoming) ? incoming : crypto.randomUUID();
 
   req.correlationId = correlationId;
   res.setHeader('x-correlation-id', correlationId);
@@ -31,7 +33,7 @@ export function correlationIdMiddleware(
     req.log.info(
       {
         method: req.method,
-        url: req.originalUrl,
+        url: req.originalUrl.split('?')[0],
         statusCode: res.statusCode,
         durationMs: duration,
       },

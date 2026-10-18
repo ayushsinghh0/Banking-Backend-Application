@@ -1,4 +1,4 @@
-import { RiskLevel } from '../generated/client';
+import { RiskLevel } from '../../generated/client';
 
 export interface TransactionEvaluationContext {
   transactionId: string;

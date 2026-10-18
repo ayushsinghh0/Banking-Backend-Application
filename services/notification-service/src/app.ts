@@ -1,49 +1,70 @@
-import express, { Request, Response } from 'express';
-import { PrismaClient } from './generated/client';
+import 'dotenv/config';
+import { Request, Response, NextFunction } from 'express';
+import { z } from 'zod';
+import { PrismaClient } from '../generated/client';
 import {
-  correlationIdMiddleware,
+  authenticate,
+  createBaseApp,
+  createEventPublisher,
   errorHandlerMiddleware,
+  getJwtAccessSecret,
+  isSwaggerEnabled,
+  logger,
+  notFoundHandler,
+  parsePagination,
+  requireRoles,
   setupSwagger,
-  KafkaService,
 } from '@banksphere/common';
-import { SimulatedEmailProvider } from './providers/email.provider';
-import { NotificationService } from './services/notification.service';
+import { EmailProvider, SimulatedEmailProvider } from './providers/email.provider';
+import { NotificationService, KafkaDLQPublisher } from './services/notification.service';
 import { KafkaNotificationConsumer } from './consumers/kafka-notification.consumer';
 
-export function createApp(prisma: PrismaClient, emailProvider?: SimulatedEmailProvider) {
-  const app = express();
-  app.use(express.json());
+const logsQuerySchema = z.object({ recipient: z.string().trim().max(254).optional() });
 
-  // Tracing middleware
-  app.use(correlationIdMiddleware);
+export function createApp(
+  prisma: PrismaClient,
+  emailProvider?: EmailProvider,
+  dlqPublisher?: KafkaDLQPublisher | null
+) {
+  getJwtAccessSecret(); // Fail fast on a missing/weak signing secret
+  const app = createBaseApp();
 
   const provider = emailProvider || new SimulatedEmailProvider();
-  const notificationService = new NotificationService(prisma, provider);
+  const notificationService = new NotificationService(prisma, provider, dlqPublisher);
 
-  // Read-only endpoint to inspect notification audit logs
-  app.get('/api/v1/notifications/logs', async (req: Request, res: Response) => {
-    const recipient = req.query.recipient as string | undefined;
-    const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : 20;
-    const logs = await notificationService.getNotificationLogs(recipient, limit);
-    res.json({ success: true, data: logs });
-  });
+  // Notification logs contain customer emails and message bodies: staff only
+  app.get(
+    '/api/v1/notifications/logs',
+    authenticate,
+    requireRoles('BANK_ADMIN', 'SUPPORT'),
+    async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const { recipient } = logsQuerySchema.parse(req.query);
+        const { limit, offset } = parsePagination(req.query);
+        const logs = await notificationService.getNotificationLogs(recipient, limit, offset);
+        res.json({ success: true, data: logs, pagination: { limit, offset } });
+      } catch (error) {
+        next(error);
+      }
+    }
+  );
 
   // Swagger Documentation
-  setupSwagger(app, {
-    title: 'BankSphere - Notification Service',
-    version: '1.0.0',
-    description: 'Asynchronous event-driven notification service with idempotency, retries, and DLQ',
-    paths: {
-      '/api/v1/notifications/logs': {
-        get: {
-          summary: 'Retrieve notification audit logs',
+  if (isSwaggerEnabled()) {
+    setupSwagger(app, {
+      title: 'BankSphere - Notification Service',
+      version: '1.0.0',
+      description: 'Asynchronous event-driven notification service with idempotency, retries, and DLQ',
+      paths: {
+        '/api/v1/notifications/logs': {
+          get: { summary: 'BANK_ADMIN/SUPPORT: notification audit logs, ?recipient=&limit=&offset=' },
         },
       },
-    },
-  });
+    });
+  }
 
   // Health and Readiness
-  app.get('/health', async (_req: Request, res: Response) => {
+  app.get('/health', async (req: Request, res: Response) => {
     try {
       await prisma.$queryRaw`SELECT 1`;
       res.json({
@@ -52,14 +73,13 @@ export function createApp(prisma: PrismaClient, emailProvider?: SimulatedEmailPr
         database: 'connected',
         timestamp: new Date().toISOString(),
       });
-    } catch (err: any) {
-      res.status(503).json({
-        status: 'DOWN',
-        error: err.message,
-      });
+    } catch (err) {
+      req.log.error({ err }, 'Health check failed');
+      res.status(503).json({ status: 'DOWN', service: 'notification-service' });
     }
   });
 
+  app.use(notFoundHandler);
   // Centralized Error Handling
   app.use(errorHandlerMiddleware);
 
@@ -69,32 +89,30 @@ export function createApp(prisma: PrismaClient, emailProvider?: SimulatedEmailPr
 // Direct server launch
 if (require.main === module) {
   const prisma = new PrismaClient();
-  const emailProvider = new SimulatedEmailProvider();
-  const { app, notificationService } = createApp(prisma, emailProvider);
+  const { publisher, kafka } = createEventPublisher(process.env.KAFKA_CLIENT_ID || 'notification-service');
+  const { app, notificationService } = createApp(prisma, new SimulatedEmailProvider(), publisher);
   const PORT = process.env.PORT || 8005;
+  let consumer: KafkaNotificationConsumer | null = null;
 
   const server = app.listen(PORT, async () => {
-    console.log(`BankSphere Notification Service running on port ${PORT}`);
+    logger.info(`BankSphere Notification Service running on port ${PORT}`);
 
-    // Start Kafka Consumer
+    if (!kafka) return;
     try {
-      const kafkaService = new KafkaService({
-        clientId: 'notification-service',
-        brokers: process.env.KAFKA_BROKERS ? process.env.KAFKA_BROKERS.split(',') : ['localhost:9092'],
-      });
-      const consumer = new KafkaNotificationConsumer(kafkaService, notificationService);
+      consumer = new KafkaNotificationConsumer(kafka, notificationService);
       await consumer.start();
-      console.log('Kafka Notification Consumer subscribed to topics');
+      logger.info('Kafka Notification Consumer subscribed to topics');
     } catch (err) {
-      console.warn('Kafka Broker not currently reachable, consumer standing by:', err);
+      logger.error({ err }, 'Kafka broker not reachable; notification consumer not started');
     }
   });
 
   const shutdown = async () => {
-    console.log('Shutting down Notification Service gracefully...');
+    logger.info('Shutting down Notification Service gracefully...');
     server.close(async () => {
+      await consumer?.stop().catch(() => {});
+      await kafka?.disconnect().catch(() => {});
       await prisma.$disconnect();
-      console.log('Notification Service connections closed.');
       process.exit(0);
     });
   };

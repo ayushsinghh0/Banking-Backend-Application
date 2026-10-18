@@ -1,6 +1,6 @@
 import { IRiskRule } from './risk-rule.interface';
 import { TransactionEvaluationContext, RiskRuleResult } from '../types';
-import { RiskLevel } from '../generated/client';
+import { RiskLevel } from '../../generated/client';
 import { MoneyUtil } from '@banksphere/common';
 
 export class AmountThresholdRule implements IRiskRule {

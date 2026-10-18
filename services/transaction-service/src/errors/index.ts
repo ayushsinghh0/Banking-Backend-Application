@@ -1,30 +1,8 @@
-export abstract class AppError extends Error {
-  abstract readonly statusCode: number;
-  abstract readonly errorCode: string;
+// Ledger-specific errors extend the shared AppError so the common error handler maps them
+// to their real HTTP status instead of a generic 500.
+import { AppError } from '@banksphere/common';
 
-  constructor(message: string) {
-    super(message);
-    Object.setPrototypeOf(this, new.target.prototype);
-  }
-}
-
-export class NotFoundError extends AppError {
-  readonly statusCode = 404;
-  readonly errorCode = 'NOT_FOUND';
-
-  constructor(message: string = 'Resource not found') {
-    super(message);
-  }
-}
-
-export class InsufficientFundsError extends AppError {
-  readonly statusCode = 422;
-  readonly errorCode = 'INSUFFICIENT_FUNDS';
-
-  constructor(message: string = 'Insufficient available balance to complete the transaction') {
-    super(message);
-  }
-}
+export { AppError, NotFoundError, InsufficientFundsError, ForbiddenError } from '@banksphere/common';
 
 export class AccountInactiveError extends AppError {
   readonly statusCode = 403;
@@ -53,11 +31,38 @@ export class IdempotencyConflictError extends AppError {
   }
 }
 
+export class IdempotencyKeyReuseError extends AppError {
+  readonly statusCode = 422;
+  readonly errorCode = 'IDEMPOTENCY_KEY_REUSED';
+
+  constructor(message: string = 'This Idempotency-Key was already used with a different request') {
+    super(message);
+  }
+}
+
 export class InvalidAmountError extends AppError {
   readonly statusCode = 400;
   readonly errorCode = 'INVALID_AMOUNT';
 
   constructor(message: string = 'Transaction amount must be a positive integer in minor units (paise)') {
+    super(message);
+  }
+}
+
+export class DailyLimitExceededError extends AppError {
+  readonly statusCode = 422;
+  readonly errorCode = 'DAILY_LIMIT_EXCEEDED';
+
+  constructor(message: string = 'This transaction would exceed the account daily outgoing limit') {
+    super(message);
+  }
+}
+
+export class CurrencyMismatchError extends AppError {
+  readonly statusCode = 400;
+  readonly errorCode = 'CURRENCY_MISMATCH';
+
+  constructor(message: string = 'Source and destination accounts use different currencies') {
     super(message);
   }
 }

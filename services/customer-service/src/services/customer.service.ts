@@ -1,6 +1,6 @@
-import { PrismaClient, CustomerProfile } from '../generated/client';
+import { PrismaClient, CustomerProfile, KycStatus } from '../../generated/client';
 import Redis from 'ioredis';
-import { NotFoundError, ConflictError } from '@banksphere/common';
+import { NotFoundError, ConflictError, logger } from '@banksphere/common';
 
 export interface CreateProfileDTO {
   userId: string;
@@ -56,7 +56,7 @@ export class CustomerService {
       }
     } catch (cacheErr) {
       // Non-blocking cache error: log and fallback directly to Postgres
-      console.warn('[CustomerService] Redis cache read failed, falling back to database', cacheErr);
+      logger.warn({ err: cacheErr }, 'Redis cache read failed, falling back to database');
     }
 
     // 2. Query PostgreSQL
@@ -65,14 +65,14 @@ export class CustomerService {
     });
 
     if (!profile) {
-      throw new NotFoundError(`Customer profile not found for user '${userId}'`);
+      throw new NotFoundError('Customer profile not found');
     }
 
     // 3. Populate Redis asynchronously with TTL
     try {
       await this.redis.set(cacheKey, JSON.stringify(profile), 'EX', this.cacheTTLSeconds);
     } catch (cacheErr) {
-      console.warn('[CustomerService] Redis cache write failed', cacheErr);
+      logger.warn({ err: cacheErr }, 'Redis cache write failed');
     }
 
     return { profile, fromCache: false };
@@ -123,7 +123,7 @@ export class CustomerService {
     });
 
     if (!existing) {
-      throw new NotFoundError(`Customer profile not found for user '${userId}'`);
+      throw new NotFoundError('Customer profile not found');
     }
 
     const updated = await this.prisma.customerProfile.update({
@@ -140,7 +140,30 @@ export class CustomerService {
     try {
       await this.redis.del(this.getCacheKey(userId));
     } catch (cacheErr) {
-      console.warn('[CustomerService] Redis cache invalidation failed', cacheErr);
+      logger.warn({ err: cacheErr }, 'Redis cache invalidation failed');
+    }
+
+    return updated;
+  }
+
+  /**
+   * KYC review outcome, set by bank staff only
+   */
+  public async updateKycStatus(userId: string, kycStatus: KycStatus): Promise<CustomerProfile> {
+    const existing = await this.prisma.customerProfile.findUnique({ where: { userId } });
+    if (!existing) {
+      throw new NotFoundError('Customer profile not found');
+    }
+
+    const updated = await this.prisma.customerProfile.update({
+      where: { userId },
+      data: { kycStatus },
+    });
+
+    try {
+      await this.redis.del(this.getCacheKey(userId));
+    } catch (cacheErr) {
+      logger.warn({ err: cacheErr }, 'Redis cache invalidation failed');
     }
 
     return updated;

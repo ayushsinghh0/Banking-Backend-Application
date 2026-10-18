@@ -1,21 +1,50 @@
 import { Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
+import { BadRequestError, getAuthenticatedUser, parsePagination } from '@banksphere/common';
 import { LedgerService } from '../services/ledger.service';
 import { IdempotencyService } from '../services/idempotency.service';
-import { AppError } from '../errors';
 
-const transferSchema = z.object({
-  sourceAccountId: z.string().uuid({ message: 'sourceAccountId must be a valid UUID' }),
-  destinationAccountId: z.string().uuid({ message: 'destinationAccountId must be a valid UUID' }),
-  amountInPaise: z.string().regex(/^\d+$/, { message: 'amountInPaise must be a positive integer string' }),
-  description: z.string().max(255).optional(),
-});
+// Max 18 digits keeps amounts well inside Postgres BIGINT
+const amountSchema = z
+  .string()
+  .regex(/^[1-9]\d{0,17}$/, { message: 'amountInPaise must be a positive integer string' });
 
-const depositWithdrawSchema = z.object({
-  accountId: z.string().uuid({ message: 'accountId must be a valid UUID' }),
-  amountInPaise: z.string().regex(/^\d+$/, { message: 'amountInPaise must be a positive integer string' }),
-  description: z.string().max(255).optional(),
-});
+const transferSchema = z
+  .object({
+    sourceAccountId: z.string().uuid({ message: 'sourceAccountId must be a valid UUID' }),
+    destinationAccountId: z.string().uuid({ message: 'destinationAccountId must be a valid UUID' }).optional(),
+    destinationAccountNumber: z.string().regex(/^\d{12}$/).optional(),
+    amountInPaise: amountSchema,
+    description: z.string().trim().max(255).optional(),
+  })
+  .strict()
+  .refine((b) => Boolean(b.destinationAccountId) !== Boolean(b.destinationAccountNumber), {
+    message: 'Provide exactly one of destinationAccountId or destinationAccountNumber',
+    path: ['destinationAccountId'],
+  });
+
+const depositWithdrawSchema = z
+  .object({
+    accountId: z.string().uuid({ message: 'accountId must be a valid UUID' }),
+    amountInPaise: amountSchema,
+    description: z.string().trim().max(255).optional(),
+  })
+  .strict();
+
+const accountIdParams = z.object({ accountId: z.string().uuid() });
+
+const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9_-]{8,128}$/;
+
+function readIdempotencyKey(req: Request): string {
+  const key = req.header('Idempotency-Key');
+  if (!key) {
+    throw new BadRequestError("Header 'Idempotency-Key' is required for financial write operations");
+  }
+  if (!IDEMPOTENCY_KEY_PATTERN.test(key)) {
+    throw new BadRequestError("'Idempotency-Key' must be 8-128 characters of [A-Za-z0-9_-] (a UUID is recommended)");
+  }
+  return key;
+}
 
 export class TransactionController {
   constructor(
@@ -23,157 +52,100 @@ export class TransactionController {
     private readonly idempotencyService: IdempotencyService
   ) {}
 
-  public transfer = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
-    const idempotencyKey = req.header('Idempotency-Key');
+  private async runIdempotent(
+    req: Request,
+    res: Response,
+    endpoint: string,
+    body: Record<string, unknown>,
+    work: Parameters<IdempotencyService['execute']>[1]
+  ): Promise<void> {
+    const actor = getAuthenticatedUser(req);
+    const key = readIdempotencyKey(req);
+    const result = await this.idempotencyService.execute(
+      {
+        userId: actor.id,
+        key,
+        endpoint,
+        requestHash: this.idempotencyService.generateRequestHash(body),
+      },
+      work
+    );
 
-    if (!idempotencyKey) {
-      res.status(400).json({
-        error: {
-          code: 'MISSING_IDEMPOTENCY_KEY',
-          message: "Header 'Idempotency-Key' is required for financial write operations",
-        },
-      });
-      return;
+    if (result.replayed) {
+      res.setHeader('X-Idempotent-Replay', 'true');
     }
+    res.status(result.statusCode).json(result.responseBody);
+  }
 
+  public transfer = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     try {
-      const validatedBody = transferSchema.parse(req.body);
-      const requestHash = this.idempotencyService.generateRequestHash(validatedBody);
+      const actor = getAuthenticatedUser(req);
+      const body = transferSchema.parse(req.body);
 
-      // Check or lock the idempotency record
-      const idempResult = await this.idempotencyService.acquireKey(
-        idempotencyKey,
-        req.originalUrl,
-        requestHash
+      await this.runIdempotent(req, res, 'transfer', body, (tx) =>
+        this.ledgerService.executeTransfer(
+          {
+            sourceAccountId: body.sourceAccountId,
+            destinationAccountId: body.destinationAccountId,
+            destinationAccountNumber: body.destinationAccountNumber,
+            amountInPaise: BigInt(body.amountInPaise),
+            description: body.description,
+          },
+          actor,
+          tx
+        )
       );
-
-      if (idempResult.isCached && idempResult.statusCode && idempResult.responseBody) {
-        res.setHeader('X-Cache-Lookup', 'IDEMPOTENT_REPLAY');
-        res.status(idempResult.statusCode).json(idempResult.responseBody);
-        return;
-      }
-
-      // Execute transfer through authoritative double-entry engine
-      const result = await this.ledgerService.executeTransfer({
-        sourceAccountId: validatedBody.sourceAccountId,
-        destinationAccountId: validatedBody.destinationAccountId,
-        amountInPaise: BigInt(validatedBody.amountInPaise),
-        description: validatedBody.description,
-      });
-
-      const responsePayload = {
-        success: true,
-        data: result,
-      };
-
-      // Mark idempotency key as completed with the response payload
-      await this.idempotencyService.completeKey(idempotencyKey, 201, responsePayload);
-
-      res.status(201).json(responsePayload);
     } catch (error) {
-      if (idempotencyKey && !(error instanceof AppError && error.statusCode === 409)) {
-        await this.idempotencyService.failKey(idempotencyKey).catch(() => {});
-      }
       next(error);
     }
   };
 
   public deposit = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
-    const idempotencyKey = req.header('Idempotency-Key');
-
-    if (!idempotencyKey) {
-      res.status(400).json({
-        error: {
-          code: 'MISSING_IDEMPOTENCY_KEY',
-          message: "Header 'Idempotency-Key' is required for deposit operations",
-        },
-      });
-      return;
-    }
-
     try {
-      const validatedBody = depositWithdrawSchema.parse(req.body);
-      const requestHash = this.idempotencyService.generateRequestHash(validatedBody);
+      const actor = getAuthenticatedUser(req);
+      const body = depositWithdrawSchema.parse(req.body);
 
-      const idempResult = await this.idempotencyService.acquireKey(
-        idempotencyKey,
-        req.originalUrl,
-        requestHash
+      await this.runIdempotent(req, res, 'deposit', body, (tx) =>
+        this.ledgerService.executeDeposit(
+          {
+            accountId: body.accountId,
+            amountInPaise: BigInt(body.amountInPaise),
+            description: body.description,
+          },
+          actor,
+          tx
+        )
       );
-
-      if (idempResult.isCached && idempResult.statusCode && idempResult.responseBody) {
-        res.setHeader('X-Cache-Lookup', 'IDEMPOTENT_REPLAY');
-        res.status(idempResult.statusCode).json(idempResult.responseBody);
-        return;
-      }
-
-      const result = await this.ledgerService.executeDeposit({
-        accountId: validatedBody.accountId,
-        amountInPaise: BigInt(validatedBody.amountInPaise),
-        description: validatedBody.description,
-      });
-
-      const responsePayload = { success: true, data: result };
-      await this.idempotencyService.completeKey(idempotencyKey, 201, responsePayload);
-      res.status(201).json(responsePayload);
     } catch (error) {
-      if (idempotencyKey && !(error instanceof AppError && error.statusCode === 409)) {
-        await this.idempotencyService.failKey(idempotencyKey).catch(() => {});
-      }
       next(error);
     }
   };
 
   public withdraw = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
-    const idempotencyKey = req.header('Idempotency-Key');
-
-    if (!idempotencyKey) {
-      res.status(400).json({
-        error: {
-          code: 'MISSING_IDEMPOTENCY_KEY',
-          message: "Header 'Idempotency-Key' is required for withdrawal operations",
-        },
-      });
-      return;
-    }
-
     try {
-      const validatedBody = depositWithdrawSchema.parse(req.body);
-      const requestHash = this.idempotencyService.generateRequestHash(validatedBody);
+      const actor = getAuthenticatedUser(req);
+      const body = depositWithdrawSchema.parse(req.body);
 
-      const idempResult = await this.idempotencyService.acquireKey(
-        idempotencyKey,
-        req.originalUrl,
-        requestHash
+      await this.runIdempotent(req, res, 'withdraw', body, (tx) =>
+        this.ledgerService.executeWithdrawal(
+          {
+            accountId: body.accountId,
+            amountInPaise: BigInt(body.amountInPaise),
+            description: body.description,
+          },
+          actor,
+          tx
+        )
       );
-
-      if (idempResult.isCached && idempResult.statusCode && idempResult.responseBody) {
-        res.setHeader('X-Cache-Lookup', 'IDEMPOTENT_REPLAY');
-        res.status(idempResult.statusCode).json(idempResult.responseBody);
-        return;
-      }
-
-      const result = await this.ledgerService.executeWithdrawal({
-        accountId: validatedBody.accountId,
-        amountInPaise: BigInt(validatedBody.amountInPaise),
-        description: validatedBody.description,
-      });
-
-      const responsePayload = { success: true, data: result };
-      await this.idempotencyService.completeKey(idempotencyKey, 201, responsePayload);
-      res.status(201).json(responsePayload);
     } catch (error) {
-      if (idempotencyKey && !(error instanceof AppError && error.statusCode === 409)) {
-        await this.idempotencyService.failKey(idempotencyKey).catch(() => {});
-      }
       next(error);
     }
   };
 
   public getBalance = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     try {
-      const accountId = req.params.accountId;
-      const balance = await this.ledgerService.getAccountBalance(accountId);
+      const { accountId } = accountIdParams.parse(req.params);
+      const balance = await this.ledgerService.getAccountBalance(accountId, getAuthenticatedUser(req));
       res.json({ success: true, data: balance });
     } catch (error) {
       next(error);
@@ -182,12 +154,16 @@ export class TransactionController {
 
   public getHistory = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     try {
-      const accountId = req.params.accountId;
-      const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : 20;
-      const offset = req.query.offset ? parseInt(req.query.offset as string, 10) : 0;
+      const { accountId } = accountIdParams.parse(req.params);
+      const { limit, offset } = parsePagination(req.query);
 
-      const history = await this.ledgerService.getTransactionHistory(accountId, limit, offset);
-      res.json({ success: true, data: history });
+      const history = await this.ledgerService.getTransactionHistory(
+        accountId,
+        getAuthenticatedUser(req),
+        limit,
+        offset
+      );
+      res.json({ success: true, data: history, pagination: { limit, offset } });
     } catch (error) {
       next(error);
     }

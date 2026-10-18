@@ -1,68 +1,67 @@
-import express, { Request, Response } from 'express';
-import { PrismaClient } from './generated/client';
+import 'dotenv/config';
+import { Request, Response } from 'express';
+import { PrismaClient } from '../generated/client';
 import {
-  correlationIdMiddleware,
+  createBaseApp,
+  createEventPublisher,
   errorHandlerMiddleware,
+  getInternalServiceToken,
+  getJwtAccessSecret,
+  isSwaggerEnabled,
+  logger,
+  notFoundHandler,
   setupSwagger,
 } from '@banksphere/common';
 import { AccountService, KafkaPublisher } from './services/account.service';
 import { AccountController } from './controllers/account.controller';
 import { createAccountRouter } from './routes/account.routes';
+import { HttpLedgerClient, LedgerClient } from './clients/ledger.client';
 
-// BigInt JSON serializer
-(BigInt.prototype as any).toJSON = function () {
-  return this.toString();
-};
+export interface AccountAppOptions {
+  kafkaPublisher?: KafkaPublisher | null;
+  ledgerClient?: LedgerClient;
+}
 
-export function createApp(prisma: PrismaClient, kafkaPublisher?: KafkaPublisher) {
-  const app = express();
-  app.use(express.json());
+export function createApp(prisma: PrismaClient, options: AccountAppOptions = {}) {
+  getJwtAccessSecret(); // Fail fast on a missing/weak signing secret
+  const app = createBaseApp();
 
-  // Tracing middleware
-  app.use(correlationIdMiddleware);
-
-  // Simulated Kafka publisher if none injected
-  const publisher: KafkaPublisher = kafkaPublisher || {
-    async publish(topic: string, key: string, payload: any) {
-      console.log(`[KafkaPublisher SIMULATED] Topic: ${topic} | Key: ${key}`, JSON.stringify(payload));
-    },
-  };
-
-  const accountService = new AccountService(prisma, publisher);
+  const ledgerClient = options.ledgerClient ?? (getInternalServiceToken(), new HttpLedgerClient());
+  const accountService = new AccountService(prisma, ledgerClient, options.kafkaPublisher);
   const accountController = new AccountController(accountService);
 
   // Routes
   app.use('/api/v1/accounts', createAccountRouter(accountController));
 
   // OpenAPI Swagger Docs
-  setupSwagger(app, {
-    title: 'BankSphere - Account Service',
-    version: '1.0.0',
-    description: 'Bank account provisioning, 12-digit account number generation, and lifecycle states',
-    paths: {
-      '/api/v1/accounts': {
-        post: {
-          summary: 'Provision a new bank account for authenticated customer',
+  if (isSwaggerEnabled()) {
+    setupSwagger(app, {
+      title: 'BankSphere - Account Service',
+      version: '1.0.0',
+      description: 'Bank account provisioning, 12-digit account number generation, and lifecycle states',
+      paths: {
+        '/api/v1/accounts': {
+          post: { summary: 'Provision a new bank account for authenticated customer' },
+          get: { summary: 'List accounts (customers: own; staff: ?customerId=)' },
         },
-        get: {
-          summary: 'List all accounts owned by authenticated customer',
+        '/api/v1/accounts/{accountId}': {
+          get: { summary: 'Get bank account details by ID' },
+        },
+        '/api/v1/accounts/{accountId}/status': {
+          patch: {
+            summary:
+              'Update account status. Customers may only freeze; BANK_ADMIN may unfreeze or close (zero balance)',
+          },
+        },
+        '/api/v1/accounts/{accountId}/daily-limit': {
+          patch: { summary: 'Change the daily outgoing limit (customers capped, BANK_ADMIN unrestricted)' },
         },
       },
-      '/api/v1/accounts/{accountId}': {
-        get: {
-          summary: 'Get bank account details by ID',
-        },
-      },
-      '/api/v1/accounts/{accountId}/status': {
-        patch: {
-          summary: 'Update account status (ACTIVE, FROZEN, CLOSED)',
-        },
-      },
-    },
-  });
+    });
+  }
 
   // Health and Readiness
-  app.get('/health', async (_req: Request, res: Response) => {
+  app.get('/health', async (req: Request, res: Response) => {
     try {
       await prisma.$queryRaw`SELECT 1`;
       res.json({
@@ -71,14 +70,13 @@ export function createApp(prisma: PrismaClient, kafkaPublisher?: KafkaPublisher)
         database: 'connected',
         timestamp: new Date().toISOString(),
       });
-    } catch (err: any) {
-      res.status(503).json({
-        status: 'DOWN',
-        error: err.message,
-      });
+    } catch (err) {
+      req.log.error({ err }, 'Health check failed');
+      res.status(503).json({ status: 'DOWN', service: 'account-service' });
     }
   });
 
+  app.use(notFoundHandler);
   // Centralized Error Handling
   app.use(errorHandlerMiddleware);
 
@@ -88,18 +86,19 @@ export function createApp(prisma: PrismaClient, kafkaPublisher?: KafkaPublisher)
 // Direct server launch
 if (require.main === module) {
   const prisma = new PrismaClient();
-  const { app } = createApp(prisma);
+  const { publisher, kafka } = createEventPublisher(process.env.KAFKA_CLIENT_ID || 'account-service');
+  const { app } = createApp(prisma, { kafkaPublisher: publisher });
   const PORT = process.env.PORT || 8003;
 
   const server = app.listen(PORT, () => {
-    console.log(`BankSphere Account Service running on port ${PORT}`);
+    logger.info(`BankSphere Account Service running on port ${PORT}`);
   });
 
   const shutdown = async () => {
-    console.log('Shutting down Account Service gracefully...');
+    logger.info('Shutting down Account Service gracefully...');
     server.close(async () => {
       await prisma.$disconnect();
-      console.log('Account Service connections closed.');
+      await kafka?.disconnect().catch(() => {});
       process.exit(0);
     });
   };

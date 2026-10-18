@@ -1,3 +1,5 @@
+import crypto from 'crypto';
+
 /**
  * Generates an authoritative 12-digit bank account number with Luhn algorithm checksum validation.
  * Structure: [4-digit Bank Branch Identifier] + [7-digit Random Sequence] + [1-digit Checksum]
@@ -9,7 +11,7 @@ export class AccountNumberGenerator {
    * Generates a 12-digit valid bank account number
    */
   public static generate(): string {
-    const sequence = Math.floor(1000000 + Math.random() * 9000000).toString(); // 7 digits
+    const sequence = crypto.randomInt(1000000, 10000000).toString(); // 7 digits, CSPRNG so numbers aren't predictable
     const payload = `${this.BRANCH_PREFIX}${sequence}`;
     const checkDigit = this.calculateLuhnCheckDigit(payload);
     return `${payload}${checkDigit}`;

@@ -1,111 +1,150 @@
 import crypto from 'crypto';
-import { PrismaClient } from '../generated/client';
-import { IdempotencyConflictError } from '../errors';
+import { PrismaClient, Prisma } from '../../generated/client';
+import { IdempotencyConflictError, IdempotencyKeyReuseError } from '../errors';
 
-export interface IdempotencyCheckResult {
-  isCached: boolean;
-  statusCode?: number;
-  responseBody?: any;
+export interface IdempotencyContext {
+  userId: string;
+  key: string;
+  endpoint: string;
+  requestHash: string;
 }
 
+export interface CachedResponse {
+  statusCode: number;
+  responseBody: any;
+}
+
+type TxClient = Prisma.TransactionClient;
+
+/**
+ * Idempotency for financial writes.
+ *
+ * The key is claimed by INSERTing a row inside the SAME database transaction that moves the money.
+ * Because (user_id, key) is unique, a concurrent duplicate blocks on that insert until the first
+ * transaction finishes: if it committed, the duplicate fails with a unique violation and replays the
+ * stored response; if it rolled back, the duplicate proceeds. Money can therefore never move twice
+ * for one key, and a crash can never leave a key stuck in "processing".
+ */
 export class IdempotencyService {
-  constructor(private readonly prisma: PrismaClient) {}
+  constructor(
+    private readonly prisma: PrismaClient,
+    private readonly ttlHours = Number(process.env.IDEMPOTENCY_TTL_HOURS || 24)
+  ) {}
 
   /**
    * Generates a deterministic SHA-256 hash of the request payload
    */
-  public generateRequestHash(payload: unknown): string {
-    const serialized = JSON.stringify(payload, Object.keys(payload || {}).sort());
-    return crypto.createHash('sha256').update(serialized).digest('hex');
+  public generateRequestHash(payload: Record<string, unknown>): string {
+    const canonical = Object.keys(payload)
+      .sort()
+      .reduce<Record<string, unknown>>((acc, k) => {
+        acc[k] = payload[k];
+        return acc;
+      }, {});
+    return crypto.createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
   }
 
   /**
-   * Evaluates or locks the idempotency key.
-   * If a completed request exists, returns the previous cached response.
-   * If an in-flight request exists or hash mismatch occurs, throws conflict error.
+   * Returns the stored response for a completed request with this key, or null if the key is unused.
+   * Throws if the key was used for a different request.
    */
-  public async acquireKey(
-    key: string,
-    endpoint: string,
-    requestHash: string,
-    ttlMinutes = 60
-  ): Promise<IdempotencyCheckResult> {
-    const existing = await this.prisma.idempotencyRecord.findUnique({
-      where: { key },
+  public async findReplay(ctx: IdempotencyContext, client: PrismaClient | TxClient = this.prisma): Promise<CachedResponse | null> {
+    const existing = await client.idempotencyRecord.findUnique({
+      where: { userId_key: { userId: ctx.userId, key: ctx.key } },
     });
 
-    if (existing) {
-      if (existing.requestHash !== requestHash) {
-        throw new IdempotencyConflictError(
-          `Idempotency-Key '${key}' was previously used with a different request payload.`
-        );
-      }
+    if (!existing) return null;
 
-      if (existing.status === 'PROCESSING') {
-        throw new IdempotencyConflictError(
-          `A request with Idempotency-Key '${key}' is currently being processed. Please retry shortly.`
-        );
-      }
-
-      if (existing.status === 'COMPLETED' && existing.statusCode && existing.responseBody) {
-        return {
-          isCached: true,
-          statusCode: existing.statusCode,
-          responseBody: existing.responseBody,
-        };
-      }
+    if (existing.expiresAt < new Date()) {
+      await client.idempotencyRecord.deleteMany({ where: { id: existing.id } });
+      return null;
     }
 
-    const expiresAt = new Date(Date.now() + ttlMinutes * 60 * 1000);
+    if (existing.requestHash !== ctx.requestHash || existing.endpoint !== ctx.endpoint) {
+      throw new IdempotencyKeyReuseError();
+    }
 
-    // Create the idempotency record in 'PROCESSING' state
-    await this.prisma.idempotencyRecord.upsert({
-      where: { key },
-      create: {
-        key,
-        endpoint,
-        requestHash,
-        status: 'PROCESSING',
-        expiresAt,
-      },
-      update: {
-        status: 'PROCESSING',
-        requestHash,
-        expiresAt,
-      },
-    });
+    if (existing.status === 'COMPLETED' && existing.statusCode && existing.responseBody) {
+      return { statusCode: existing.statusCode, responseBody: existing.responseBody };
+    }
 
-    return { isCached: false };
+    return null;
   }
 
   /**
-   * Persists the final successful response for the idempotency key
+   * Claims the key inside the caller's transaction. Must be the first write in that transaction.
    */
-  public async completeKey(
-    key: string,
+  public async claim(tx: TxClient, ctx: IdempotencyContext): Promise<void> {
+    await tx.idempotencyRecord.create({
+      data: {
+        userId: ctx.userId,
+        key: ctx.key,
+        endpoint: ctx.endpoint,
+        requestHash: ctx.requestHash,
+        status: 'PROCESSING',
+        expiresAt: new Date(Date.now() + this.ttlHours * 60 * 60 * 1000),
+      },
+    });
+  }
+
+  /**
+   * Stores the final response inside the caller's transaction, so it commits atomically with the ledger writes.
+   */
+  public async complete(
+    tx: TxClient,
+    ctx: IdempotencyContext,
     statusCode: number,
-    responseBody: any,
-    txClient?: any
+    responseBody: unknown
   ): Promise<void> {
-    const client = txClient || this.prisma;
-    await client.idempotencyRecord.update({
-      where: { key },
+    await tx.idempotencyRecord.update({
+      where: { userId_key: { userId: ctx.userId, key: ctx.key } },
       data: {
         status: 'COMPLETED',
         statusCode,
-        responseBody,
+        responseBody: responseBody as Prisma.InputJsonValue,
       },
     });
   }
 
   /**
-   * Releases or marks key as failed if the operation encounters an abortive error
+   * Runs `work` exactly once per (user, key): claims the key, executes the ledger writes and stores
+   * the response in one DB transaction. Duplicates (sequential or concurrent) replay the stored response.
    */
-  public async failKey(key: string, txClient?: any): Promise<void> {
-    const client = txClient || this.prisma;
-    await client.idempotencyRecord.updateMany({
-      where: { key, status: 'PROCESSING' },
-      data: { status: 'FAILED' },
+  public async execute(
+    ctx: IdempotencyContext,
+    work: (tx: TxClient) => Promise<unknown>
+  ): Promise<CachedResponse & { replayed: boolean }> {
+    const replay = await this.findReplay(ctx);
+    if (replay) return { ...replay, replayed: true };
+
+    try {
+      const responseBody = await this.prisma.$transaction(
+        async (tx) => {
+          await this.claim(tx, ctx);
+          const data = await work(tx);
+          // Normalise to plain JSON (Dates -> ISO strings) so the replayed body is byte-identical
+          const body = JSON.parse(JSON.stringify({ success: true, data }));
+          await this.complete(tx, ctx, 201, body);
+          return body;
+        },
+        { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, timeout: 10000 }
+      );
+      return { statusCode: 201, responseBody, replayed: false };
+    } catch (err: any) {
+      if (err?.code === 'P2002') {
+        // A concurrent request with the same key committed first
+        const winner = await this.findReplay(ctx);
+        if (winner) return { ...winner, replayed: true };
+        throw new IdempotencyConflictError();
+      }
+      throw err;
+    }
+  }
+
+  public async purgeExpired(): Promise<number> {
+    const result = await this.prisma.idempotencyRecord.deleteMany({
+      where: { expiresAt: { lt: new Date() } },
     });
+    return result.count;
   }
 }

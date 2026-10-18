@@ -40,7 +40,8 @@ export interface WithdrawDTO {
 
 export interface TransferDTO {
   sourceAccountId: string;
-  destinationAccountId: string;
+  destinationAccountId?: string;
+  destinationAccountNumber?: string;
   amountInPaise: bigint;
   description?: string;
   referenceId?: string;
@@ -55,4 +56,18 @@ export interface TransactionResult {
   sourceAccountId?: string | null;
   destinationAccountId?: string | null;
   createdAt: Date;
+}
+
+export interface LedgerAccountProvisionDTO {
+  id: string;
+  accountNumber: string;
+  customerId: string;
+  currency: string;
+  dailyLimitPaise: bigint;
+  isActive: boolean;
+}
+
+export interface LedgerAccountUpdateDTO {
+  isActive?: boolean;
+  dailyLimitPaise?: bigint;
 }

@@ -8,14 +8,17 @@
     "services/*"
   ],
   "scripts": {
-    "build": "npm run build --workspaces --if-present",
-    "test": "npm run test --workspaces --if-present",
-    "lint": "echo 'Linting workspaces...'",
-    "docker:up": "docker-compose up -d",
-    "docker:down": "docker-compose down",
-    "docker:logs": "docker-compose logs -f"
+    "build": "npm run build -w @banksphere/common && npm run build --workspaces --if-present",
+    "test": "npm run build -w @banksphere/common && npm run test --workspaces --if-present",
+    "db:migrate": "npm run prisma:deploy --workspaces --if-present",
+    "docker:up": "docker compose up -d --build",
+    "docker:down": "docker compose down",
+    "docker:logs": "docker compose logs -f"
   },
   "devDependencies": {
     "typescript": "^5.4.5"
+  },
+  "engines": {
+    "node": ">=20.10"
   }
 }

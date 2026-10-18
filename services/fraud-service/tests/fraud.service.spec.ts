@@ -1,5 +1,5 @@
 import { FraudService } from '../src/services/fraud.service';
-import { RiskLevel, AlertStatus } from '../src/generated/client';
+import { RiskLevel, AlertStatus } from '../generated/client';
 
 describe('FraudService (Risk Engine, Anomaly Detection, and Alerts)', () => {
   let mockPrisma: any;
@@ -20,6 +20,7 @@ describe('FraudService (Risk Engine, Anomaly Detection, and Alerts)', () => {
         create: jest.fn(),
         findMany: jest.fn(),
       },
+      $transaction: jest.fn((cb: any) => cb(mockPrisma)),
     };
 
     mockAlertPublisher = {
@@ -123,5 +124,26 @@ describe('FraudService (Risk Engine, Anomaly Detection, and Alerts)', () => {
       // Risk assessment should NOT be recorded again
       expect(mockPrisma.riskAssessment.create).not.toHaveBeenCalled();
     });
+  });
+
+  it('CONCURRENT DUPLICATE: a unique violation on processed_events is treated as already processed', async () => {
+    mockPrisma.processedEvent.findUnique.mockResolvedValue(null);
+    mockPrisma.riskAssessment.count.mockResolvedValue(0);
+    mockPrisma.$transaction.mockRejectedValue(Object.assign(new Error('unique'), { code: 'P2002' }));
+
+    const result = await fraudService.evaluateTransaction(
+      { transactionId: 'tx-1', accountId: 'acc-1', amountInPaise: 50000000n, timestamp: new Date() },
+      'evt-race-1'
+    );
+
+    expect(result.alertCreated).toBe(false);
+    expect(mockAlertPublisher.publish).not.toHaveBeenCalled();
+  });
+
+  it('maps risk scores to levels', () => {
+    expect(FraudService.scoreToRiskLevel(0)).toBe(RiskLevel.LOW);
+    expect(FraudService.scoreToRiskLevel(20)).toBe(RiskLevel.MEDIUM);
+    expect(FraudService.scoreToRiskLevel(45)).toBe(RiskLevel.HIGH);
+    expect(FraudService.scoreToRiskLevel(85)).toBe(RiskLevel.CRITICAL);
   });
 });

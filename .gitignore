@@ -4,5 +4,5 @@ coverage/
 .env
 .env.*
 !.env.example
-services/*/src/generated/
+services/*/generated/
 *.log

@@ -4,15 +4,19 @@
   "description": "BankSphere Fraud & Risk Service - Risk Rules, Velocity Engine, and Anomaly Alerts",
   "main": "dist/app.js",
   "scripts": {
-    "build": "tsc",
+    "build": "prisma generate && tsc",
     "start": "node dist/app.js",
     "dev": "ts-node-dev --respawn --transpile-only src/app.ts",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
-    "test": "jest --runInBand"
+    "test": "jest --runInBand",
+    "prisma:deploy": "prisma migrate deploy",
+    "pretest": "prisma generate"
   },
   "dependencies": {
     "@banksphere/common": "*",
+    "@prisma/client": "^5.14.0",
+    "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "kafkajs": "^2.2.4",
     "zod": "^3.23.8"

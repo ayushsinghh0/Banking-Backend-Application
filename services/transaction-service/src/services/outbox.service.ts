@@ -1,4 +1,5 @@
-import { PrismaClient } from '../generated/client';
+import { PrismaClient } from '../../generated/client';
+import { logger } from '@banksphere/common';
 
 export interface KafkaPublisher {
   publish(topic: string, key: string, payload: any): Promise<void>;
@@ -27,7 +28,7 @@ export class OutboxService {
       try {
         await this.processPendingEvents();
       } catch (error) {
-        console.error('[OutboxService] Error processing outbox events:', error);
+        logger.error({ err: error }, 'Error processing outbox events');
       } finally {
         this.isPolling = false;
       }
@@ -107,6 +108,6 @@ export class OutboxService {
       }
 
       return pendingEvents.length;
-    });
+    }, { timeout: 60000 }); // Kafka sends happen inside this tx; the default 5s would abort and re-publish the batch
   }
 }

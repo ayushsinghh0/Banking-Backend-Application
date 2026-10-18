@@ -1,5 +1,5 @@
 import { NotificationService } from '../src/services/notification.service';
-import { NotificationStatus } from '../src/generated/client';
+import { NotificationStatus } from '../generated/client';
 import { TransactionCompletedEvent } from '../src/types';
 
 describe('NotificationService (Consumer Idempotency, Retries, and DLQ)', () => {
@@ -16,6 +16,14 @@ describe('NotificationService (Consumer Idempotency, Retries, and DLQ)', () => {
       },
       notificationLog: {
         create: jest.fn(),
+      },
+      userContact: {
+        findUnique: jest.fn().mockResolvedValue({ userId: 'cust-1', email: 'alice@bank.com' }),
+        upsert: jest.fn(),
+      },
+      accountOwner: {
+        findUnique: jest.fn(),
+        upsert: jest.fn(),
       },
     };
 
@@ -72,12 +80,16 @@ describe('NotificationService (Consumer Idempotency, Retries, and DLQ)', () => {
         referenceId: 'TXN-999',
         type: 'DEPOSIT',
         amountInPaise: '100000', // ₹1,000.00
+        destinationAccountId: 'acc-1',
+        destinationCustomerId: 'cust-1',
       };
 
       const wasProcessed = await notificationService.handleTransactionCompleted(event);
 
       expect(wasProcessed).toBe(true);
       expect(mockEmailProvider.sendEmail).toHaveBeenCalledTimes(1);
+      // Sent to the real account holder, not a hardcoded mailbox
+      expect(mockEmailProvider.sendEmail.mock.calls[0][0].recipient).toBe('alice@bank.com');
       expect(mockPrisma.notificationLog.create).toHaveBeenCalledWith(
         expect.objectContaining({
           data: expect.objectContaining({
@@ -162,6 +174,37 @@ describe('NotificationService (Consumer Idempotency, Retries, and DLQ)', () => {
           failureReason: 'Fatal SMTP outage',
         })
       );
+    });
+  });
+
+  describe('Contact directory', () => {
+    it('stores the email from user.registered.v1 and masks account numbers in welcome emails', async () => {
+      await notificationService.handleUserRegistered({
+        eventId: 'evt-u1',
+        eventType: 'user.registered.v1',
+        timestamp: new Date().toISOString(),
+        userId: 'cust-1',
+        email: 'alice@bank.com',
+        role: 'CUSTOMER',
+      });
+      expect(mockPrisma.userContact.upsert).toHaveBeenCalled();
+
+      mockPrisma.processedEvent.findUnique.mockResolvedValue(null);
+      await notificationService.handleAccountCreated({
+        eventId: 'evt-a1',
+        eventType: 'account.created.v1',
+        timestamp: new Date().toISOString(),
+        accountId: 'acc-1',
+        accountNumber: '100112345678',
+        customerId: 'cust-1',
+        accountType: 'SAVINGS',
+        currency: 'INR',
+      });
+
+      const email = mockEmailProvider.sendEmail.mock.calls[0][0];
+      expect(email.recipient).toBe('alice@bank.com');
+      expect(email.body).toContain('XXXXXXXX5678');
+      expect(email.body).not.toContain('100112345678');
     });
   });
 });

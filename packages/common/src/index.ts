@@ -10,3 +10,7 @@ export * from './redis/redis-client';
 export * from './kafka/kafka-client';
 export * from './utils/money.util';
 export * from './docs/swagger';
+export * from './auth/jwt';
+export * from './middleware/authenticate.middleware';
+export * from './http/base-app';
+export * from './kafka/event-publisher';

@@ -1,8 +1,15 @@
-import express, { Request, Response } from 'express';
-import { PrismaClient } from './generated/client';
+import 'dotenv/config';
+import { Request, Response } from 'express';
+import { PrismaClient } from '../generated/client';
 import {
-  correlationIdMiddleware,
+  createBaseApp,
+  createEventPublisher,
   errorHandlerMiddleware,
+  getInternalServiceToken,
+  getJwtAccessSecret,
+  isSwaggerEnabled,
+  logger,
+  notFoundHandler,
   setupSwagger,
 } from '@banksphere/common';
 import { LedgerService } from './services/ledger.service';
@@ -10,98 +17,111 @@ import { IdempotencyService } from './services/idempotency.service';
 import { OutboxService, KafkaPublisher } from './services/outbox.service';
 import { TransactionController } from './controllers/transaction.controller';
 import { createTransactionRouter } from './routes/transaction.routes';
+import { createInternalRouter } from './routes/internal.routes';
 
-// Enable JSON.stringify to handle BigInt gracefully
-(BigInt.prototype as any).toJSON = function () {
-  return this.toString();
-};
+export interface TransactionAppOptions {
+  kafkaPublisher?: KafkaPublisher | null;
+}
 
-export function createApp(prisma: PrismaClient, kafkaPublisher?: KafkaPublisher) {
-  const app = express();
-  app.use(express.json());
-
-  // Shared Correlation ID and Request Tracing middleware
-  app.use(correlationIdMiddleware);
+export function createApp(prisma: PrismaClient, options: TransactionAppOptions = {}) {
+  getJwtAccessSecret(); // Fail fast on a missing/weak signing secret
+  getInternalServiceToken();
+  const app = createBaseApp();
 
   // Services initialization
   const ledgerService = new LedgerService(prisma);
   const idempotencyService = new IdempotencyService(prisma);
 
-  // Outbox background service (simulated publisher if none provided)
-  const publisher: KafkaPublisher = kafkaPublisher || {
-    async publish(topic: string, key: string, payload: any) {
-      console.log(`[KafkaPublisher SIMULATED] Topic: ${topic} | Key: ${key}`, JSON.stringify(payload));
-    },
-  };
-
-  const outboxService = new OutboxService(prisma, publisher);
-  outboxService.start(3000); // Poll every 3 seconds
+  // The outbox relay only runs with a real publisher. Without Kafka, events stay PENDING
+  // (and are delivered once Kafka is configured) instead of being marked PUBLISHED and lost.
+  const outboxService = options.kafkaPublisher
+    ? new OutboxService(prisma, options.kafkaPublisher)
+    : null;
 
   // Controller & Router
   const controller = new TransactionController(ledgerService, idempotencyService);
   app.use('/api/v1/transactions', createTransactionRouter(controller));
+  app.use('/internal/v1', createInternalRouter(ledgerService));
 
   // Health and readiness endpoints
-  app.get('/health', async (_req: Request, res: Response) => {
+  app.get('/health', async (req: Request, res: Response) => {
     try {
       await prisma.$queryRaw`SELECT 1`;
       res.json({
         status: 'UP',
         service: 'transaction-and-ledger-service',
+        outboxRelay: outboxService ? 'running' : 'disabled',
         timestamp: new Date().toISOString(),
       });
-    } catch (err: any) {
-      res.status(503).json({
-        status: 'DOWN',
-        database: err.message,
-      });
+    } catch (err) {
+      req.log.error({ err }, 'Health check failed');
+      res.status(503).json({ status: 'DOWN', service: 'transaction-and-ledger-service' });
     }
   });
 
   // Swagger documentation
-  setupSwagger(app, {
-    title: 'BankSphere - Transaction & Ledger Service',
-    version: '1.0.0',
-    description: 'Double-entry immutable ledger and financial transaction engine',
-    paths: {
-      '/api/v1/transactions/transfer': {
-        post: {
-          summary: 'Transfer funds between accounts',
-          parameters: [
-            {
-              name: 'Idempotency-Key',
-              in: 'header',
-              required: true,
-              schema: { type: 'string' },
-            },
-          ],
+  if (isSwaggerEnabled()) {
+    const idempotencyHeader = {
+      name: 'Idempotency-Key',
+      in: 'header',
+      required: true,
+      schema: { type: 'string', pattern: '^[A-Za-z0-9_-]{8,128}$' },
+    };
+    setupSwagger(app, {
+      title: 'BankSphere - Transaction & Ledger Service',
+      version: '1.0.0',
+      description: 'Double-entry immutable ledger and financial transaction engine',
+      paths: {
+        '/api/v1/transactions/transfer': {
+          post: { summary: 'Transfer funds from an owned account', parameters: [idempotencyHeader] },
+        },
+        '/api/v1/transactions/withdraw': {
+          post: { summary: 'Withdraw from an owned account', parameters: [idempotencyHeader] },
+        },
+        '/api/v1/transactions/deposit': {
+          post: { summary: 'BANK_ADMIN (teller) only: deposit into an account', parameters: [idempotencyHeader] },
+        },
+        '/api/v1/transactions/accounts/{accountId}/balance': {
+          get: { summary: 'Authoritative ledger balance (owner or staff)' },
+        },
+        '/api/v1/transactions/accounts/{accountId}/history': {
+          get: { summary: 'Paginated ledger history (owner or staff), ?limit=1..100&offset=' },
         },
       },
-    },
-  });
+    });
+  }
 
+  app.use(notFoundHandler);
   // Centralized Error Handling Middleware
   app.use(errorHandlerMiddleware);
 
-  return { app, outboxService, prisma };
+  return { app, outboxService, idempotencyService, prisma };
 }
 
 // Server startup if executed directly
 if (require.main === module) {
   const prisma = new PrismaClient();
-  const { app } = createApp(prisma);
+  const { publisher, kafka } = createEventPublisher(process.env.KAFKA_CLIENT_ID || 'transaction-service');
+  const { app, outboxService, idempotencyService } = createApp(prisma, { kafkaPublisher: publisher });
   const PORT = process.env.PORT || 8004;
 
+  outboxService?.start(Number(process.env.OUTBOX_POLL_INTERVAL_MS || 3000));
+  const purgeTimer = setInterval(() => {
+    idempotencyService.purgeExpired().catch((err) => logger.error({ err }, 'Idempotency purge failed'));
+  }, 60 * 60 * 1000);
+
   const server = app.listen(PORT, () => {
-    console.log(`BankSphere Transaction & Ledger Service running on port ${PORT}`);
+    logger.info(`BankSphere Transaction & Ledger Service running on port ${PORT}`);
   });
 
   // Graceful shutdown
   const shutdown = async () => {
-    console.log('Shutting down Transaction & Ledger Service gracefully...');
+    logger.info('Shutting down Transaction & Ledger Service gracefully...');
+    outboxService?.stop();
+    clearInterval(purgeTimer);
     server.close(async () => {
       await prisma.$disconnect();
-      console.log('Postgres connections closed. Process terminating.');
+      await kafka?.disconnect().catch(() => {});
       process.exit(0);
     });
   };
