@@ -26,6 +26,9 @@ services:
 
   auth-service:
     environment:
+      # Relaxed per-IP limits so the e2e suite can be re-run locally (production: 30 / 10 per 15 min)
+      AUTH_RATE_LIMIT_MAX: "500"
+      AUTH_RECOVERY_RATE_LIMIT_MAX: "500"
       SMTP_HOST: mailpit
       SMTP_PORT: 1025
       SMTP_SECURE: "false"
