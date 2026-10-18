@@ -1,0 +1,21 @@
+{
+  "name": "banksphere-monorepo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "BankSphere — Production-Style Banking Backend Using Microservices",
+  "workspaces": [
+    "packages/*",
+    "services/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "lint": "echo 'Linting workspaces...'",
+    "docker:up": "docker-compose up -d",
+    "docker:down": "docker-compose down",
+    "docker:logs": "docker-compose logs -f"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5"
+  }
+}
