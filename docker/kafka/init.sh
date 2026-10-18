@@ -12,7 +12,7 @@ printf 'security.protocol=SASL_PLAINTEXT\nsasl.mechanism=PLAIN\nsasl.jaas.config
 topics() { "$BIN/kafka-topics.sh" --bootstrap-server "$BOOTSTRAP" --command-config "$CFG" "$@"; }
 acl() { "$BIN/kafka-acls.sh" --bootstrap-server "$BOOTSTRAP" --command-config "$CFG" --add --force "$@" >/dev/null; }
 
-EVENTS="user.registered.v1 account.created.v1 account.status.changed.v1 transaction.completed.v1 fraud.alert.created.v1"
+EVENTS="user.registered.v1 account.created.v1 account.status.changed.v1 transaction.completed.v1 fraud.alert.created.v1 withdrawal.code.created.v1"
 for t in $EVENTS; do
   topics --create --if-not-exists --topic "$t" --partitions 3 --replication-factor 1
   topics --create --if-not-exists --topic "$t.dlq" --partitions 1 --replication-factor 1
@@ -39,6 +39,7 @@ produce auth-svc    user.registered.v1
 produce account-svc account.created.v1
 produce account-svc account.status.changed.v1
 produce ledger-svc  transaction.completed.v1
+produce ledger-svc  withdrawal.code.created.v1
 produce fraud-svc   fraud.alert.created.v1
 for u in auth-svc account-svc ledger-svc fraud-svc notification-svc; do idempotent "$u"; done
 
@@ -48,6 +49,7 @@ consume fraud-svc transaction.completed.v1
 consume fraud-svc transaction.completed.v1.retry
 produce fraud-svc transaction.completed.v1.retry
 group   fraud-svc fraud-service-group
+group   fraud-svc fraud-service-group.retry
 produce fraud-svc transaction.completed.v1.dlq
 for t in $EVENTS; do
   consume notification-svc "$t"
@@ -56,6 +58,7 @@ for t in $EVENTS; do
   produce notification-svc "$t.dlq"
 done
 group   notification-svc notification-service-group
+group   notification-svc notification-service-group.retry
 produce notification-svc notifications.dlq
 
 echo "Kafka topics, users and ACLs ready"

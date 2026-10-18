@@ -103,6 +103,12 @@ describe('API Gateway', () => {
       expect(staff.body.error.code).toBe('NETWORK_NOT_ALLOWED');
       const customer = await request(app).post('/api/v1/transactions/transfer').send({});
       expect(customer.status).toBe(200);
+      // Upstream routing is case-insensitive and tolerant: none of these spellings may slip past the check
+      for (const sneaky of ['/api/v1/transactions/Deposit', '/api/v1/TRANSACTIONS/deposit', '/api/v1/transactions/%64eposit', '/api/v1/transactions//deposit', '/api/v1/transactions/deposit/']) {
+        const res = await request(app).post(sneaky).send({});
+        expect([sneaky, res.status]).toEqual([sneaky, 403]);
+      }
+      expect((await request(app).post('/api/v1/transactions/%E0%A4%A').send({})).status).toBe(400);
     } finally {
       delete process.env.STAFF_ALLOWED_CIDRS;
     }

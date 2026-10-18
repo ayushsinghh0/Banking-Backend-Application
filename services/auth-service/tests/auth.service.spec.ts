@@ -43,6 +43,7 @@ function buildMockPrisma() {
       create: jest.fn(),
       update: jest.fn(),
       updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+      count: jest.fn().mockResolvedValue(0),
     },
     refreshToken: {
       create: jest.fn(),
@@ -79,7 +80,7 @@ function buildMockPrisma() {
       updateMany: jest.fn().mockResolvedValue({ count: 1 }),
     },
     outboxEvent: { create: jest.fn() },
-    auditLog: { create: jest.fn() },
+    auditLog: { create: jest.fn(), findFirst: jest.fn().mockResolvedValue(null) },
     $queryRaw: jest.fn().mockResolvedValue([{ id: 'locked' }]),
   };
   prisma.$transaction = jest.fn((arg: any) => (typeof arg === 'function' ? arg(prisma) : Promise.all(arg)));
@@ -248,7 +249,7 @@ describe('AuthService', () => {
       const secret = generateTotpSecret();
       prisma.user.findUnique.mockResolvedValue(enrolledUser(secret));
       prisma.user.findUniqueOrThrow.mockResolvedValue(enrolledUser(secret));
-      const challenge = await security.createMfaChallenge('u1', 300);
+      const challenge = await security.createMfaChallenge('u1', 0, 300);
       prisma.user.updateMany.mockResolvedValueOnce({ count: 0 }); // the step was already consumed
       await expect(authService.completeMfaLogin(challenge, totpAt(secret, currentStep()))).rejects.toThrow(UnauthorizedError);
     });
@@ -256,7 +257,7 @@ describe('AuthService', () => {
     it('a challenge dies after 5 wrong codes', async () => {
       const secret = generateTotpSecret();
       prisma.user.findUnique.mockResolvedValue(enrolledUser(secret));
-      const challenge = await security.createMfaChallenge('u1', 300);
+      const challenge = await security.createMfaChallenge('u1', 0, 300);
       for (let i = 0; i < 5; i++) {
         await expect(authService.completeMfaLogin(challenge, '000000')).rejects.toThrow(UnauthorizedError);
       }
@@ -286,6 +287,9 @@ describe('AuthService', () => {
       expect(claims.mfa).toBe(true);
       // Same session (family and absolute expiry) rather than a brand-new 30-day one
       expect(claims.sessionId).toBe('fam-1');
+      // A fresh TOTP check, on a factor enrolled just now (so it can't yet authorise high-risk actions)
+      expect(claims.stepUpAt).toBeDefined();
+      expect(Math.abs(claims.mfaSince! - Date.now() / 1000)).toBeLessThan(5);
       expect(prisma.refreshToken.create.mock.calls.at(-1)[0].data).toEqual(expect.objectContaining({ familyId: 'fam-1', familyExpiresAt }));
       expect(await tokenState.isAccessTokenRevoked({ userId: 'u1', jti: 'old', tokenVersion: 0 })).toBe(true);
     });
@@ -315,11 +319,53 @@ describe('AuthService', () => {
       const secret = generateTotpSecret();
       prisma.user.findUnique.mockResolvedValue(enrolledUser(secret));
       for (let i = 0; i < 10; i++) {
-        const challenge = await security.createMfaChallenge('u1', 300);
+        const challenge = await security.createMfaChallenge('u1', 0, 300);
         await expect(authService.completeMfaLogin(challenge, '000000')).rejects.toThrow(UnauthorizedError);
       }
-      const fresh = await security.createMfaChallenge('u1', 300);
+      const fresh = await security.createMfaChallenge('u1', 0, 300);
       await expect(authService.completeMfaLogin(fresh, totpAt(secret, currentStep()))).rejects.toThrow('Too many failed verification codes');
+    });
+
+    it('MFA login tokens carry a fresh step-up time and the factor enrolment time', async () => {
+      const secret = generateTotpSecret();
+      const enrolledAt = new Date(Date.now() - 3 * 86400_000);
+      const user = enrolledUser(secret, { passwordHash: await PasswordService.hash('Password1234'), mfaEnabledAt: enrolledAt });
+      prisma.user.findUnique.mockResolvedValue(user);
+      const step1: any = await authService.login({ email: 'alice@bank.com', password: 'Password1234' }, NET);
+      const result = await authService.completeMfaLogin(step1.challengeToken, totpAt(secret, currentStep()));
+      const claims = verifyAccessToken(result.tokens.accessToken);
+      expect(Math.abs(claims.stepUpAt! - Date.now() / 1000)).toBeLessThan(5);
+      expect(claims.mfaSince).toBe(Math.floor(enrolledAt.getTime() / 1000));
+
+      // A refreshed token keeps the MFA session but is NOT a recent step-up
+      const fam = prisma.refreshToken.create.mock.calls.at(-1)[0].data;
+      const record = { id: 'rt1', userId: 'u1', familyId: fam.familyId, isRevoked: false, expiresAt: new Date(Date.now() + 1e6), familyExpiresAt: fam.familyExpiresAt, mfaAuthenticated: true, user };
+      prisma.refreshToken.findUnique.mockResolvedValue(record);
+      prisma.refreshToken.findUniqueOrThrow.mockResolvedValue(record);
+      const refreshed = verifyAccessToken((await authService.refreshToken('x')).accessToken);
+      expect(refreshed.mfa).toBe(true);
+      expect(refreshed.stepUpAt).toBeUndefined();
+    });
+
+    it('STEP-UP: re-verifying TOTP in an MFA session issues a fresh step-up token; wrong codes are counted', async () => {
+      const secret = generateTotpSecret();
+      prisma.user.findUnique.mockResolvedValue(enrolledUser(secret, { mfaEnabledAt: new Date(Date.now() - 86400_000 * 2) }));
+      prisma.refreshToken.findFirst.mockResolvedValue({ id: 'rt1', familyId: 'fam-1' });
+      const actor = { id: 'u1', email: 'alice@bank.com', role: 'CUSTOMER' as const, mfa: true, sessionId: 'fam-1' };
+      await expect(authService.stepUp({ ...actor, mfa: false }, totpAt(secret, currentStep()))).rejects.toMatchObject({ errorCode: 'MFA_REQUIRED' });
+      await expect(authService.stepUp(actor, '000000')).rejects.toMatchObject({ errorCode: 'INVALID_MFA_CODE' });
+      const { accessToken } = await authService.stepUp(actor, totpAt(secret, currentStep()));
+      const claims = verifyAccessToken(accessToken);
+      expect(claims.sessionId).toBe('fam-1');
+      expect(Math.abs(claims.stepUpAt! - Date.now() / 1000)).toBeLessThan(5);
+    });
+
+    it('a password reset kills a half-finished MFA login (the challenge is bound to the token version)', async () => {
+      const secret = generateTotpSecret();
+      prisma.user.findUnique.mockResolvedValue(enrolledUser(secret, { tokenVersion: 1 })); // reset happened: version 0 -> 1
+      const challenge = await security.createMfaChallenge('u1', 0, 300); // issued before the reset
+      await expect(authService.completeMfaLogin(challenge, totpAt(secret, currentStep()))).rejects.toThrow(UnauthorizedError);
+      expect(prisma.refreshToken.create).not.toHaveBeenCalled();
     });
 
     it('verifyTotp tolerates one step of clock drift and rejects malformed codes', () => {
@@ -437,6 +483,26 @@ describe('AuthService', () => {
       await authService.setCustomerActive(admin, 'u1', false);
       expect(await tokenState.isAccessTokenRevoked({ userId: 'u1', jti: 'jti', tokenVersion: 0 })).toBe(true);
       expect(prisma.auditLog.create.mock.calls[0][0].data).toEqual(expect.objectContaining({ actorId: 'admin-1', action: 'USER_DISABLED' }));
+    });
+
+    it('DUAL CONTROL: the admin who disabled a customer cannot re-enable them; another admin can', async () => {
+      prisma.user.findUnique.mockResolvedValue(activeUser({ isActive: false }));
+      prisma.user.update.mockResolvedValue(activeUser({ isActive: true }));
+      prisma.auditLog.findFirst.mockResolvedValue({ actorId: 'admin-1', action: 'USER_DISABLED' });
+      await expect(authService.setCustomerActive(admin, 'u1', true)).rejects.toThrow(ForbiddenError);
+      await expect(authService.setCustomerActive(admin2, 'u1', true)).resolves.toEqual(expect.objectContaining({ isActive: true }));
+    });
+
+    it('resetting a customer MFA is a four-eyes request too (it reopens password-only access)', async () => {
+      prisma.user.findUnique.mockResolvedValue(activeUser({ mfaEnabled: true }));
+      await expect(authService.adminResetCustomerMfa(admin, 'u1')).rejects.toMatchObject({ errorCode: 'APPROVAL_REQUIRED' });
+      expect(prisma.user.update).not.toHaveBeenCalled();
+    });
+
+    it('BOOTSTRAP: only the first two administrators can be created by the bootstrap script', async () => {
+      prisma.user.count.mockResolvedValue(2);
+      await expect(authService.createBootstrapAdmin('third@bank.com', 'Password12345')).rejects.toThrow('first two administrators');
+      expect(prisma.user.create).not.toHaveBeenCalled();
     });
 
     it('administrators cannot disable themselves; staff accounts need an approval request', async () => {

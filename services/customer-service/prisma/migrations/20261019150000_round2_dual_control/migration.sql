@@ -23,7 +23,8 @@ CREATE INDEX "staff_access_log_actor_id_created_at_idx" ON "staff_access_log"("a
 -- Staff access to customer PII is append-only evidence
 CREATE TRIGGER "trg_staff_access_log_append_only" BEFORE UPDATE OR DELETE ON "staff_access_log" FOR EACH ROW EXECUTE FUNCTION "prevent_mutation"();
 CREATE TRIGGER "trg_staff_access_log_no_truncate" BEFORE TRUNCATE ON "staff_access_log" FOR EACH STATEMENT EXECUTE FUNCTION "prevent_mutation"();
-ALTER TABLE "customer_profiles" ADD CONSTRAINT "chk_customer_profiles_version" CHECK ("version" >= 1);
+ALTER TABLE "customer_profiles" ADD CONSTRAINT "chk_customer_profiles_version" CHECK ("version" >= 1) NOT VALID;
+ALTER TABLE "customer_profiles" VALIDATE CONSTRAINT "chk_customer_profiles_version";
 
 DO $$
 BEGIN

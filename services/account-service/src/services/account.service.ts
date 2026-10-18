@@ -194,21 +194,32 @@ export class AccountService {
       );
     }
 
-    // Every control change gets the next version; the ledger ignores anything not newer than what it has
-    const version = account.version + 1;
+    // Dual control: an account frozen by a staff member can only be unfrozen by a different one
+    if (status === AccountStatus.ACTIVE && account.status === AccountStatus.FROZEN) {
+      const lastFreeze = await this.prisma.auditLog.findFirst({
+        where: { targetId: accountId, action: 'ACCOUNT_STATUS_CHANGED' },
+        orderBy: { createdAt: 'desc' },
+      });
+      if (lastFreeze && lastFreeze.actorId === actor.id && lastFreeze.actorId !== account.customerId) {
+        throw new ForbiddenError('An account you froze must be unfrozen by a different administrator');
+      }
+    }
+
+    // A unique version for this change, reserved atomically against the version we read: two concurrent
+    // writers can never push the same version to the ledger
+    const version = await this.reserveVersion(accountId, account.version);
 
     // Restrictive changes: ledger first (it is the authority on whether money can move / balance is 0)
     if (status === AccountStatus.CLOSED) {
       await this.ledgerClient.closeAccount(accountId, version);
     } else if (status === AccountStatus.FROZEN) {
-      await this.ledgerClient.updateAccount(accountId, { isActive: false, dailyLimitPaise: account.dailyLimit.toString(), version });
+      await this.pushToLedger(accountId, { isActive: false, dailyLimitPaise: account.dailyLimit.toString(), version });
     }
 
     const updated = await this.prisma.$transaction(async (tx) => {
-      // Compare-and-set on the version guards against a concurrent change between read and write
       const result = await tx.bankAccount.updateMany({
-        where: { id: accountId, version: account.version },
-        data: { status, version },
+        where: { id: accountId, version },
+        data: { status },
       });
       if (result.count !== 1) {
         throw new ConflictError('Account status changed concurrently, please retry');
@@ -226,10 +237,29 @@ export class AccountService {
 
     // Permissive change: only after our own commit
     if (status === AccountStatus.ACTIVE) {
-      await this.ledgerClient.updateAccount(accountId, { isActive: true, dailyLimitPaise: updated.dailyLimit.toString(), version });
+      await this.pushToLedger(accountId, { isActive: true, dailyLimitPaise: updated.dailyLimit.toString(), version });
     }
 
     return updated;
+  }
+
+  /** Bumps the account's control version iff it is still `expected`; returns the new version */
+  private async reserveVersion(accountId: string, expected: number): Promise<number> {
+    const result = await this.prisma.bankAccount.updateMany({
+      where: { id: accountId, version: expected },
+      data: { version: { increment: 1 } },
+    });
+    if (result.count !== 1) throw new ConflictError('Account changed concurrently, please retry');
+    return expected + 1;
+  }
+
+  /** A push the ledger did not apply means it already holds a newer state: never treat that as success */
+  private async pushToLedger(accountId: string, update: { isActive: boolean; dailyLimitPaise: string; version: number }) {
+    const { applied } = await this.ledgerClient.updateAccount(accountId, update);
+    if (!applied) {
+      logger.error({ accountId, version: update.version, alert: 'ACCOUNT_LEDGER_PUSH_REJECTED' }, 'Ledger refused an account control update');
+      throw new ConflictError('Account changed concurrently, please retry');
+    }
   }
 
   /**
@@ -250,15 +280,16 @@ export class AccountService {
       throw new ConflictError('Cannot change limits on a closed account');
     }
     this.assertDailyLimitAllowed(dailyLimit, isAdmin);
+    if (dailyLimit === account.dailyLimit) return account;
 
-    const version = account.version + 1;
+    const version = await this.reserveVersion(accountId, account.version);
     const ledgerState = { isActive: account.status === AccountStatus.ACTIVE, dailyLimitPaise: dailyLimit.toString(), version };
-    const lowering = dailyLimit <= account.dailyLimit;
+    const lowering = dailyLimit < account.dailyLimit;
     if (lowering) {
-      await this.ledgerClient.updateAccount(accountId, ledgerState);
+      await this.pushToLedger(accountId, ledgerState);
     }
     const updated = await this.prisma.$transaction(async (tx) => {
-      const cas = await tx.bankAccount.updateMany({ where: { id: accountId, version: account.version }, data: { dailyLimit, version } });
+      const cas = await tx.bankAccount.updateMany({ where: { id: accountId, version }, data: { dailyLimit } });
       if (cas.count !== 1) throw new ConflictError('Account changed concurrently, please retry');
       const result = await tx.bankAccount.findUniqueOrThrow({ where: { id: accountId } });
       await this.audit(tx, actor.id, 'DAILY_LIMIT_CHANGED', accountId, {
@@ -268,7 +299,7 @@ export class AccountService {
       return result;
     });
     if (!lowering) {
-      await this.ledgerClient.updateAccount(accountId, ledgerState);
+      await this.pushToLedger(accountId, ledgerState);
     }
     return updated;
   }
@@ -324,12 +355,19 @@ export class AccountService {
             if (ledger.closed) {
               logger.error({ accountId: account.id, alert: 'ACCOUNT_LEDGER_CLOSED_MISMATCH' }, 'Ledger closed but account is not');
             } else if (ledger.isActive !== wantActive || ledger.dailyLimitPaise !== wantLimit) {
-              const { applied } = await this.ledgerClient.updateAccount(account.id, {
-                isActive: wantActive,
-                dailyLimitPaise: wantLimit,
-                version: account.version,
-              });
-              if (applied) repaired++;
+              const ledgerLooser = (ledger.isActive && !wantActive) || BigInt(ledger.dailyLimitPaise) > account.dailyLimit;
+              if (ledger.controlVersion === account.version && !ledgerLooser) {
+                // Same version, ledger stricter: a restrictive change reached the ledger but not this record.
+                // Never loosen money controls automatically: a person decides.
+                logger.error({ accountId: account.id, alert: 'ACCOUNT_LEDGER_DIVERGED' }, 'Ledger is stricter than the account record at the same version');
+              } else {
+                // The ledger allows more than it should (or is simply behind): push our state with a fresh version
+                const version =
+                  ledger.controlVersion < account.version ? account.version : await this.reserveVersion(account.id, account.version);
+                const { applied } = await this.ledgerClient.updateAccount(account.id, { isActive: wantActive, dailyLimitPaise: wantLimit, version });
+                if (applied) repaired++;
+                else logger.error({ accountId: account.id, alert: 'ACCOUNT_LEDGER_PUSH_REJECTED' }, 'Ledger refused the reconciliation push');
+              }
             }
           }
         } catch (err) {

@@ -6,6 +6,7 @@ import {
   AccountStatusChangedEvent,
   FraudAlertCreatedEvent,
   UserRegisteredEvent,
+  WithdrawalCodeCreatedEvent,
   EmailDispatchOptions,
 } from '../types';
 import { MoneyUtil, TransientError, isTransientError, logger } from '@banksphere/common';
@@ -198,6 +199,26 @@ export class NotificationService {
       this.contactMissing(event.eventId, event.timestamp);
     }
 
+    await this.markEventProcessed(event.eventId, event.eventType);
+    return true;
+  }
+
+  /** A cash withdrawal code was created: tell the customer, in case it wasn't them */
+  public async handleWithdrawalCodeCreated(event: WithdrawalCodeCreatedEvent): Promise<boolean> {
+    if (await this.isEventProcessed(event.eventId)) {
+      return false;
+    }
+    const recipient = await this.resolveEmail(event.customerId);
+    if (recipient) {
+      await this.dispatchWithRetryAndDLQ(event.eventId, event.eventType, {
+        recipient,
+        subject: 'BankSphere: a cash withdrawal code was created',
+        body: `Dear Customer,\n\nA one-time code to withdraw ${MoneyUtil.formatINR(event.amountInPaise)} in cash at a branch was created from your online banking session. It expires at ${event.expiresAt}.\n\nIf this was not you, contact BankSphere immediately and change your password.`,
+        metadata: { accountId: event.accountId },
+      });
+    } else {
+      this.contactMissing(event.eventId, event.timestamp);
+    }
     await this.markEventProcessed(event.eventId, event.eventType);
     return true;
   }

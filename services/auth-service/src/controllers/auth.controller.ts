@@ -40,6 +40,7 @@ const loginSchema = z.object({
 const mfaLoginSchema = z.object({ challengeToken: oneTimeTokenSchema, code: totpCodeSchema }).strict();
 const mfaSetupSchema = z.object({ password: z.string().min(1).max(128), enrolmentToken: oneTimeTokenSchema.optional() }).strict();
 const mfaEnableSchema = z.object({ code: totpCodeSchema, enrolmentToken: oneTimeTokenSchema.optional() }).strict();
+const stepUpSchema = z.object({ code: totpCodeSchema }).strict();
 const activateSchema = z.object({ token: oneTimeTokenSchema, password: passwordSchema }).strict();
 const requestIdParams = z.object({ requestId: z.string().uuid() });
 const requestListQuery = z.object({ status: z.enum(['PENDING', 'APPROVED', 'REJECTED']).optional() });
@@ -133,6 +134,11 @@ export class AuthController {
     const { code, enrolmentToken } = mfaEnableSchema.parse(req.body);
     const tokens = await this.authService.enableMfa(getAuthenticatedUser(req), code, enrolmentToken);
     res.status(200).json({ success: true, data: { tokens } });
+  });
+
+  public mfaStepUp = wrap(async (req, res) => {
+    const { code } = stepUpSchema.parse(req.body);
+    res.status(200).json({ success: true, data: await this.authService.stepUp(getAuthenticatedUser(req), code) });
   });
 
   public activateStaff = wrap(async (req, res) => {

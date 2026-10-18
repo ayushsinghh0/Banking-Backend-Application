@@ -3,6 +3,7 @@ import { Request, Response } from 'express';
 import Redis from 'ioredis';
 import { PrismaClient } from '../generated/client';
 import {
+  acquireJobLease,
   connectRedis,
   createAuthenticate,
   createBaseApp,
@@ -95,9 +96,13 @@ async function main(): Promise<void> {
   const prisma = new PrismaClient(prismaClientOptions());
   const redis = await connectRedis();
   const { app, accountService } = createApp(prisma, { tokenState: new RedisTokenStateStore(redis), redis });
+  const reconcileIntervalMs = Number(process.env.RECONCILE_INTERVAL_MS || 5 * 60 * 1000);
   const reconcileTimer = setInterval(() => {
-    accountService.reconcileWithLedger().catch((err) => logger.error({ err }, 'Account/ledger reconciliation failed'));
-  }, Number(process.env.RECONCILE_INTERVAL_MS || 5 * 60 * 1000));
+    // One replica at a time (lease), not every instance walking every account
+    acquireJobLease(prisma, 'account-ledger-reconcile', Math.ceil((reconcileIntervalMs * 2) / 1000))
+      .then((leader) => (leader ? accountService.reconcileWithLedger() : undefined))
+      .catch((err) => logger.error({ err }, 'Account/ledger reconciliation failed'));
+  }, reconcileIntervalMs);
 
   const { publisher, kafka } = createEventPublisher(process.env.KAFKA_CLIENT_ID || 'account-service');
   const relay = publisher ? new OutboxRelay(prisma, publisher) : null;

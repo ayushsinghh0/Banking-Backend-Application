@@ -6,6 +6,7 @@ import {
   AccountStatusChangedEvent,
   FraudAlertCreatedEvent,
   UserRegisteredEvent,
+  WithdrawalCodeCreatedEvent,
 } from '../types';
 
 export class KafkaNotificationConsumer {
@@ -22,6 +23,7 @@ export class KafkaNotificationConsumer {
       'account.created.v1',
       'account.status.changed.v1',
       'fraud.alert.created.v1',
+      'withdrawal.code.created.v1',
     ];
 
     this.kafkaService.subscribe(
@@ -60,6 +62,10 @@ export class KafkaNotificationConsumer {
             await this.notificationService.handleFraudAlert(
               payload as FraudAlertCreatedEvent
             );
+            break;
+
+          case 'withdrawal.code.created.v1':
+            await this.notificationService.handleWithdrawalCodeCreated(payload as WithdrawalCodeCreatedEvent);
             break;
 
           default:

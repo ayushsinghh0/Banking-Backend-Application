@@ -41,14 +41,15 @@ const withdrawSchema = depositSchema.extend({
 
 const withdrawalCodeSchema = z.object({ accountId: z.string().uuid(), amountInPaise: amountSchema }).strict();
 const beneficiarySchema = z.object({ accountNumber: z.string().regex(/^\d{12}$/), nickname: z.string().trim().min(1).max(60) }).strict();
-const openSessionSchema = z.object({ openingFloatPaise: nonNegativeAmount }).strict();
-const closeSessionSchema = z.object({ countedCashPaise: nonNegativeAmount }).strict();
+const issueFloatSchema = z.object({ tellerId: z.string().uuid(), openingFloatPaise: nonNegativeAmount }).strict();
+const acceptFloatSchema = z.object({ countedFloatPaise: nonNegativeAmount }).strict();
+const countSchema = z.object({ countedCashPaise: nonNegativeAmount }).strict();
 
 const accountIdParams = z.object({ accountId: z.string().uuid() });
 const idParams = z.object({ id: z.string().uuid() });
 const cashOperationParams = z.object({ cashOperationId: z.string().uuid() });
 const cashListQuery = z.object({ status: z.enum(['PENDING_APPROVAL', 'EXECUTED', 'REJECTED']).optional() });
-const sessionListQuery = z.object({ status: z.enum(['OPEN', 'CLOSED', 'RECONCILED']).optional() });
+const sessionListQuery = z.object({ status: z.enum(['ISSUED', 'OPEN', 'CLOSED', 'RECONCILED', 'CANCELLED']).optional() });
 
 const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9_-]{8,128}$/;
 
@@ -182,21 +183,33 @@ export class TransactionController {
     );
   });
 
-  public openSession = wrap(async (req, res) => {
-    const { openingFloatPaise } = openSessionSchema.parse(req.body);
-    res.status(201).json({ success: true, data: await this.tellerService.openSession(getAuthenticatedUser(req), BigInt(openingFloatPaise)) });
+  public acceptFloat = wrap(async (req, res) => {
+    const { countedFloatPaise } = acceptFloatSchema.parse(req.body);
+    res.json({ success: true, data: await this.tellerService.acceptFloat(getAuthenticatedUser(req), BigInt(countedFloatPaise)) });
   });
 
   public closeSession = wrap(async (req, res) => {
-    const { countedCashPaise } = closeSessionSchema.parse(req.body);
+    const { countedCashPaise } = countSchema.parse(req.body);
     res.json({ success: true, data: await this.tellerService.closeSession(getAuthenticatedUser(req), BigInt(countedCashPaise)) });
   });
 
   // --- supervisor -----------------------------------------------------------
 
+  public issueFloat = wrap(async (req, res) => {
+    const { tellerId, openingFloatPaise } = issueFloatSchema.parse(req.body);
+    res.status(201).json({ success: true, data: await this.tellerService.issueFloat(getAuthenticatedUser(req), tellerId, BigInt(openingFloatPaise)) });
+  });
+
+  public cancelFloat = wrap(async (req, res) => {
+    const { id } = idParams.parse(req.params);
+    await this.tellerService.cancelFloat(getAuthenticatedUser(req), id);
+    res.json({ success: true, data: { id, status: 'CANCELLED' } });
+  });
+
   public signOffSession = wrap(async (req, res) => {
     const { id } = idParams.parse(req.params);
-    res.json({ success: true, data: await this.tellerService.signOffSession(getAuthenticatedUser(req), id) });
+    const { countedCashPaise } = countSchema.parse(req.body);
+    res.json({ success: true, data: await this.tellerService.signOffSession(getAuthenticatedUser(req), id, BigInt(countedCashPaise)) });
   });
 
   public listSessions = wrap(async (req, res) => {

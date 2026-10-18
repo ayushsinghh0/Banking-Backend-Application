@@ -13,7 +13,13 @@ ADD COLUMN     "kind" "LedgerAccountKind" NOT NULL DEFAULT 'CUSTOMER';
 
 -- AlterTable
 ALTER TABLE "outbox_events" ADD COLUMN     "locked_by" TEXT,
-ADD COLUMN     "seq" BIGSERIAL NOT NULL;
+ADD COLUMN     "seq" BIGINT;
+-- Existing (pending) events get their sequence in creation order, so per-aggregate publish order holds
+CREATE SEQUENCE "outbox_events_seq_seq" OWNED BY "outbox_events"."seq";
+WITH ordered AS (SELECT id, row_number() OVER (ORDER BY created_at, id) AS n FROM "outbox_events")
+UPDATE "outbox_events" o SET "seq" = ordered.n FROM ordered WHERE o.id = ordered.id;
+SELECT setval('"outbox_events_seq_seq"', COALESCE((SELECT max("seq") FROM "outbox_events"), 0) + 1, false);
+ALTER TABLE "outbox_events" ALTER COLUMN "seq" SET DEFAULT nextval('"outbox_events_seq_seq"'), ALTER COLUMN "seq" SET NOT NULL;
 
 -- CreateTable
 CREATE TABLE "teller_sessions" (
@@ -88,15 +94,19 @@ CREATE UNIQUE INDEX "outbox_events_seq_key" ON "outbox_events"("seq");
 -- ---------------------------------------------------------------------------
 -- Integrity constraints for teller drawers, withdrawal codes and beneficiaries
 -- ---------------------------------------------------------------------------
--- A drawer's balance is net cash movement since it was created (the opening float is counted, not
--- booked), so it may go negative; customer balances never may.
+-- Cash accounts (drawers, vault, suspense) are assets that may legitimately go negative (e.g. the vault
+-- issuing floats for cash that predates the ledger); customer balances never may.
 ALTER TABLE "ledger_accounts" DROP CONSTRAINT "chk_ledger_accounts_balance_non_negative";
-ALTER TABLE "ledger_accounts" ADD CONSTRAINT "chk_ledger_accounts_balance_non_negative" CHECK ("balance" >= 0 OR "kind" = 'TELLER_CASH');
-ALTER TABLE "ledger_accounts" ADD CONSTRAINT "chk_ledger_accounts_balance_cap" CHECK ("balance" <= 900000000000000000 AND "balance" >= -900000000000000000);
-ALTER TABLE "ledger_accounts" ADD CONSTRAINT "chk_ledger_accounts_control_version" CHECK ("control_version" >= 0);
+ALTER TABLE "ledger_accounts" ADD CONSTRAINT "chk_ledger_accounts_balance_non_negative" CHECK ("balance" >= 0 OR "kind" <> 'CUSTOMER') NOT VALID;
+ALTER TABLE "ledger_accounts" VALIDATE CONSTRAINT "chk_ledger_accounts_balance_non_negative";
+ALTER TABLE "ledger_accounts" ADD CONSTRAINT "chk_ledger_accounts_balance_cap" CHECK ("balance" <= 900000000000000000 AND "balance" >= -900000000000000000) NOT VALID;
+ALTER TABLE "ledger_accounts" VALIDATE CONSTRAINT "chk_ledger_accounts_balance_cap";
+ALTER TABLE "ledger_accounts" ADD CONSTRAINT "chk_ledger_accounts_control_version" CHECK ("control_version" >= 0) NOT VALID;
+ALTER TABLE "ledger_accounts" VALIDATE CONSTRAINT "chk_ledger_accounts_control_version";
 -- Entry balances can be negative for drawers; customer-account balances are enforced on ledger_accounts
 ALTER TABLE "ledger_entries" DROP CONSTRAINT "chk_ledger_entries_balance_after_non_negative";
-ALTER TABLE "cash_operations" ADD CONSTRAINT "chk_cash_operations_amount_positive" CHECK ("amount" > 0);
+ALTER TABLE "cash_operations" ADD CONSTRAINT "chk_cash_operations_amount_positive" CHECK ("amount" > 0) NOT VALID;
+ALTER TABLE "cash_operations" VALIDATE CONSTRAINT "chk_cash_operations_amount_positive";
 ALTER TABLE "withdrawal_authorizations" ADD CONSTRAINT "chk_withdrawal_authorizations_amount_positive" CHECK ("amount" > 0);
 ALTER TABLE "teller_sessions" ADD CONSTRAINT "chk_teller_sessions_opening_float" CHECK ("opening_float" >= 0);
 -- One drawer per teller

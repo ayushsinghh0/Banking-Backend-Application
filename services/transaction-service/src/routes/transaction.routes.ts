@@ -15,13 +15,15 @@ export function createTransactionRouter(controller: TransactionController, authe
   router.post('/withdrawal-codes', requireRoles('CUSTOMER'), controller.createWithdrawalCode);
 
   // Teller (maker): branch cash, inside a business-day session, never on their own accounts
-  router.post('/teller/sessions/open', requireRoles('TELLER'), controller.openSession);
+  router.post('/teller/sessions/accept', requireRoles('TELLER'), controller.acceptFloat);
   router.post('/teller/sessions/close', requireRoles('TELLER'), controller.closeSession);
   router.post('/deposit', requireRoles('TELLER'), controller.deposit);
   router.post('/withdraw', requireRoles('TELLER'), controller.withdraw);
 
   // Supervisor (checker): approvals and session sign-off
   router.get('/teller/sessions', requireRoles('BANK_ADMIN', 'SUPPORT'), controller.listSessions);
+  router.post('/teller/sessions', requireRoles('BANK_ADMIN'), controller.issueFloat);
+  router.post('/teller/sessions/:id/cancel', requireRoles('BANK_ADMIN'), controller.cancelFloat);
   router.post('/teller/sessions/:id/sign-off', requireRoles('BANK_ADMIN'), controller.signOffSession);
   router.get('/cash-operations', requireRoles('TELLER', 'BANK_ADMIN', 'SUPPORT'), controller.listCashOperations);
   router.post('/cash-operations/:cashOperationId/approve', requireRoles('BANK_ADMIN'), controller.approveCashOperation);

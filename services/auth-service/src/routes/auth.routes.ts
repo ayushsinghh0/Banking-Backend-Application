@@ -43,6 +43,7 @@ export function createAuthRouter(
   router.post('/mfa/setup', limiters.credentials, auth.authenticateForEnrolment, controller.mfaSetup);
   router.post('/mfa/enable', limiters.credentials, auth.authenticateForEnrolment, controller.mfaEnable);
   router.post('/mfa/disable', limiters.credentials, auth.authenticate, controller.mfaDisable);
+  router.post('/mfa/step-up', limiters.credentials, auth.authenticate, controller.mfaStepUp);
   router.post('/staff/activate', limiters.recovery, controller.activateStaff);
 
   // Staff administration (BANK_ADMIN with an MFA session). Staff changes are four-eyes requests.

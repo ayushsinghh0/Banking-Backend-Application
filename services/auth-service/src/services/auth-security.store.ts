@@ -29,14 +29,20 @@ export interface AuthSecurityStore {
   clearAllLoginFailures(email: string): Promise<void>;
   /** Returns true if another email of this kind may be sent to this address now */
   consumeEmailQuota(kind: string, email: string): Promise<boolean>;
-  createMfaChallenge(userId: string, ttlSeconds: number): Promise<string>;
-  /** Atomically counts an attempt; returns the user id if the challenge is valid and under its limit */
-  consumeMfaChallengeAttempt(token: string): Promise<string | null>;
+  /** A challenge remembers the token version at password time, so a reset in between invalidates it */
+  createMfaChallenge(userId: string, tokenVersion: number, ttlSeconds: number): Promise<string>;
+  /** Atomically counts an attempt; returns the challenge if it is valid and under its limit */
+  consumeMfaChallengeAttempt(token: string): Promise<MfaChallenge | null>;
   deleteMfaChallenge(token: string): Promise<void>;
   /** Per-user TOTP failures in a rolling hour; returns the new count */
   recordMfaFailure(userId: string): Promise<number>;
   isMfaLocked(userId: string): Promise<boolean>;
   clearMfaFailures(userId: string): Promise<void>;
+}
+
+export interface MfaChallenge {
+  userId: string;
+  tokenVersion: number;
 }
 
 export interface AuthSecurityConfig {
@@ -125,25 +131,26 @@ export class RedisAuthSecurityStore implements AuthSecurityStore {
     return Number(results?.[0]?.[1] ?? 0) <= this.config.emailsPerHour;
   }
 
-  public async createMfaChallenge(userId: string, ttlSeconds: number): Promise<string> {
+  public async createMfaChallenge(userId: string, tokenVersion: number, ttlSeconds: number): Promise<string> {
     const token = crypto.randomBytes(32).toString('base64url');
     const key = `auth:mfa-challenge:${hash(token)}`;
-    await this.state.multi().hset(key, 'userId', userId, 'attempts', '0').expire(key, ttlSeconds).exec();
+    await this.state.multi().hset(key, 'userId', userId, 'tv', String(tokenVersion), 'attempts', '0').expire(key, ttlSeconds).exec();
     return token;
   }
 
-  public async consumeMfaChallengeAttempt(token: string): Promise<string | null> {
+  public async consumeMfaChallengeAttempt(token: string): Promise<MfaChallenge | null> {
     // Increment-then-check in one atomic step: parallel requests can't all see "0 attempts"
     const result = (await this.state.eval(
       `if redis.call('EXISTS', KEYS[1]) == 0 then return false end
        local n = redis.call('HINCRBY', KEYS[1], 'attempts', 1)
        if n > tonumber(ARGV[1]) then return false end
-       return redis.call('HGET', KEYS[1], 'userId')`,
+       return redis.call('HMGET', KEYS[1], 'userId', 'tv')`,
       1,
       `auth:mfa-challenge:${hash(token)}`,
       String(this.config.maxMfaAttempts)
-    )) as string | null;
-    return result || null;
+    )) as [string | null, string | null] | null;
+    if (!result || !result[0] || result[1] === null) return null;
+    return { userId: result[0], tokenVersion: Number(result[1]) };
   }
 
   public async deleteMfaChallenge(token: string): Promise<void> {
@@ -170,7 +177,7 @@ export class InMemoryAuthSecurityStore implements AuthSecurityStore {
   private readonly globals = new Map<string, number>();
   private readonly known = new Map<string, Set<string>>();
   private readonly quotas = new Map<string, number>();
-  private readonly challenges = new Map<string, { userId: string; attempts: number }>();
+  private readonly challenges = new Map<string, { userId: string; tokenVersion: number; attempts: number }>();
   private readonly mfaFailures = new Map<string, number>();
 
   constructor(
@@ -218,17 +225,17 @@ export class InMemoryAuthSecurityStore implements AuthSecurityStore {
     return next <= this.config.emailsPerHour;
   }
 
-  public async createMfaChallenge(userId: string, _ttlSeconds?: number): Promise<string> {
+  public async createMfaChallenge(userId: string, tokenVersion: number, _ttlSeconds?: number): Promise<string> {
     const token = crypto.randomBytes(32).toString('base64url');
-    this.challenges.set(hash(token), { userId, attempts: 0 });
+    this.challenges.set(hash(token), { userId, tokenVersion, attempts: 0 });
     return token;
   }
 
-  public async consumeMfaChallengeAttempt(token: string): Promise<string | null> {
+  public async consumeMfaChallengeAttempt(token: string): Promise<MfaChallenge | null> {
     const c = this.challenges.get(hash(token));
     if (!c) return null;
     c.attempts++;
-    return c.attempts <= this.config.maxMfaAttempts ? c.userId : null;
+    return c.attempts <= this.config.maxMfaAttempts ? { userId: c.userId, tokenVersion: c.tokenVersion } : null;
   }
 
   public async deleteMfaChallenge(token: string): Promise<void> {

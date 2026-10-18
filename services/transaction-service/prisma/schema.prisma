@@ -12,6 +12,7 @@ enum TransactionType {
   DEPOSIT
   WITHDRAWAL
   TRANSFER
+  CASH_TRANSFER // internal cash movement: vault <-> drawer floats, count differences to suspense
 }
 
 enum TransactionStatus {
@@ -39,8 +40,10 @@ enum OutboxStatus {
 }
 
 enum LedgerAccountKind {
-  CUSTOMER    // customer deposit account (a liability of the bank)
-  TELLER_CASH // a teller's cash drawer (an asset): every cash deposit/withdrawal is double-entry against it
+  CUSTOMER      // customer deposit account (a liability of the bank)
+  TELLER_CASH   // a teller's cash drawer (an asset): every cash deposit/withdrawal is double-entry against it
+  VAULT_CASH    // the branch vault (an asset): issues floats to drawers and receives them back
+  CASH_SUSPENSE // counted shortages (debit) / overages (credit) awaiting investigation
 }
 
 // Authoritative local account representation within the ledger service boundary
@@ -194,9 +197,11 @@ model AuditLog {
 }
 
 enum TellerSessionStatus {
-  OPEN
-  CLOSED      // closing count declared; awaiting supervisor sign-off
-  RECONCILED  // signed off by a different administrator
+  ISSUED      // a supervisor issued the opening float; awaiting the teller's count
+  OPEN        // the teller counted and accepted the float; it is booked vault -> drawer
+  CLOSED      // the teller declared a blind closing count; awaiting the supervisor's blind count
+  RECONCILED  // both counts matched; cash returned to the vault, any difference posted to suspense
+  CANCELLED   // an issued float that was never accepted
 }
 
 // A teller's business day: opening float -> cash operations -> closing count -> supervisor sign-off.
@@ -207,11 +212,13 @@ model TellerSession {
   businessDate    String              @map("business_date") // IST calendar date, YYYY-MM-DD
   drawerAccountId String              @map("drawer_account_id")
   openingFloat    BigInt              @map("opening_float")
-  status          TellerSessionStatus @default(OPEN)
+  issuedBy        String?             @map("issued_by")
+  status          TellerSessionStatus @default(ISSUED)
   declaredClosing BigInt?             @map("declared_closing")
   expectedClosing BigInt?             @map("expected_closing")
   discrepancy     BigInt?
-  openedAt        DateTime            @default(now()) @map("opened_at")
+  openedAt        DateTime            @default(now()) @map("opened_at") // issue time; acceptedAt is when cash duty began
+  acceptedAt      DateTime?           @map("accepted_at")
   closedAt        DateTime?           @map("closed_at")
   signedOffBy     String?             @map("signed_off_by")
   signedOffAt     DateTime?           @map("signed_off_at")
@@ -253,4 +260,13 @@ model Beneficiary {
   @@unique([customerId, accountId])
   @@index([customerId])
   @@map("beneficiaries")
+}
+
+// Leader election for periodic jobs across replicas (see acquireJobLease in @banksphere/common)
+model JobLease {
+  name      String   @id
+  holder    String
+  expiresAt DateTime @map("expires_at")
+
+  @@map("job_leases")
 }

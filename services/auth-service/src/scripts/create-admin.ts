@@ -2,9 +2,12 @@
  * Bootstraps the first BANK_ADMIN account. Public registration can only create CUSTOMER
  * users, so this script (run by an operator with database access) is the root of trust.
  *
- *   ADMIN_EMAIL=ops@bank.example ADMIN_PASSWORD='...' npm run create-admin -w @banksphere/auth-service
+ *   ADMIN_EMAIL=ops@bank.example ADMIN_PASSWORD='...' [ENROLMENT_TOKEN_FILE=/secure/path] npm run create-admin -w @banksphere/auth-service
+ *
+ * Only the first two BANK_ADMINs can be created this way (the minimum for four-eyes administration).
  */
 import 'dotenv/config';
+import fs from 'fs';
 import { PrismaClient } from '../../generated/client';
 import { connectRedis, ConsoleMailer, RedisTokenStateStore, prismaClientOptions } from '@banksphere/common';
 import { AuthService } from '../services/auth.service';
@@ -33,9 +36,17 @@ async function main(): Promise<void> {
     });
     const { user, enrolmentToken } = await authService.createBootstrapAdmin(email, password);
     console.log(`Created BANK_ADMIN ${user.email} (${user.id}).`);
-    console.log('Sign in, then enrol MFA with POST /api/v1/auth/mfa/setup and /mfa/enable using this ONE-TIME enrolment token');
-    console.log(`(valid ${authService.config.enrolmentTtlHours}h; hand it to the administrator out of band):`);
-    console.log(`ENROLMENT_TOKEN=${enrolmentToken}`);
+    console.log('Sign in, then enrol MFA with POST /api/v1/auth/mfa/setup and /mfa/enable using the ONE-TIME enrolment token');
+    console.log(`(valid ${authService.config.enrolmentTtlHours}h; hand it to the administrator out of band).`);
+    const tokenFile = process.env.ENROLMENT_TOKEN_FILE;
+    if (tokenFile) {
+      // Keeps the token out of terminal scrollback and container logs
+      fs.writeFileSync(tokenFile, `${enrolmentToken}
+`, { mode: 0o600, flag: 'wx' });
+      console.log(`Enrolment token written to ${tokenFile} (mode 600).`);
+    } else {
+      console.log(`ENROLMENT_TOKEN=${enrolmentToken}`);
+    }
   } finally {
     await prisma.$disconnect();
     redis.disconnect();

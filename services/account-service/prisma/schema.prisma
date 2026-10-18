@@ -78,3 +78,12 @@ model AuditLog {
   @@index([targetId, createdAt])
   @@map("audit_log")
 }
+
+// Leader election for periodic jobs across replicas (see acquireJobLease in @banksphere/common)
+model JobLease {
+  name      String   @id
+  holder    String
+  expiresAt DateTime @map("expires_at")
+
+  @@map("job_leases")
+}

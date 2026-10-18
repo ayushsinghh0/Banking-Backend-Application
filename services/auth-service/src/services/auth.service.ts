@@ -93,6 +93,7 @@ export interface AuthServiceDeps {
 export const STAFF_ROLES: Role[] = [Role.SUPPORT, Role.TELLER, Role.KYC_OFFICER, Role.FRAUD_ANALYST, Role.BANK_ADMIN];
 
 const INVALID_CREDENTIALS = 'Invalid email or password';
+const BOOTSTRAP_ADMIN_LIMIT = 2;
 const ACCEPTED_MESSAGE =
   'If the address can receive email, a message with further instructions has been sent.';
 const REUSE_MESSAGE =
@@ -273,6 +274,12 @@ export class AuthService {
   public async createBootstrapAdmin(email: string, password: string): Promise<{ user: PublicUser; enrolmentToken: string }> {
     const passwordHash = await PasswordService.hash(password);
     return this.prisma.$transaction(async (tx) => {
+      // Bootstrap only creates the two administrators four-eyes needs; every later one is a four-eyes request
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended('bootstrap-admin', 0))::text`;
+      const admins = await tx.user.count({ where: { role: Role.BANK_ADMIN, isActive: true } });
+      if (admins >= BOOTSTRAP_ADMIN_LIMIT) {
+        throw new ConflictError('Bootstrap is only for the first two administrators; create others with a four-eyes admin request');
+      }
       let user: User;
       try {
         user = await tx.user.create({
@@ -284,6 +291,7 @@ export class AuthService {
       }
       await this.stageUserRegistered(tx, user);
       await this.audit(tx, null, 'BOOTSTRAP_ADMIN_CREATED', user.id);
+      logger.warn({ userId: user.id, alert: 'BOOTSTRAP_ADMIN_CREATED' }, 'A bootstrap administrator was created');
       const enrolmentToken = await this.createEnrolmentToken(tx, user.id, EnrolmentPurpose.MFA_ENROL);
       return { user: { id: user.id, email: user.email, role: user.role }, enrolmentToken };
     });
@@ -376,7 +384,7 @@ export class AuthService {
     }
 
     if (user.mfaEnabled) {
-      const challengeToken = await this.security.createMfaChallenge(user.id, this.config.mfaChallengeTtlSeconds);
+      const challengeToken = await this.security.createMfaChallenge(user.id, user.tokenVersion, this.config.mfaChallengeTtlSeconds);
       return { mfaRequired: true, challengeToken, expiresInSeconds: this.config.mfaChallengeTtlSeconds };
     }
 
@@ -392,8 +400,9 @@ export class AuthService {
    */
   public async completeMfaLogin(challengeToken: string, code: string): Promise<AuthResponse> {
     const invalid = () => new UnauthorizedError('Invalid or expired verification code');
-    const userId = await this.security.consumeMfaChallengeAttempt(challengeToken);
-    if (!userId) throw invalid();
+    const challenge = await this.security.consumeMfaChallengeAttempt(challengeToken);
+    if (!challenge) throw invalid();
+    const { userId } = challenge;
 
     if (await this.security.isMfaLocked(userId)) {
       await this.security.deleteMfaChallenge(challengeToken);
@@ -421,7 +430,8 @@ export class AuthService {
 
     await this.security.deleteMfaChallenge(challengeToken);
     await this.security.clearMfaFailures(user.id);
-    const tokens = await this.startSession(user, true, user.tokenVersion);
+    // Bound to the token version at password time: a reset since then kills this half-finished login
+    const tokens = await this.startSession(user, true, challenge.tokenVersion, true);
     return { user: { id: user.id, email: user.email, role: user.role }, tokens };
   }
 
@@ -566,6 +576,7 @@ export class AuthService {
         where: { id: user.id },
         data: {
           mfaEnabled: true,
+          mfaEnabledAt: new Date(),
           mfaSecretEnc: encryptSecret(secret, user.id),
           mfaPendingSecretEnc: null,
           mfaLastUsedStep: step,
@@ -583,11 +594,38 @@ export class AuthService {
     this.runInBackground('send MFA changed email', () =>
       this.mailer.send(mfaChangedEmail(updated.email, true)).then(() => {})
     );
-    return this.createTokensInFamily(this.prisma, updated, {
-      familyId: actor.sessionId,
-      familyExpiresAt,
-      mfaAuthenticated: true,
-    });
+    // The code just verified is a fresh TOTP check; the factor-age rule still keeps a brand-new factor
+    // from authorising high-risk actions in production
+    return this.createTokensInFamily(
+      this.prisma,
+      updated,
+      { familyId: actor.sessionId, familyExpiresAt, mfaAuthenticated: true },
+      true
+    );
+  }
+
+  /**
+   * Re-verifies the second factor inside an existing MFA session and returns a short-lived access token
+   * marked as recently strongly authenticated (needed for large transfers and instant payees).
+   */
+  public async stepUp(actor: AuthenticatedUser, code: string): Promise<{ accessToken: string; expiresInSeconds: number }> {
+    const user = await this.requireActiveUser(actor.id);
+    if (!actor.mfa || !actor.sessionId || !user.mfaEnabled || !user.mfaSecretEnc) {
+      throw new HttpError(403, 'MFA_REQUIRED', 'Sign in with two-factor authentication first');
+    }
+    if (await this.security.isMfaLocked(user.id)) {
+      throw new HttpError(429, 'MFA_TEMPORARILY_LOCKED', 'Too many failed verification codes. Try again later.');
+    }
+    const step = verifyTotp(decryptSecret(user.mfaSecretEnc, user.id), code);
+    if (step === null || !(await this.consumeTotpStep(user.id, step))) {
+      await this.security.recordMfaFailure(user.id);
+      throw new HttpError(400, 'INVALID_MFA_CODE', 'The verification code is not valid');
+    }
+    await this.security.clearMfaFailures(user.id);
+    const session = await this.prisma.refreshToken.findFirst({ where: { userId: user.id, familyId: actor.sessionId, isRevoked: false } });
+    if (!session) throw new UnauthorizedError('Your session is no longer valid');
+    await this.audit(this.prisma, user.id, 'MFA_STEP_UP', user.id);
+    return { accessToken: this.accessTokenFor(user, actor.sessionId, true, true), expiresInSeconds: this.tokenService.accessTokenTtlSeconds };
   }
 
   /**
@@ -608,7 +646,7 @@ export class AuthService {
     const updated = await this.prisma.$transaction(async (tx) => {
       const result = await tx.user.update({
         where: { id: user.id },
-        data: { mfaEnabled: false, mfaSecretEnc: null, mfaPendingSecretEnc: null, tokenVersion: { increment: 1 } },
+        data: { mfaEnabled: false, mfaEnabledAt: null, mfaSecretEnc: null, mfaPendingSecretEnc: null, tokenVersion: { increment: 1 } },
       });
       await tx.refreshToken.updateMany({ where: { userId: user.id, isRevoked: false }, data: { isRevoked: true } });
       await this.audit(tx, user.id, 'MFA_DISABLED', user.id);
@@ -629,7 +667,7 @@ export class AuthService {
     if (!user) throw new NotFoundError('User not found');
     const result = await tx.user.update({
       where: { id: userId },
-      data: { mfaEnabled: false, mfaSecretEnc: null, mfaPendingSecretEnc: null, mfaLastUsedStep: null, tokenVersion: { increment: 1 } },
+      data: { mfaEnabled: false, mfaEnabledAt: null, mfaSecretEnc: null, mfaPendingSecretEnc: null, mfaLastUsedStep: null, tokenVersion: { increment: 1 } },
     });
     await tx.refreshToken.updateMany({ where: { userId, isRevoked: false }, data: { isRevoked: true } });
     await this.audit(tx, actorId, 'MFA_RESET', userId);
@@ -646,15 +684,14 @@ export class AuthService {
     );
   }
 
-  /** Lost authenticator for a CUSTOMER: one administrator may reset it directly (staff need four-eyes) */
-  public async adminResetCustomerMfa(admin: AuthenticatedUser, userId: string): Promise<void> {
+  /**
+   * Removing anyone's second factor is a takeover primitive (it re-opens password-only access), so it is
+   * always a four-eyes request, for customers as well as staff.
+   */
+  public async adminResetCustomerMfa(_admin: AuthenticatedUser, userId: string): Promise<void> {
     const target = await this.prisma.user.findUnique({ where: { id: userId } });
     if (!target) throw new NotFoundError('User not found');
-    if (isStaffRole(target.role)) {
-      throw new HttpError(409, 'APPROVAL_REQUIRED', 'Resetting MFA for staff requires a four-eyes admin request');
-    }
-    const { user, enrolmentToken } = await this.prisma.$transaction((tx) => this.resetMfaInTx(tx, admin.id, userId));
-    await this.afterMfaReset(user, enrolmentToken);
+    throw new HttpError(409, 'APPROVAL_REQUIRED', 'Resetting MFA requires a four-eyes admin request');
   }
 
   // ---------------------------------------------------------------------------
@@ -850,6 +887,15 @@ export class AuthService {
     if (isStaffRole(target.role)) {
       throw new HttpError(409, 'APPROVAL_REQUIRED', 'Changing a staff account requires a four-eyes admin request');
     }
+    if (isActive && !target.isActive) {
+      const lastDisable = await this.prisma.auditLog.findFirst({
+        where: { targetId: userId, action: 'USER_DISABLED' },
+        orderBy: { createdAt: 'desc' },
+      });
+      if (lastDisable?.actorId === admin.id) {
+        throw new ForbiddenError('A user you disabled must be re-enabled by a different administrator');
+      }
+    }
     const updated = await this.prisma.$transaction((tx) => this.setUserActiveInTx(tx, admin.id, userId, isActive));
     await this.afterUserActiveChange(updated);
     return { id: updated.id, email: updated.email, role: updated.role, isActive: updated.isActive };
@@ -999,34 +1045,47 @@ export class AuthService {
    * row lock and only if the user's token version still equals `expectedVersion` (read before the
    * credential check), so a password reset/disable committing in between can't be outlived by this login.
    */
-  private async startSession(user: User, mfaAuthenticated: boolean, expectedVersion?: number): Promise<GeneratedTokens> {
+  private async startSession(user: User, mfaAuthenticated: boolean, expectedVersion?: number, stepUp = false): Promise<GeneratedTokens> {
     return this.prisma.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM users WHERE id = ${user.id} FOR UPDATE`;
       const fresh = await tx.user.findUniqueOrThrow({ where: { id: user.id } });
       if (!fresh.isActive || (expectedVersion !== undefined && fresh.tokenVersion !== expectedVersion)) {
         throw new UnauthorizedError('Your credentials changed while signing in. Please sign in again.');
       }
-      return this.createTokensInFamily(tx, fresh, {
-        familyId: crypto.randomUUID(),
-        familyExpiresAt: new Date(Date.now() + this.config.sessionMaxDays * 86400_000),
-        mfaAuthenticated,
-      });
+      return this.createTokensInFamily(
+        tx,
+        fresh,
+        {
+          familyId: crypto.randomUUID(),
+          familyExpiresAt: new Date(Date.now() + this.config.sessionMaxDays * 86400_000),
+          mfaAuthenticated,
+        },
+        stepUp
+      );
+    });
+  }
+
+  /** stepUp: this token is issued right after a TOTP verification (recent strong authentication) */
+  private accessTokenFor(user: User, sessionId: string, mfa: boolean, stepUp: boolean): string {
+    return this.tokenService.generateAccessToken({
+      userId: user.id,
+      email: user.email,
+      role: user.role,
+      tokenVersion: user.tokenVersion,
+      mfa,
+      sessionId,
+      stepUpAt: stepUp ? Math.floor(Date.now() / 1000) : undefined,
+      mfaSince: mfa && user.mfaEnabledAt ? Math.floor(user.mfaEnabledAt.getTime() / 1000) : undefined,
     });
   }
 
   private async createTokensInFamily(
     client: Client,
     user: User,
-    family: { familyId: string; familyExpiresAt: Date; mfaAuthenticated: boolean }
+    family: { familyId: string; familyExpiresAt: Date; mfaAuthenticated: boolean },
+    stepUp = false
   ): Promise<GeneratedTokens> {
-    const accessToken = this.tokenService.generateAccessToken({
-      userId: user.id,
-      email: user.email,
-      role: user.role,
-      tokenVersion: user.tokenVersion,
-      mfa: family.mfaAuthenticated,
-      sessionId: family.familyId,
-    });
+    const accessToken = this.accessTokenFor(user, family.familyId, family.mfaAuthenticated, stepUp);
     const rawRefreshToken = this.tokenService.generateRawRefreshToken();
     // Sliding idle timeout, capped by the absolute session lifetime
     const expiresAt = new Date(

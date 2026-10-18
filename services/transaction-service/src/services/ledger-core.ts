@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import { Prisma } from '../../generated/client';
-import { HttpError } from '@banksphere/common';
+import { AuthenticatedUser, HttpError, hasRecentStrongAuth } from '@banksphere/common';
 import { EntryType, TransactionResult, TransactionStatus, TransactionType } from '../types';
 import { DailyLimitExceededError } from '../errors';
 
@@ -8,7 +8,7 @@ export type TxClient = Prisma.TransactionClient;
 
 export interface LockedAccount {
   id: string;
-  kind: 'CUSTOMER' | 'TELLER_CASH';
+  kind: 'CUSTOMER' | 'TELLER_CASH' | 'VAULT_CASH' | 'CASH_SUSPENSE';
   balance: bigint;
   is_active: boolean;
   closed_at: Date | null;
@@ -35,6 +35,12 @@ export interface LedgerPolicy {
   newBeneficiaryLimit: bigint;
   /** Withdrawal authorisation codes expire after this many minutes */
   withdrawalCodeTtlMinutes: number;
+  /** Withdrawal codes at or above this amount need recent strong authentication */
+  withdrawalCodeStepUpThreshold: bigint;
+  /** "Recent" strong authentication: a TOTP code verified within this many seconds */
+  stepUpMaxAgeSeconds: number;
+  /** A newly enrolled second factor only counts for step-up after this many hours */
+  mfaFactorMinAgeHours: number;
 }
 
 export const defaultLedgerPolicy = (): LedgerPolicy => ({
@@ -46,7 +52,25 @@ export const defaultLedgerPolicy = (): LedgerPolicy => ({
   beneficiaryCoolingMinutes: Number(process.env.BENEFICIARY_COOLING_MINUTES ?? 60),
   newBeneficiaryLimit: BigInt(process.env.NEW_BENEFICIARY_LIMIT_PAISE || '5000000'), // ₹50,000
   withdrawalCodeTtlMinutes: Number(process.env.WITHDRAWAL_CODE_TTL_MINUTES || 15),
+  withdrawalCodeStepUpThreshold: BigInt(process.env.WITHDRAWAL_CODE_STEP_UP_PAISE || '2500000'), // ₹25,000
+  stepUpMaxAgeSeconds: Number(process.env.STEP_UP_MAX_AGE_SECONDS || 300),
+  mfaFactorMinAgeHours: Number(process.env.MFA_FACTOR_MIN_AGE_HOURS ?? 24),
 });
+
+/** Recent TOTP verification on an established factor (see hasRecentStrongAuth) */
+export function hasStepUp(actor: AuthenticatedUser, policy: LedgerPolicy): boolean {
+  return hasRecentStrongAuth(actor, {
+    maxAgeSeconds: policy.stepUpMaxAgeSeconds,
+    minFactorAgeSeconds: policy.mfaFactorMinAgeHours * 3600,
+  });
+}
+
+export const stepUpRequired = () =>
+  new HttpError(
+    403,
+    'STEP_UP_REQUIRED',
+    'Confirm this action with your authenticator: POST /api/v1/auth/mfa/step-up, then retry with the new access token'
+  );
 
 /** Hard ceiling on any balance (also a DB CHECK): keeps arithmetic far from BIGINT overflow */
 export const MAX_BALANCE = 900_000_000_000_000_000n;
@@ -189,7 +213,8 @@ export async function audit(
 /**
  * Posts one balanced double-entry movement: `amount` is DEBITED from `debit` and CREDITED to `credit`.
  * Balance semantics: a CUSTOMER account's balance is what the bank owes the customer (credits increase
- * it); a TELLER_CASH drawer's balance is the cash it should hold (debits increase it).
+ * it); every cash account (drawer, vault, suspense) is an asset whose balance is the cash it should hold
+ * (debits increase it). Hence sum(CUSTOMER balances) == sum(cash account balances) at all times.
  */
 export async function postDoubleEntry(
   tx: TxClient,
@@ -201,7 +226,7 @@ export async function postDoubleEntry(
   }
 ): Promise<{ debitBalance: bigint; creditBalance: bigint }> {
   const delta = (account: LockedAccount, side: 'DEBIT' | 'CREDIT') =>
-    (account.kind === 'TELLER_CASH') === (side === 'DEBIT') ? params.amount : -params.amount;
+    (account.kind !== 'CUSTOMER') === (side === 'DEBIT') ? params.amount : -params.amount;
 
   const debitBalance = params.debit.balance + delta(params.debit, 'DEBIT');
   const creditBalance = params.credit.balance + delta(params.credit, 'CREDIT');

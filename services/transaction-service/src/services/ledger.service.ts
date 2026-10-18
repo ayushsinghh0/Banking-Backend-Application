@@ -24,13 +24,18 @@ import {
   audit,
   defaultLedgerPolicy,
   generateReferenceId,
+  hasStepUp,
   lockAccounts,
+  stepUpRequired,
   postDoubleEntry,
   stageTransactionEvent,
   toResult,
 } from './ledger-core';
 
 export { startOfIstDay } from './ledger-core';
+
+const beneficiaryRequired = () =>
+  new HttpError(422, 'BENEFICIARY_REQUIRED', 'Add this account as a beneficiary before sending money to it');
 
 /** The one answer for "this destination can't receive money", whatever the reason */
 const invalidDestination = () =>
@@ -75,12 +80,8 @@ export class LedgerService {
     if (amountInPaise <= 0n) {
       throw new InvalidAmountError();
     }
-    if (amountInPaise >= this.policy.stepUpThreshold && !actor.mfa) {
-      throw new HttpError(
-        403,
-        'STEP_UP_REQUIRED',
-        'Transfers of this size require signing in with two-factor authentication'
-      );
+    if (amountInPaise >= this.policy.stepUpThreshold && !hasStepUp(actor, this.policy)) {
+      throw stepUpRequired();
     }
 
     const referenceId = dto.referenceId || generateReferenceId('TXN-TRF');
@@ -118,7 +119,18 @@ export class LedgerService {
       }
       await assertWithinDailyLimits(tx, sourceAccount, amountInPaise, this.policy);
 
-      // 2. Then the destination, with a single uniform error
+      // 2. Third-party payees must be registered before anything is revealed about them: an unregistered
+      //    number gets the same answer whether it exists, is frozen or was never issued
+      const ownDestination = destAccount?.customer_id === actor.id && destAccount.kind === 'CUSTOMER';
+      const beneficiary =
+        !ownDestination && destinationAccountId
+          ? await tx.beneficiary.findUnique({ where: { customerId_accountId: { customerId: actor.id, accountId: destinationAccountId } } })
+          : null;
+      if (!ownDestination && (!beneficiary || beneficiary.revokedAt)) {
+        throw beneficiaryRequired();
+      }
+
+      // 3. Then the destination itself, with a single uniform error
       if (
         !destAccount ||
         destAccount.kind !== 'CUSTOMER' ||
@@ -132,8 +144,8 @@ export class LedgerService {
         throw invalidDestination();
       }
 
-      // 3. Payee controls for third-party transfers
-      if (destAccount.customer_id !== actor.id) {
+      // 4. Payee controls for third-party transfers
+      if (!ownDestination) {
         await this.assertBeneficiaryAllows(tx, actor.id, destAccount.id, amountInPaise);
       }
 
@@ -173,7 +185,7 @@ export class LedgerService {
     const beneficiary = await tx.beneficiary.findUnique({ where: { customerId_accountId: { customerId, accountId } } });
     const now = Date.now();
     if (!beneficiary || beneficiary.revokedAt) {
-      throw new HttpError(422, 'BENEFICIARY_REQUIRED', 'Add this account as a beneficiary before sending money to it');
+      throw beneficiaryRequired();
     }
     if (beneficiary.activatesAt.getTime() > now) {
       throw new HttpError(422, 'BENEFICIARY_COOLING_OFF', `This beneficiary becomes active at ${beneficiary.activatesAt.toISOString()}`);
@@ -370,7 +382,10 @@ export class LedgerService {
    * 3. zero-sum: total owed to customers equals total cash recorded in teller drawers.
    */
   public async reconcileBalances(): Promise<{ checked: number; mismatches: string[]; unbalancedTransactions: number; zeroSumDelta: string }> {
-    const rows = await this.prisma.$queryRaw<Array<{ id: string }>>`
+    // One REPEATABLE READ snapshot, so all three checks see the same instant even while money moves
+    return this.prisma.$transaction(
+      async (tx) => {
+    const rows = await tx.$queryRaw<Array<{ id: string }>>`
       SELECT a.id
       FROM ledger_accounts a
       LEFT JOIN (
@@ -378,17 +393,17 @@ export class LedgerService {
                SUM(CASE WHEN entry_type = 'CREDIT' THEN amount ELSE -amount END) AS net_credit
         FROM ledger_entries GROUP BY account_id
       ) e ON e.account_id = a.id
-      WHERE a.balance <> CASE WHEN a.kind = 'TELLER_CASH' THEN -COALESCE(e.net_credit, 0) ELSE COALESCE(e.net_credit, 0) END
+      WHERE a.balance <> CASE WHEN a.kind = 'CUSTOMER' THEN COALESCE(e.net_credit, 0) ELSE -COALESCE(e.net_credit, 0) END
     `;
-    const [{ unbalanced }] = await this.prisma.$queryRaw<Array<{ unbalanced: bigint }>>`
+    const [{ unbalanced }] = await tx.$queryRaw<Array<{ unbalanced: bigint }>>`
       SELECT count(*)::bigint AS unbalanced FROM (
         SELECT transaction_id FROM ledger_entries GROUP BY transaction_id
         HAVING SUM(CASE WHEN entry_type = 'DEBIT' THEN amount ELSE 0 END) <> SUM(CASE WHEN entry_type = 'CREDIT' THEN amount ELSE 0 END)
       ) x
     `;
-    const [{ customers, drawers, count }] = await this.prisma.$queryRaw<Array<{ customers: bigint | null; drawers: bigint | null; count: bigint }>>`
+    const [{ customers, drawers, count }] = await tx.$queryRaw<Array<{ customers: bigint | null; drawers: bigint | null; count: bigint }>>`
       SELECT SUM(CASE WHEN kind = 'CUSTOMER' THEN balance ELSE 0 END)::bigint AS customers,
-             SUM(CASE WHEN kind = 'TELLER_CASH' THEN balance ELSE 0 END)::bigint AS drawers,
+             SUM(CASE WHEN kind <> 'CUSTOMER' THEN balance ELSE 0 END)::bigint AS drawers,
              count(*)::bigint AS count
       FROM ledger_accounts
     `;
@@ -401,5 +416,9 @@ export class LedgerService {
       );
     }
     return { checked: Number(count), mismatches, unbalancedTransactions: Number(unbalanced), zeroSumDelta: zeroSumDelta.toString() };
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead, timeout: 120_000, maxWait: 10_000 }
+    );
   }
+
 }

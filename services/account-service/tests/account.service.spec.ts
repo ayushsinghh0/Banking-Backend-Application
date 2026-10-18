@@ -44,13 +44,13 @@ describe('AccountService (Account Lifecycle, Numbers, and Ownership)', () => {
           calls.push('db');
           return account(data);
         }),
-        updateMany: jest.fn(() => {
-          calls.push('db');
+        updateMany: jest.fn(({ data }: any) => {
+          calls.push(data?.version?.increment ? 'reserve-version' : 'db');
           return { count: 1 };
         }),
       },
       outboxEvent: { create: jest.fn() },
-      auditLog: { create: jest.fn() },
+      auditLog: { create: jest.fn(), findFirst: jest.fn().mockResolvedValue(null) },
       $queryRaw: jest.fn().mockResolvedValue([]),
     };
     mockPrisma.$transaction = jest.fn((cb: any) => cb(mockPrisma));
@@ -130,7 +130,9 @@ describe('AccountService (Account Lifecycle, Numbers, and Ownership)', () => {
       mockPrisma.bankAccount.findUnique.mockResolvedValue(account());
       mockPrisma.bankAccount.findUniqueOrThrow.mockResolvedValue(account({ status: AccountStatus.FROZEN }));
       await accountService.updateAccountStatus('acc-1', AccountStatus.FROZEN, alice);
-      expect(calls).toEqual(['ledger', 'db']);
+      expect(calls).toEqual(['reserve-version', 'ledger', 'db']);
+      // The ledger gets the freshly reserved version, never one another writer could also be using
+      expect(mockLedger.updateAccount).toHaveBeenCalledWith('acc-1', expect.objectContaining({ isActive: false, version: 4 }));
       expect(mockPrisma.auditLog.create).toHaveBeenCalled();
     });
 
@@ -138,7 +140,30 @@ describe('AccountService (Account Lifecycle, Numbers, and Ownership)', () => {
       mockPrisma.bankAccount.findUnique.mockResolvedValue(account({ status: AccountStatus.FROZEN }));
       mockPrisma.bankAccount.findUniqueOrThrow.mockResolvedValue(account());
       await accountService.updateAccountStatus('acc-1', AccountStatus.ACTIVE, admin);
-      expect(calls).toEqual(['db', 'ledger']);
+      expect(calls).toEqual(['reserve-version', 'db', 'ledger']);
+    });
+
+    it('VERSION RACE: a concurrent writer that already took the next version makes this change fail, not collide', async () => {
+      mockPrisma.bankAccount.findUnique.mockResolvedValue(account());
+      mockPrisma.bankAccount.updateMany.mockImplementationOnce(() => ({ count: 0 }));
+      await expect(accountService.updateAccountStatus('acc-1', AccountStatus.FROZEN, admin)).rejects.toThrow(ConflictError);
+      expect(mockLedger.updateAccount).not.toHaveBeenCalled();
+    });
+
+    it('a ledger push that was not applied is a failure, never a silent success', async () => {
+      mockPrisma.bankAccount.findUnique.mockResolvedValue(account());
+      mockLedger.updateAccount.mockResolvedValue({ applied: false });
+      await expect(accountService.updateAccountStatus('acc-1', AccountStatus.FROZEN, admin)).rejects.toThrow(ConflictError);
+      expect(calls).not.toContain('db');
+    });
+
+    it('DUAL CONTROL: an admin who froze an account cannot unfreeze it; another admin can', async () => {
+      mockPrisma.bankAccount.findUnique.mockResolvedValue(account({ status: AccountStatus.FROZEN }));
+      mockPrisma.bankAccount.findUniqueOrThrow.mockResolvedValue(account());
+      mockPrisma.auditLog.findFirst.mockResolvedValue({ actorId: 'admin-user-id', action: 'ACCOUNT_STATUS_CHANGED' });
+      await expect(accountService.updateAccountStatus('acc-1', AccountStatus.ACTIVE, admin)).rejects.toThrow(ForbiddenError);
+      const admin2 = { ...admin, id: 'admin-2' };
+      await expect(accountService.updateAccountStatus('acc-1', AccountStatus.ACTIVE, admin2)).resolves.toBeDefined();
     });
 
     it('SELF-UNFREEZE: a customer cannot unfreeze an account frozen by the bank', async () => {
@@ -156,7 +181,8 @@ describe('AccountService (Account Lifecycle, Numbers, and Ownership)', () => {
       mockPrisma.bankAccount.findUnique.mockResolvedValue(account());
       mockLedger.closeAccount.mockRejectedValue(new HttpError(409, 'BALANCE_NOT_ZERO', 'Account balance must be zero'));
       await expect(accountService.updateAccountStatus('acc-1', AccountStatus.CLOSED, admin)).rejects.toThrow('balance must be zero');
-      expect(mockPrisma.bankAccount.updateMany).not.toHaveBeenCalled();
+      // Only the version was reserved; the account was never marked closed
+      expect(calls).toEqual(['reserve-version']);
     });
   });
 
@@ -164,7 +190,12 @@ describe('AccountService (Account Lifecycle, Numbers, and Ownership)', () => {
     it('lowering hits the ledger first; customers are capped; admins on their own account are capped too', async () => {
       mockPrisma.bankAccount.findUnique.mockResolvedValue(account());
       await accountService.updateDailyLimit('acc-1', 50000n, alice);
-      expect(calls).toEqual(['ledger', 'db']);
+      expect(calls).toEqual(['reserve-version', 'ledger', 'db']);
+
+      // Setting the current value again is a no-op (it used to push a "lowering" to the ledger)
+      calls.length = 0;
+      await accountService.updateDailyLimit('acc-1', 10000000n, alice);
+      expect(calls).toEqual([]);
 
       await expect(accountService.updateDailyLimit('acc-1', 999999999999n, alice)).rejects.toThrow(ForbiddenError);
       mockPrisma.bankAccount.findUnique.mockResolvedValue(account({ customerId: 'admin-user-id' }));
@@ -192,6 +223,24 @@ describe('AccountService (Account Lifecycle, Numbers, and Ownership)', () => {
       const result = await accountService.reconcileWithLedger();
       expect(result.repaired).toBe(0);
       expect(mockLedger.updateAccount).not.toHaveBeenCalled();
+    });
+
+    it('SAME VERSION, LEDGER STRICTER: never loosened automatically (alert instead)', async () => {
+      mockPrisma.bankAccount.findMany.mockResolvedValueOnce([account({ status: AccountStatus.ACTIVE })]).mockResolvedValue([]);
+      mockLedger.getAccounts.mockResolvedValue([
+        { id: 'acc-1', isActive: false, closed: false, dailyLimitPaise: '10000000', balanceInPaise: '0', controlVersion: 3 },
+      ]);
+      expect((await accountService.reconcileWithLedger()).repaired).toBe(0);
+      expect(mockLedger.updateAccount).not.toHaveBeenCalled();
+    });
+
+    it('SAME VERSION, LEDGER LOOSER: repaired with a freshly reserved version', async () => {
+      mockPrisma.bankAccount.findMany.mockResolvedValueOnce([account({ status: AccountStatus.FROZEN })]).mockResolvedValue([]);
+      mockLedger.getAccounts.mockResolvedValue([
+        { id: 'acc-1', isActive: true, closed: false, dailyLimitPaise: '10000000', balanceInPaise: '0', controlVersion: 3 },
+      ]);
+      expect((await accountService.reconcileWithLedger()).repaired).toBe(1);
+      expect(mockLedger.updateAccount).toHaveBeenCalledWith('acc-1', { isActive: false, dailyLimitPaise: '10000000', version: 4 });
     });
 
     it('counts a push the ledger ignored as not repaired', async () => {

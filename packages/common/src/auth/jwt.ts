@@ -27,6 +27,10 @@ export interface AuthenticatedUser {
   mfa?: boolean;
   /** Session (refresh-token family) id this access token belongs to */
   sessionId?: string;
+  /** Unix seconds of the TOTP verification that issued this token (absent on refreshed tokens) */
+  stepUpAt?: number;
+  /** Unix seconds when the user's current second factor was enrolled */
+  mfaSince?: number;
 }
 
 export interface AccessTokenClaims {
@@ -36,6 +40,23 @@ export interface AccessTokenClaims {
   tokenVersion: number;
   mfa: boolean;
   sessionId: string;
+  stepUpAt?: number;
+  mfaSince?: number;
+}
+
+/**
+ * Strong, RECENT customer authentication for high-risk actions (large transfers, instant payees, large
+ * withdrawal codes): a TOTP code verified within `maxAgeSeconds`, on a factor enrolled at least
+ * `minFactorAgeSeconds` ago, so neither a stolen long-lived session nor a factor an attacker has just
+ * enrolled with a phished password is enough.
+ */
+export function hasRecentStrongAuth(
+  user: AuthenticatedUser,
+  opts: { maxAgeSeconds: number; minFactorAgeSeconds: number },
+  nowSeconds = Math.floor(Date.now() / 1000)
+): boolean {
+  if (!user.mfa || user.stepUpAt === undefined || user.mfaSince === undefined) return false;
+  return nowSeconds - user.stepUpAt <= opts.maxAgeSeconds && nowSeconds - user.mfaSince >= opts.minFactorAgeSeconds;
 }
 
 /**
@@ -126,7 +147,15 @@ export function signAccessToken(
 ): string {
   const { kid, key } = getSigningKey();
   return jwt.sign(
-    { email: claims.email, role: claims.role, tv: claims.tokenVersion, mfa: claims.mfa, sid: claims.sessionId },
+    {
+      email: claims.email,
+      role: claims.role,
+      tv: claims.tokenVersion,
+      mfa: claims.mfa,
+      sid: claims.sessionId,
+      ...(claims.stepUpAt !== undefined ? { sua: claims.stepUpAt } : {}),
+      ...(claims.mfaSince !== undefined ? { mfs: claims.mfaSince } : {}),
+    },
     key,
     {
       algorithm: JWT_ALGORITHM,
@@ -168,7 +197,9 @@ export function verifyAccessToken(token: string): AuthenticatedUser {
     !Number.isInteger(decoded.tv) ||
     typeof decoded.mfa !== 'boolean' ||
     typeof decoded.sid !== 'string' ||
-    typeof decoded.exp !== 'number'
+    typeof decoded.exp !== 'number' ||
+    (decoded.sua !== undefined && !Number.isInteger(decoded.sua)) ||
+    (decoded.mfs !== undefined && !Number.isInteger(decoded.mfs))
   ) {
     throw new UnauthorizedError('Malformed access token claims');
   }
@@ -182,6 +213,8 @@ export function verifyAccessToken(token: string): AuthenticatedUser {
     expiresAt: decoded.exp,
     mfa: decoded.mfa,
     sessionId: decoded.sid,
+    stepUpAt: decoded.sua,
+    mfaSince: decoded.mfs,
   };
 }
 

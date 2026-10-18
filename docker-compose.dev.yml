@@ -55,6 +55,12 @@ services:
     depends_on:
       mailpit: { condition: service_started }
 
+  transaction-service:
+    environment:
+      # Lets a just-enrolled authenticator count for step-up so the e2e suite can test instant flows
+      # (production: a factor must be 24h old before it can authorise large transfers or instant payees)
+      MFA_FACTOR_MIN_AGE_HOURS: "0"
+
   notification-service:
     environment:
       SMTP_HOST: mailpit

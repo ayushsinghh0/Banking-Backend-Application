@@ -9,7 +9,7 @@ export interface KafkaConfig {
 export interface SubscribeOptions {
   /** Attempts for a message that keeps failing with a NON-transient error before it is dead-lettered */
   maxAttempts?: number;
-  /** How long a transient failure is retried in place before the message moves to `<topic>.retry` */
+  /** How long a transient failure is retried in place before the message moves to `<topic>.retry` (default 15s) */
   transientBudgetMs?: number;
   /** Delays (ms) for successive hops through `<topic>.retry`; after the last one the message is dead-lettered */
   retryDelaysMs?: number[];
@@ -151,13 +151,14 @@ export class KafkaService {
   }
 
   /**
-   * Subscribes with manual offset commits and keeps the consumer alive: if it cannot connect or
-   * crashes with a non-retriable error, it is restarted with backoff (never silently left dead).
-   *
-   * Per message:
-   * - success                    -> commit
-   * - transient failure          -> retry with backoff until it succeeds (heartbeating meanwhile)
-   * - persistent/poison failure  -> `maxAttempts` tries, then `<topic>.dlq` and commit
+   * Subscribes with manual offset commits and keeps the consumers alive (restarted with backoff, never
+   * silently left dead). Two consumer groups run per subscription:
+   * - `groupId` on the main topics: a transient failure is retried in place only briefly; if the
+   *   dependency stays down the message is parked on `<topic>.retry` and the partition moves on. While a
+   *   dependency is known to be down (circuit open), failing messages are parked after a single try.
+   * - `groupId.retry` on the `<topic>.retry` topics: a message that is not due yet pauses its partition
+   *   (no sleeping inside the handler), and is retried when due; after the last hop it is dead-lettered.
+   * Persistent/poison failures: `maxAttempts` tries, then `<topic>.dlq`.
    */
   public subscribe(
     groupId: string,
@@ -165,11 +166,22 @@ export class KafkaService {
     messageHandler: (topic: string, payload: any, correlationId?: string) => Promise<void>,
     options: SubscribeOptions = {}
   ): void {
+    this.startConsumer(groupId, topics, messageHandler, options, 'main');
+    this.startConsumer(`${groupId}.retry`, topics.map((t) => `${t}.retry`), messageHandler, options, 'retry');
+  }
+
+  private startConsumer(
+    groupId: string,
+    topics: string[],
+    messageHandler: (topic: string, payload: any, correlationId?: string) => Promise<void>,
+    options: SubscribeOptions,
+    mode: 'main' | 'retry'
+  ): void {
     this.consumerState.set(groupId, 'starting');
     let attempt = 0;
     const startOnce = async (): Promise<void> => {
       try {
-        await this.runConsumer(groupId, topics, messageHandler, options);
+        await this.runConsumer(groupId, topics, messageHandler, options, mode);
         attempt = 0;
       } catch (err) {
         if (this.stopping) return;
@@ -187,12 +199,15 @@ export class KafkaService {
     groupId: string,
     topics: string[],
     messageHandler: (topic: string, payload: any, correlationId?: string) => Promise<void>,
-    options: SubscribeOptions
+    options: SubscribeOptions,
+    mode: 'main' | 'retry'
   ): Promise<void> {
     const maxAttempts = options.maxAttempts ?? 5;
-    const transientBudgetMs = options.transientBudgetMs ?? Number(process.env.KAFKA_TRANSIENT_BUDGET_MS || 120_000);
+    const transientBudgetMs = options.transientBudgetMs ?? Number(process.env.KAFKA_TRANSIENT_BUDGET_MS || 15_000);
     const retryDelaysMs = options.retryDelaysMs ?? DEFAULT_RETRY_DELAYS_MS;
     const consumer = this.kafka.consumer({ groupId, sessionTimeout: 30_000, heartbeatInterval: 3_000 });
+    // Circuit breaker: after a message exhausted its transient budget, assume the dependency is down
+    let circuitOpenUntil = 0;
 
     consumer.on(consumer.events.CRASH, (event) => {
       if (this.stopping) return;
@@ -203,12 +218,11 @@ export class KafkaService {
         return;
       }
       // KafkaJS gave up: restart it ourselves
-      this.consumerState.set(groupId, 'crashed');
       logger.error({ groupId, err: event.payload.error }, 'Kafka consumer crashed permanently; restarting');
       this.consumers = this.consumers.filter((c) => c !== consumer);
       consumer.disconnect().catch(() => {});
       setTimeout(() => {
-        if (!this.stopping) this.subscribe(groupId, topics, messageHandler, options);
+        if (!this.stopping) this.startConsumer(groupId, topics, messageHandler, options, mode);
       }, 5_000).unref();
     });
     consumer.on(consumer.events.GROUP_JOIN, () => this.consumerState.set(groupId, 'running'));
@@ -220,11 +234,12 @@ export class KafkaService {
       // fromBeginning only matters for a brand-new consumer group: it must not miss events published
       // before its first start. Handlers are idempotent (processed-event tables), so a replay is safe.
       await consumer.subscribe({ topic, fromBeginning: process.env.KAFKA_FROM_BEGINNING !== 'false' });
-      await consumer.subscribe({ topic: `${topic}.retry`, fromBeginning: process.env.KAFKA_FROM_BEGINNING !== 'false' });
     }
 
     await consumer.run({
       autoCommit: false,
+      // Partitions are independent (ordering is per key, i.e. per partition), so process them in parallel
+      partitionsConsumedConcurrently: Number(process.env.KAFKA_PARTITIONS_CONCURRENCY || 3),
       eachMessage: async ({ topic, partition, message, heartbeat }: EachMessagePayload) => {
         const commit = () =>
           consumer.commitOffsets([{ topic, partition, offset: (BigInt(message.offset) + 1n).toString() }]);
@@ -244,28 +259,33 @@ export class KafkaService {
           return;
         }
 
-        const commitAndReturn = async () => {
-          await commit();
-        };
-
-        // Messages on a retry topic are delayed: wait (heartbeating) until they are due
         let originalTopic = topic;
         let payload: any = parsed;
         let hop = 0;
-        if (topic.endsWith('.retry') && parsed?.__retry === 1) {
+        if (mode === 'retry') {
+          if (parsed?.__retry !== 1) {
+            await this.sendToDlq(topic, message.key?.toString(), rawValue, 'Not a retry envelope');
+            await commit();
+            return;
+          }
           const envelope = parsed as RetryEnvelope;
           originalTopic = envelope.originalTopic;
           payload = envelope.payload;
           hop = envelope.hop;
-          while (Date.now() < envelope.retryAt) {
-            if (this.stopping) throw new Error('Consumer stopping; message will be redelivered');
-            await new Promise((r) => setTimeout(r, Math.min(1_000, envelope.retryAt - Date.now())));
-            await heartbeat().catch(() => {});
+          const waitMs = envelope.retryAt - Date.now();
+          if (waitMs > 0) {
+            // Not due yet: rewind to this message, pause the partition and resume when it is due
+            consumer.seek({ topic, partition, offset: message.offset });
+            consumer.pause([{ topic, partitions: [partition] }]);
+            setTimeout(() => consumer.resume([{ topic, partitions: [partition] }]), Math.min(waitMs, 60_000)).unref();
+            return;
           }
         }
 
         const correlationId = payload?.correlationId || message.headers?.['x-correlation-id']?.toString();
-        const transientDeadline = Date.now() + transientBudgetMs;
+        // With the circuit open the dependency is known to be down: one try, then park
+        const budget = Date.now() < circuitOpenUntil ? 0 : transientBudgetMs;
+        const transientDeadline = Date.now() + budget;
 
         let failures = 0;
         let transientRetries = 0;
@@ -274,7 +294,8 @@ export class KafkaService {
           if (this.stopping) throw new Error('Consumer stopping; message will be redelivered');
           try {
             await messageHandler(originalTopic, payload, correlationId);
-            await commitAndReturn();
+            circuitOpenUntil = 0;
+            await commit();
             return;
           } catch (error) {
             lastError = error;
@@ -287,6 +308,7 @@ export class KafkaService {
             );
             if (!transient && failures >= maxAttempts) break;
             if (transient && Date.now() >= transientDeadline) {
+              circuitOpenUntil = Date.now() + 30_000;
               // Don't block the partition: park the message on the retry topic and move on
               if (hop < retryDelaysMs.length) {
                 const envelope: RetryEnvelope = {
@@ -299,24 +321,21 @@ export class KafkaService {
                 };
                 await this.publishEvent(`${originalTopic}.retry`, message.key?.toString() || 'unknown', envelope);
                 logger.warn({ topic: originalTopic, hop: hop + 1 }, 'Message moved to retry topic after transient failures');
-                await commitAndReturn();
+                await commit();
                 return;
               }
               break; // retry hops exhausted: dead-letter
             }
             const delay = transient
-              ? Math.min(500 * 2 ** Math.min(transientRetries, 6), 30_000)
+              ? Math.min(500 * 2 ** Math.min(transientRetries, 6), 5_000)
               : Math.min(200 * 2 ** failures, 5_000);
-            // Sleep in short slices and heartbeat, so a long outage doesn't trigger a rebalance
-            for (let waited = 0; waited < delay; waited += 1_000) {
-              await new Promise((r) => setTimeout(r, Math.min(1_000, delay - waited)));
-              await heartbeat().catch(() => {});
-            }
+            await new Promise((r) => setTimeout(r, delay));
+            await heartbeat().catch(() => {});
           }
         }
 
         await this.sendToDlq(originalTopic, message.key?.toString(), JSON.stringify(payload), String((lastError as any)?.message ?? lastError));
-        await commitAndReturn();
+        await commit();
       },
     });
 

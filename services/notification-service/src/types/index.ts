@@ -34,6 +34,14 @@ export interface AccountStatusChangedEvent extends BaseEvent {
   status: string;
 }
 
+export interface WithdrawalCodeCreatedEvent extends BaseEvent {
+  eventType: 'withdrawal.code.created.v1';
+  customerId: string;
+  accountId: string;
+  amountInPaise: string;
+  expiresAt: string;
+}
+
 export interface UserRegisteredEvent extends BaseEvent {
   eventType: 'user.registered.v1';
   userId: string;

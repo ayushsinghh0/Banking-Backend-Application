@@ -73,6 +73,8 @@ SMTP_REQUIRE_TLS=false
 MAIL_FROM="BankSphere <no-reply@banksphere.local>"
 SECURITY_ALERT_EMAIL=security-team@banksphere.local
 STAFF_EMAIL_DOMAIN=banksphere.local
+GATEWAY_TRUST_PROXY=0
+STAFF_ALLOWED_CIDRS=127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1/128
 `
   );
 } else {
@@ -84,6 +86,8 @@ STAFF_EMAIL_DOMAIN=banksphere.local
     ['REDIS_CUSTOMER_PASSWORD', secret()],
     ['REDIS_READER_PASSWORD', secret()],
     ['STAFF_EMAIL_DOMAIN', 'banksphere.local'],
+    ['GATEWAY_TRUST_PROXY', '0'],
+    ['STAFF_ALLOWED_CIDRS', '127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1/128'],
   ].filter(([k]) => !new RegExp(`^${k}=`, 'm').test(existing));
   if (added.length) {
     fs.appendFileSync(rootEnvFile, `${existing.endsWith('\n') ? '' : '\n'}${added.map(([k, v]) => `${k}=${v}`).join('\n')}\n`);
@@ -132,7 +136,7 @@ const services = {
   'auth-service': `PORT=8001\nKAFKA_CLIENT_ID=auth-service\n${redis('auth-svc', 'REDIS_AUTH_PASSWORD')}RATE_LIMIT_REDIS_URL="redis://:${env.RATE_LIMIT_REDIS_PASSWORD}@127.0.0.1:6381"\nSTAFF_EMAIL_DOMAIN=${env.STAFF_EMAIL_DOMAIN}\n${kafka('auth-svc', 'KAFKA_AUTH_PASSWORD')}${db('AUTH', 'auth_schema')}\nJWT_SIGNING_KEY="${env.JWT_SIGNING_KEY}"\nJWT_SIGNING_KEY_ID=${env.JWT_SIGNING_KEY_ID}\nJWT_ACCESS_EXPIRATION=${env.JWT_ACCESS_EXPIRATION}\nJWT_REFRESH_EXPIRATION_DAYS=${env.JWT_REFRESH_EXPIRATION_DAYS}\nMFA_ENCRYPTION_KEY=${env.MFA_ENCRYPTION_KEY}\nAPP_BASE_URL=${env.APP_BASE_URL}\n${smtp}# Relaxed per-IP limits so the local e2e suite can be re-run (production defaults: 30 / 10 per 15 min)\nAUTH_RATE_LIMIT_MAX=500\nAUTH_RECOVERY_RATE_LIMIT_MAX=500\n`,
   'customer-service': `PORT=8002\n${redis('customer-svc', 'REDIS_CUSTOMER_PASSWORD')}${db('CUSTOMER', 'customer_schema')}\nCUSTOMER_INTERNAL_TOKEN="${env.CUSTOMER_INTERNAL_TOKEN}"\n`,
   'account-service': `PORT=8003\n${reader}KAFKA_CLIENT_ID=account-service\n${kafka('account-svc', 'KAFKA_ACCOUNT_PASSWORD')}LEDGER_SERVICE_URL=http://localhost:8004\nCUSTOMER_SERVICE_URL=http://localhost:8002\n${db('ACCOUNT', 'account_schema')}\nLEDGER_INTERNAL_TOKEN="${env.LEDGER_INTERNAL_TOKEN}"\nCUSTOMER_INTERNAL_TOKEN="${env.CUSTOMER_INTERNAL_TOKEN}"\n`,
-  'transaction-service': `PORT=8004\n${reader}KAFKA_CLIENT_ID=transaction-service\n${kafka('ledger-svc', 'KAFKA_LEDGER_PASSWORD')}${db('LEDGER', 'ledger_schema')}\nLEDGER_INTERNAL_TOKEN="${env.LEDGER_INTERNAL_TOKEN}"\n`,
+  'transaction-service': `PORT=8004\n${reader}# Dev only: a just-enrolled authenticator counts for step-up (production: 24h)\nMFA_FACTOR_MIN_AGE_HOURS=0\nKAFKA_CLIENT_ID=transaction-service\n${kafka('ledger-svc', 'KAFKA_LEDGER_PASSWORD')}${db('LEDGER', 'ledger_schema')}\nLEDGER_INTERNAL_TOKEN="${env.LEDGER_INTERNAL_TOKEN}"\n`,
   'notification-service': `PORT=8005\n${reader}KAFKA_CLIENT_ID=notification-service\n${kafka('notification-svc', 'KAFKA_NOTIFICATION_PASSWORD')}SECURITY_ALERT_EMAIL=${env.SECURITY_ALERT_EMAIL}\n${db('NOTIFICATION', 'notification_schema')}\n${smtp}`,
   'fraud-service': `PORT=8006\n${reader}KAFKA_CLIENT_ID=fraud-service\n${kafka('fraud-svc', 'KAFKA_FRAUD_PASSWORD')}${db('FRAUD', 'fraud_schema')}\n`,
 };
@@ -150,6 +154,7 @@ LOG_LEVEL=info
 REDIS_URL="redis://:${env.RATE_LIMIT_REDIS_PASSWORD}@127.0.0.1:6381"
 # Relaxed so the e2e suite can be re-run back to back (production default: 300 per minute per IP)
 GATEWAY_RATE_LIMIT_PER_MINUTE=5000
+STAFF_ALLOWED_CIDRS=${env.STAFF_ALLOWED_CIDRS}
 CORS_ORIGINS=${env.CORS_ORIGINS}
 AUTH_SERVICE_URL=http://localhost:8001
 CUSTOMER_SERVICE_URL=http://localhost:8002

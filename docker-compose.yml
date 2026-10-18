@@ -224,13 +224,14 @@ services:
       NODE_ENV: production
       LOG_LEVEL: ${LOG_LEVEL:-info}
       PORT: 8000
-      # Leave empty unless a load balancer that OVERWRITES X-Forwarded-For sits in front (then: hop count)
-      TRUST_PROXY: ${GATEWAY_TRUST_PROXY:-}
+      # Number of proxies in front that OVERWRITE X-Forwarded-For (0 = none). Required: a wrong value breaks
+      # per-IP limits and lockouts for everyone, so the gateway refuses to start without it.
+      TRUST_PROXY: ${GATEWAY_TRUST_PROXY:?set GATEWAY_TRUST_PROXY in .env (0 if nothing sits in front of the gateway)}
       REDIS_URL: redis://:${RATE_LIMIT_REDIS_PASSWORD}@redis-ratelimit:6379
       CORS_ORIGINS: ${CORS_ORIGINS:-}
       GATEWAY_RATE_LIMIT_PER_MINUTE: ${GATEWAY_RATE_LIMIT_PER_MINUTE:-300}
-      # Comma-separated CIDRs (VPN/office) allowed to call staff-only APIs; empty = no network restriction
-      STAFF_ALLOWED_CIDRS: ${STAFF_ALLOWED_CIDRS:-}
+      # Comma-separated CIDRs (VPN/office) allowed to call staff-only APIs (required in production)
+      STAFF_ALLOWED_CIDRS: ${STAFF_ALLOWED_CIDRS:?set STAFF_ALLOWED_CIDRS in .env}
       AUTH_SERVICE_URL: http://auth-service:8001
       CUSTOMER_SERVICE_URL: http://customer-service:8002
       ACCOUNT_SERVICE_URL: http://account-service:8003
@@ -257,7 +258,7 @@ services:
       REDIS_URL: redis://auth-svc:${REDIS_AUTH_PASSWORD}@redis:6379
       # Login/recovery counters live in the evictable rate-limit Redis, never in the security store
       RATE_LIMIT_REDIS_URL: redis://:${RATE_LIMIT_REDIS_PASSWORD}@redis-ratelimit:6379
-      STAFF_EMAIL_DOMAIN: ${STAFF_EMAIL_DOMAIN:-}
+      STAFF_EMAIL_DOMAIN: ${STAFF_EMAIL_DOMAIN:?set STAFF_EMAIL_DOMAIN in .env}
       KAFKA_CLIENT_ID: auth-service
       DATABASE_URL: postgresql://auth_app:${AUTH_DB_APP_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=auth_schema
       JWT_SIGNING_KEY: ${JWT_SIGNING_KEY:?set JWT_SIGNING_KEY in .env}

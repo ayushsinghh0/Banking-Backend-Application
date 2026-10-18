@@ -1,6 +1,6 @@
 import { PrismaClient } from '../../generated/client';
 import { AuthenticatedUser, ConflictError, HttpError, NotFoundError, RateLimitExceededError } from '@banksphere/common';
-import { LedgerPolicy, audit, defaultLedgerPolicy } from './ledger-core';
+import { LedgerPolicy, audit, defaultLedgerPolicy, hasStepUp } from './ledger-core';
 
 const MAX_NEW_BENEFICIARIES_PER_DAY = Number(process.env.MAX_NEW_BENEFICIARIES_PER_DAY || 10);
 
@@ -32,12 +32,15 @@ export class BeneficiaryService {
       throw new HttpError(400, 'OWN_ACCOUNT', 'Your own accounts do not need to be added as beneficiaries');
     }
 
-    const activatesAt = customer.mfa ? new Date() : new Date(Date.now() + this.policy.beneficiaryCoolingMinutes * 60_000);
+    // Immediate only with recent strong authentication on an established factor
+    const activatesAt = hasStepUp(customer, this.policy)
+      ? new Date()
+      : new Date(Date.now() + this.policy.beneficiaryCoolingMinutes * 60_000);
     try {
       const beneficiary = await this.prisma.beneficiary.create({
         data: { customerId: customer.id, accountId: target.id, accountNumber, nickname, activatesAt },
       });
-      await audit(this.prisma, customer.id, 'BENEFICIARY_ADDED', beneficiary.id, { accountNumber, mfa: Boolean(customer.mfa) });
+      await audit(this.prisma, customer.id, 'BENEFICIARY_ADDED', beneficiary.id, { accountNumber, immediate: activatesAt.getTime() <= Date.now() });
       return beneficiary;
     } catch (err: any) {
       if (err?.code !== 'P2002') throw err;

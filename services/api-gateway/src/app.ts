@@ -40,6 +40,16 @@ const STAFF_PATHS = [
   '/api/v1/transactions/cash-operations',
 ];
 
+/** Decoded, lower-cased, without duplicate or trailing slashes; null if it can't be decoded */
+export function canonicalPath(path: string): string | null {
+  try {
+    const decoded = decodeURIComponent(path);
+    return decoded.toLowerCase().replace(/\/{2,}/g, '/').replace(/\/+$/, '') || '/';
+  } catch {
+    return null;
+  }
+}
+
 /** "10.0.0.0/8,192.168.1.0/24,fd00::/8" -> BlockList, or null when unset */
 export function parseCidrs(value: string | undefined): net.BlockList | null {
   if (!value || !value.trim()) return null;
@@ -132,7 +142,13 @@ export function createGateway(options: GatewayOptions = {}) {
   const staffNetworks = parseCidrs(process.env.STAFF_ALLOWED_CIDRS);
   if (staffNetworks) {
     app.use((req: Request, res: Response, next) => {
-      if (!STAFF_PATHS.some((p) => req.path === p || req.path.startsWith(`${p}/`))) return next();
+      // Upstream routers match case-insensitively and tolerate encodings, so compare a canonical form
+      const path = canonicalPath(req.path);
+      if (path === null) {
+        res.status(400).json({ error: { code: 'BAD_REQUEST', message: 'Malformed request path', correlationId: req.correlationId } });
+        return;
+      }
+      if (!STAFF_PATHS.some((p) => path === p || path.startsWith(`${p}/`))) return next();
       const ip = (req.ip || '').replace(/^::ffff:/, '');
       const family = net.isIPv6(ip) ? 'ipv6' : 'ipv4';
       if (ip && staffNetworks.check(ip, family)) return next();
@@ -153,10 +169,17 @@ export function createGateway(options: GatewayOptions = {}) {
 
 async function main(): Promise<void> {
   const redis = await connectRedis(process.env.RATE_LIMIT_REDIS_URL || process.env.REDIS_URL);
-  const app = createGateway({ redis });
-  if (process.env.NODE_ENV === 'production' && !process.env.TRUST_PROXY) {
-    logger.warn('TRUST_PROXY is not set: client IPs are taken from the TCP connection (correct only without a load balancer)');
+  if (process.env.NODE_ENV === 'production') {
+    // Both are deployment facts the gateway can't guess; a wrong guess breaks per-IP limits and lockouts
+    // for everyone (all clients look like the load balancer) or opens the staff APIs to the internet.
+    if (!process.env.TRUST_PROXY) {
+      throw new Error('TRUST_PROXY must be set in production: the number of proxies in front of the gateway that overwrite X-Forwarded-For, or 0 for none');
+    }
+    if (!parseCidrs(process.env.STAFF_ALLOWED_CIDRS)) {
+      throw new Error('STAFF_ALLOWED_CIDRS must be set in production (the VPN/office networks allowed to call staff APIs)');
+    }
   }
+  const app = createGateway({ redis });
   startHttpServer(app, process.env.PORT || 8000, 'api-gateway', [() => redis.quit()]);
 }
 

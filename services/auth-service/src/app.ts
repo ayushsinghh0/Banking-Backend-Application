@@ -125,6 +125,9 @@ export function createApp(prisma: PrismaClient, deps: AuthAppDeps) {
 }
 
 async function main(): Promise<void> {
+  if (process.env.NODE_ENV === 'production' && !process.env.STAFF_EMAIL_DOMAIN) {
+    throw new Error('STAFF_EMAIL_DOMAIN must be set in production: staff accounts must use the corporate mail domain');
+  }
   const prisma = new PrismaClient(prismaClientOptions());
   const redis = await connectRedis();
   const rateLimitRedis = await connectRedis(process.env.RATE_LIMIT_REDIS_URL || process.env.REDIS_URL);

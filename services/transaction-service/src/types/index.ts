@@ -4,6 +4,7 @@ export enum TransactionType {
   DEPOSIT = 'DEPOSIT',
   WITHDRAWAL = 'WITHDRAWAL',
   TRANSFER = 'TRANSFER',
+  CASH_TRANSFER = 'CASH_TRANSFER',
 }
 
 export enum TransactionStatus {

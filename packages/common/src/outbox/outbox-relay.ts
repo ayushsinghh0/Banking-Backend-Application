@@ -96,6 +96,8 @@ export class OutboxRelay {
       }
       const lag = await this.lagSeconds();
       if (lag > 300) logger.error({ lagSeconds: lag, alert: 'OUTBOX_LAG' }, 'Outbox events are not being published');
+      const parked = await this.failedCount();
+      if (parked > 0) logger.error({ parked, alert: 'OUTBOX_EVENTS_PARKED' }, 'Outbox events are parked as FAILED and need a re-drive');
     } catch (err) {
       logger.error({ err }, 'Outbox relay batch failed');
     } finally {
@@ -146,7 +148,9 @@ export class OutboxRelay {
       } catch (err: any) {
         const attempts = row.retry_count + 1;
         const message = String(err?.message || 'Unknown publish failure').slice(0, 500);
-        if (attempts >= this.opts.maxAttempts) {
+        // Only a message the broker will NEVER accept is parked; an unavailable broker (however long the
+        // outage) just backs off, so events are never lost to an outage and per-aggregate order holds
+        if (isPoisonPublishError(err) && attempts >= this.opts.maxAttempts) {
           logger.error({ id: row.id, eventType: row.event_type, attempts, alert: 'OUTBOX_EVENT_FAILED' }, 'Outbox event parked as FAILED');
           await this.prisma.$executeRaw`
             UPDATE outbox_events
@@ -168,6 +172,28 @@ export class OutboxRelay {
     return rows.length;
   }
 
+  /**
+   * Re-queues parked FAILED events (after the cause was fixed). Returns how many were re-queued.
+   * Operators can also do this in SQL: UPDATE outbox_events SET status='PENDING', retry_count=0 WHERE status='FAILED'.
+   */
+  public async redriveFailed(eventIds?: string[]): Promise<number> {
+    if (eventIds?.length) {
+      return this.prisma.$executeRaw`
+        UPDATE outbox_events SET status = 'PENDING', retry_count = 0, next_attempt_at = NULL
+        WHERE status = 'FAILED' AND id = ANY(${eventIds}::text[])
+      `;
+    }
+    return this.prisma.$executeRaw`
+      UPDATE outbox_events SET status = 'PENDING', retry_count = 0, next_attempt_at = NULL WHERE status = 'FAILED'
+    `;
+  }
+
+  /** Number of parked events: anything above 0 needs a person (alerted on every batch) */
+  public async failedCount(): Promise<number> {
+    const [{ n }] = await this.prisma.$queryRaw<Array<{ n: bigint }>>`SELECT count(*)::bigint AS n FROM outbox_events WHERE status = 'FAILED'`;
+    return Number(n);
+  }
+
   /** Deletes PUBLISHED rows past the retention window */
   public async purgePublished(): Promise<number> {
     return this.prisma.$executeRaw`
@@ -185,4 +211,13 @@ export class OutboxRelay {
       }),
     ]).finally(() => clearTimeout(timer));
   }
+}
+
+/** Errors that are about the message itself (the broker will reject it every time), not about availability */
+const POISON_KAFKA_ERRORS = new Set(['MESSAGE_TOO_LARGE', 'RECORD_LIST_TOO_LARGE', 'INVALID_RECORD', 'CORRUPT_MESSAGE', 'INVALID_TOPIC_EXCEPTION']);
+export function isPoisonPublishError(err: unknown): boolean {
+  const e = err as any;
+  if (!e) return false;
+  if (e instanceof TypeError || e instanceof RangeError) return true; // e.g. payload can't be serialised
+  return POISON_KAFKA_ERRORS.has(e.type) || POISON_KAFKA_ERRORS.has(e.cause?.type);
 }

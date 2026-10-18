@@ -4,9 +4,6 @@ CREATE TYPE "CashOperationType" AS ENUM ('DEPOSIT', 'WITHDRAWAL');
 -- CreateEnum
 CREATE TYPE "CashOperationStatus" AS ENUM ('PENDING_APPROVAL', 'EXECUTED', 'REJECTED');
 
--- DropIndex
-DROP INDEX "ledger_entries_account_id_created_at_idx";
-
 -- AlterTable
 ALTER TABLE "ledger_accounts" ADD COLUMN     "closed_at" TIMESTAMP(3);
 
@@ -53,9 +50,6 @@ CREATE INDEX "cash_operations_requested_by_created_at_idx" ON "cash_operations"(
 
 -- CreateIndex
 CREATE INDEX "audit_log_actor_id_created_at_idx" ON "audit_log"("actor_id", "created_at");
-
--- CreateIndex
-CREATE INDEX "ledger_entries_account_id_created_at_id_idx" ON "ledger_entries"("account_id", "created_at", "id");
 
 -- CreateIndex
 CREATE INDEX "outbox_events_aggregate_id_status_idx" ON "outbox_events"("aggregate_id", "status");

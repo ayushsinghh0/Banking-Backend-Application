@@ -413,9 +413,15 @@ check('SEPARATION OF DUTIES: an administrator cannot handle cash (403, tellers o
 const noSession = await api('POST', '/api/v1/transactions/deposit', { token: teller.token, headers: idem(), body: { accountId: aliceAcc.id, amountInPaise: '100' } });
 check('a teller without an open session cannot handle cash (409 NO_TELLER_SESSION)', noSession.status === 409 && noSession.body.error.code === 'NO_TELLER_SESSION', noSession.body);
 const OPENING_FLOAT = 5_000_000n;
-const open = await api('POST', '/api/v1/transactions/teller/sessions/open', { token: teller.token, body: { openingFloatPaise: OPENING_FLOAT.toString() } });
-check('teller opens the business-day session with the counted opening float', open.status === 201 && open.body.data.status === 'OPEN', open.body);
-check('only one session per teller per day (409)', (await api('POST', '/api/v1/transactions/teller/sessions/open', { token: teller.token, body: { openingFloatPaise: '0' } })).status === 409);
+check('a teller cannot issue their own float (403)', (await api('POST', '/api/v1/transactions/teller/sessions', { token: teller.token, body: { tellerId: teller.id, openingFloatPaise: '1' } })).status === 403);
+const issue = await api('POST', '/api/v1/transactions/teller/sessions', { token: admin.token, body: { tellerId: teller.id, openingFloatPaise: OPENING_FLOAT.toString() } });
+check('DUAL CONTROL: a supervisor issues the opening float (ISSUED, nothing booked yet)', issue.status === 201 && issue.body.data.status === 'ISSUED', issue.body);
+check('...no cash can be handled before the teller accepts it (409)', (await api('POST', '/api/v1/transactions/deposit', { token: teller.token, headers: idem(), body: { accountId: aliceAcc.id, amountInPaise: '100' } })).status === 409);
+const miscount = await api('POST', '/api/v1/transactions/teller/sessions/accept', { token: teller.token, body: { countedFloatPaise: (OPENING_FLOAT - 1n).toString() } });
+check('...the teller must count exactly the issued float (409 FLOAT_MISMATCH)', miscount.status === 409 && miscount.body.error.code === 'FLOAT_MISMATCH', miscount.body);
+const open = await api('POST', '/api/v1/transactions/teller/sessions/accept', { token: teller.token, body: { countedFloatPaise: OPENING_FLOAT.toString() } });
+check('the teller counts and accepts the float: booked vault -> drawer, session OPEN', open.status === 200 && open.body.data.status === 'OPEN', open.body);
+check('only one session per teller per day (409)', (await api('POST', '/api/v1/transactions/teller/sessions', { token: admin2.token, body: { tellerId: teller.id, openingFloatPaise: '0' } })).status === 409);
 const dep = await api('POST', '/api/v1/transactions/deposit', { token: teller.token, headers: idem(), body: { accountId: aliceAcc.id, amountInPaise: '100000' } });
 check('teller deposit within the single-approval limit executes immediately (201)', dep.status === 201 && dep.body.data.status === 'EXECUTED', dep.body);
 check('alice balance = 100000', (await balance(alice.token, aliceAcc.id)) === '100000');
@@ -430,6 +436,9 @@ const notOwner = await api('POST', '/api/v1/transactions/withdrawal-codes', { to
 check("only the account owner can authorise a withdrawal (bob on alice's account: 404)", notOwner.status === 404, notOwner.body);
 const code = await api('POST', '/api/v1/transactions/withdrawal-codes', { token: alice.token, body: { accountId: aliceAcc.id, amountInPaise: '20000' } });
 check('customer generates a one-time 8-digit withdrawal code for an exact amount', code.status === 201 && /^\d{8}$/.test(code.body.data.authorizationCode), code.body);
+check('...and is told by email that a cash withdrawal code was created', Boolean(await waitForEmail(alice.email, /cash withdrawal code was created/)));
+const bigCode = await api('POST', '/api/v1/transactions/withdrawal-codes', { token: bob.token, body: { accountId: bobAcc.id, amountInPaise: '3000000' } });
+check('a large withdrawal code needs a recent TOTP check (403 STEP_UP_REQUIRED)', bigCode.status === 403 && bigCode.body.error.code === 'STEP_UP_REQUIRED', bigCode.body);
 const wrongAmount = await api('POST', '/api/v1/transactions/withdraw', { token: teller.token, headers: idem(), body: { accountId: aliceAcc.id, amountInPaise: '25000', authorizationCode: code.body.data.authorizationCode } });
 check('the code is bound to the amount (403 for a different amount)', wrongAmount.status === 403, wrongAmount.body);
 const withdraw = await api('POST', '/api/v1/transactions/withdraw', { token: teller.token, headers: idem(), body: { accountId: aliceAcc.id, amountInPaise: '20000', authorizationCode: code.body.data.authorizationCode } });
@@ -463,7 +472,7 @@ check('transfer without Idempotency-Key is rejected (400)', (await api('POST', '
 const insufficient = await api('POST', '/api/v1/transactions/transfer', { token: alice.token, headers: idem(), body: { sourceAccountId: aliceAcc2.id, destinationAccountId: bobAcc.id, amountInPaise: '1000' } });
 check("insufficient funds is checked first, before anything about the payee (422 INSUFFICIENT_FUNDS)", insufficient.status === 422 && insufficient.body.error.code === 'INSUFFICIENT_FUNDS', insufficient.body);
 const noSuchDest = await api('POST', '/api/v1/transactions/transfer', { token: alice.token, headers: idem(), body: { sourceAccountId: aliceAcc.id, destinationAccountNumber: '100100000000', amountInPaise: '100' } });
-check('ORACLE: an unknown destination gives the generic 422 INVALID_DESTINATION', noSuchDest.status === 422 && noSuchDest.body.error.code === 'INVALID_DESTINATION', noSuchDest.body);
+check('ENUMERATION: an unregistered destination gets BENEFICIARY_REQUIRED whether or not it exists', noSuchDest.status === 422 && noSuchDest.body.error.code === 'BENEFICIARY_REQUIRED', noSuchDest.body);
 const emptyProbe = await api('POST', '/api/v1/transactions/transfer', { token: carol.token, headers: idem(), body: { sourceAccountId: aliceAcc.id, destinationAccountNumber: bobAcc.accountNumber, amountInPaise: '1' } });
 check('ORACLE: probing with an account you do not own reveals nothing (404)', emptyProbe.status === 404, emptyProbe.body);
 const noBeneficiary = await api('POST', '/api/v1/transactions/transfer', { token: alice.token, headers: idem(), body: { sourceAccountId: aliceAcc.id, destinationAccountNumber: bobAcc.accountNumber, amountInPaise: '1000' } });
@@ -537,8 +546,14 @@ const closeWithMoney = await api('PATCH', `/api/v1/accounts/${aliceAcc.id}/statu
 check('account with balance cannot be closed (409, decided by the ledger)', closeWithMoney.status === 409, closeWithMoney.body);
 
 await api('PATCH', `/api/v1/accounts/${aliceAcc.id}/daily-limit`, { token: admin.token, body: { dailyLimitPaise: '100000000' } });
+// Alice's TOTP check was minutes ago: a large transfer needs a fresh one (step-up)
+const badStepUp = await api('POST', '/api/v1/auth/mfa/step-up', { token: alice.token, body: { code: '000000' } });
+check('STEP-UP: a wrong code is refused (400)', badStepUp.status === 400 && badStepUp.body.error.code === 'INVALID_MFA_CODE', badStepUp.body);
+const stepUp = await api('POST', '/api/v1/auth/mfa/step-up', { token: alice.token, body: { code: await freshTotp(aliceMfa.secret) } });
+check('STEP-UP: re-verifying TOTP returns a short-lived step-up token for the same session', stepUp.status === 200 && Boolean(stepUp.body.data.accessToken), stepUp.body);
+alice.token = stepUp.body.data?.accessToken ?? alice.token;
 const big = await api('POST', '/api/v1/transactions/transfer', { token: alice.token, headers: idem(), body: { sourceAccountId: aliceAcc.id, destinationAccountId: aliceAcc2.id, amountInPaise: '25000000' } });
-check('high-value transfer (Rs 2.5 lakh, MFA session) succeeds within the raised limit', big.status === 201, big.body);
+check('high-value transfer (Rs 2.5 lakh, fresh step-up) succeeds within the raised limit', big.status === 201, big.body);
 const overCustomerCap = await api('POST', '/api/v1/transactions/transfer', { token: alice.token, headers: idem(), body: { sourceAccountId: aliceAcc.id, destinationAccountId: aliceAcc2.id, amountInPaise: '25000000' } });
 check('per-customer daily outflow cap (Rs 5 lakh across accounts) is enforced', overCustomerCap.status === 422 && overCustomerCap.body.error.code === 'DAILY_LIMIT_EXCEEDED', overCustomerCap.body);
 const alerts = await waitFor(async () => {
@@ -562,12 +577,16 @@ check('KAFKA: the fraud alert reached the security team by email (via outbox)', 
 // ---------------------------------------------------------------------------
 section('Teller close-out & supervisor sign-off');
 const cashMoved = 100000n - 20000n + 60000000n; // deposits in, withdrawals out of this drawer
-const close = await api('POST', '/api/v1/transactions/teller/sessions/close', { token: teller.token, body: { countedCashPaise: (OPENING_FLOAT + cashMoved - 500n).toString() } });
-check('closing computes expected cash from the ledger and flags the discrepancy', close.status === 200 && close.body.data.expectedClosing === (OPENING_FLOAT + cashMoved).toString() && close.body.data.discrepancy === '-500', close.body);
+const counted = OPENING_FLOAT + cashMoved - 500n; // the drawer is Rs 5 short
+const close = await api('POST', '/api/v1/transactions/teller/sessions/close', { token: teller.token, body: { countedCashPaise: counted.toString() } });
+check('BLIND COUNT: the teller closes without ever seeing the expected figure', close.status === 200 && close.body.data.status === 'CLOSED' && !('expectedClosing' in close.body.data) && !('discrepancy' in close.body.data), close.body);
 check('a closed session handles no more cash (409)', (await api('POST', '/api/v1/transactions/deposit', { token: teller.token, headers: idem(), body: { accountId: aliceAcc.id, amountInPaise: '100' } })).status === 409);
-check('the teller cannot sign off their own session (403)', (await api('POST', `/api/v1/transactions/teller/sessions/${open.body.data.id}/sign-off`, { token: teller.token })).status === 403);
-const signOff = await api('POST', `/api/v1/transactions/teller/sessions/${open.body.data.id}/sign-off`, { token: admin.token });
-check('a supervisor signs the session off (RECONCILED)', signOff.status === 200 && signOff.body.data.status === 'RECONCILED', signOff.body);
+check('the teller cannot sign off their own session (403)', (await api('POST', `/api/v1/transactions/teller/sessions/${open.body.data.id}/sign-off`, { token: teller.token, body: { countedCashPaise: counted.toString() } })).status === 403);
+const recount = await api('POST', `/api/v1/transactions/teller/sessions/${open.body.data.id}/sign-off`, { token: admin.token, body: { countedCashPaise: (counted + 1000n).toString() } });
+check("BLIND COUNT: the supervisor's own count must match the teller's (409 COUNT_MISMATCH)", recount.status === 409 && recount.body.error.code === 'COUNT_MISMATCH', recount.body);
+const signOff = await api('POST', `/api/v1/transactions/teller/sessions/${open.body.data.id}/sign-off`, { token: admin.token, body: { countedCashPaise: counted.toString() } });
+check('sign-off returns the cash to the vault and posts the Rs 5 shortage to suspense (RECONCILED)', signOff.status === 200 && signOff.body.data.status === 'RECONCILED' && signOff.body.data.expectedClosing === (OPENING_FLOAT + cashMoved).toString() && signOff.body.data.discrepancy === '-500', signOff.body);
+check('the drawer is back to zero: a new float can be issued tomorrow', (await api('GET', '/api/v1/transactions/teller/sessions?status=RECONCILED', { token: admin.token })).body?.data?.some((x) => x.id === open.body.data.id));
 
 // ---------------------------------------------------------------------------
 section('Staff-only data, admin controls & internal API');
@@ -577,10 +596,19 @@ const logsAsAdmin = await api('GET', `/api/v1/notifications/logs?recipient=${enc
 check('admin can audit notification logs', logsAsAdmin.status === 200 && logsAsAdmin.body.data.length >= 2, logsAsAdmin.body?.data?.length);
 const selfDisable = await api('PATCH', `/api/v1/auth/admin/users/${admin.id}/status`, { token: admin.token, body: { isActive: false } });
 check('an administrator cannot disable themselves (403)', selfDisable.status === 403, selfDisable.body);
+const fraudFreeze = await api('PATCH', `/api/v1/accounts/${bobAcc.id}/status`, { token: admin.token, body: { status: 'FROZEN' } });
+check('admin freezes a suspicious account', fraudFreeze.status === 200, fraudFreeze.body);
+const selfUnfreeze = await api('PATCH', `/api/v1/accounts/${bobAcc.id}/status`, { token: admin.token, body: { status: 'ACTIVE' } });
+check('DUAL CONTROL: the admin who froze it cannot unfreeze it (403)', selfUnfreeze.status === 403, selfUnfreeze.body);
+check('...a different admin can', (await api('PATCH', `/api/v1/accounts/${bobAcc.id}/status`, { token: admin2.token, body: { status: 'ACTIVE' } })).status === 200);
+const mfaReset = await api('POST', `/api/v1/auth/admin/users/${erin.id}/mfa/reset`, { token: admin.token });
+check("removing a customer's MFA is only a four-eyes request (202)", mfaReset.status === 202 && mfaReset.body.data.status === 'PENDING', mfaReset.body);
 const disable = await api('PATCH', `/api/v1/auth/admin/users/${bob.id}/status`, { token: admin.token, body: { isActive: false } });
 check('admin can suspend a customer directly', disable.status === 200 && disable.body.data.isActive === false, disable.body);
 check('REVOCATION: a disabled user is locked out immediately', (await api('GET', `/api/v1/accounts/${bobAcc.id}`, { token: bob.token })).status === 401);
 check('disabled user cannot log in', (await api('POST', '/api/v1/auth/login', { body: { email: bob.email, password: PASSWORD } })).status === 401);
+check('DUAL CONTROL: the admin who disabled a customer cannot re-enable them (403)', (await api('PATCH', `/api/v1/auth/admin/users/${bob.id}/status`, { token: admin.token, body: { isActive: true } })).status === 403);
+check('...a different admin can', (await api('PATCH', `/api/v1/auth/admin/users/${bob.id}/status`, { token: admin2.token, body: { isActive: true } })).status === 200);
 const disableTeller = await api('PATCH', `/api/v1/auth/admin/users/${teller.id}/status`, { token: admin.token, body: { isActive: false } });
 check('disabling a STAFF account only creates a four-eyes request (202)', disableTeller.status === 202 && disableTeller.body.data.status === 'PENDING', disableTeller.body);
 check('...the teller still works until it is approved', (await api('GET', '/api/v1/auth/me', { token: teller.token })).status === 200);

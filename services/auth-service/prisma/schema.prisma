@@ -52,6 +52,7 @@ model User {
   passwordChangedAt DateTime?                @map("password_changed_at")
   // TOTP second factor. Secrets are AES-256-GCM encrypted with MFA_ENCRYPTION_KEY, never stored in clear
   mfaEnabled        Boolean                  @default(false) @map("mfa_enabled")
+  mfaEnabledAt         DateTime? @map("mfa_enabled_at") // a new factor is not trusted for step-up at first
   mfaSecretEnc      String?                  @map("mfa_secret_enc")
   mfaPendingSecretEnc String?                @map("mfa_pending_secret_enc")
   mfaLastUsedStep   Int?                     @map("mfa_last_used_step") // replay protection: a code works once

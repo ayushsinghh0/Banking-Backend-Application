@@ -18,7 +18,11 @@ describe('FraudService (Risk Engine, Anomaly Detection, and Alerts)', () => {
   beforeEach(() => {
     mockPrisma = {
       processedEvent: { findUnique: jest.fn().mockResolvedValue(null), create: jest.fn() },
-      riskAssessment: { create: jest.fn(), count: jest.fn().mockResolvedValue(0) },
+      riskAssessment: {
+        create: jest.fn(),
+        count: jest.fn().mockResolvedValue(0),
+        aggregate: jest.fn().mockResolvedValue({ _sum: { amountInPaise: null }, _count: { _all: 0 } }),
+      },
       fraudAlert: {
         create: jest.fn(({ data }: any) => ({ id: 'alert-1', ...data })),
         findMany: jest.fn(),
@@ -128,6 +132,17 @@ describe('FraudService (Risk Engine, Anomaly Detection, and Alerts)', () => {
     expect((await rule.evaluate({ ...cash, amountInPaise: 1_000_000n })).triggered).toBe(false);
     expect((await rule.evaluate({ ...cash, transactionType: 'TRANSFER' })).triggered).toBe(false);
     expect((await rule.evaluate({ ...cash, amountInPaise: 30_000_000n })).triggered).toBe(false);
+  });
+
+  it('STRUCTURING: small cash operations into one account that add up past the approval limit are flagged', async () => {
+    const rule = new CashStructuringRule(mockPrisma, 20_000_000n, 80n, 2);
+    const cash = ctx({ amountInPaise: 5_000_000n, transactionType: 'DEPOSIT', initiatedBy: 'teller-1', direction: 'INBOUND' });
+    mockPrisma.riskAssessment.aggregate.mockResolvedValue({ _sum: { amountInPaise: 14_000_000n }, _count: { _all: 3 } });
+    expect((await rule.evaluate(cash)).triggered).toBe(false); // 19,000,000 total: still below the limit
+    mockPrisma.riskAssessment.aggregate.mockResolvedValue({ _sum: { amountInPaise: 16_000_000n }, _count: { _all: 4 } });
+    const flagged = await rule.evaluate(cash); // 21,000,000 total across 5 operations
+    expect(flagged.triggered).toBe(true);
+    expect(mockPrisma.riskAssessment.aggregate.mock.calls.at(-1)[0].where).toEqual(expect.objectContaining({ initiatedBy: 'teller-1', accountId: 'acc-1' }));
   });
 
   it('maps risk scores to levels', () => {

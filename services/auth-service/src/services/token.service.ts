@@ -8,6 +8,8 @@ export interface TokenPayload {
   tokenVersion: number;
   mfa: boolean;
   sessionId: string;
+  stepUpAt?: number;
+  mfaSince?: number;
 }
 
 export interface GeneratedTokens {
@@ -50,6 +52,8 @@ export class TokenService {
         tokenVersion: payload.tokenVersion,
         mfa: payload.mfa,
         sessionId: payload.sessionId,
+        stepUpAt: payload.stepUpAt,
+        mfaSince: payload.mfaSince,
       },
       this.accessExpiration
     );

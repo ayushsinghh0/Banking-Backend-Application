@@ -15,7 +15,13 @@ import {
 } from '../src/errors';
 import { AuthenticatedUser, ForbiddenError, ConflictError, HttpError } from '@banksphere/common';
 
-const alice: AuthenticatedUser = { id: 'alice', email: 'alice@bank.com', role: 'CUSTOMER', mfa: true };
+const NOW = () => Math.floor(Date.now() / 1000);
+// Fresh TOTP verification on a factor enrolled two days ago: strong, recent authentication
+const alice: AuthenticatedUser = { id: 'alice', email: 'alice@bank.com', role: 'CUSTOMER', mfa: true, stepUpAt: NOW(), mfaSince: NOW() - 2 * 86400 };
+// MFA session, but the TOTP check was an hour ago (e.g. a refreshed or stolen long-lived session)
+const aliceStale: AuthenticatedUser = { ...alice, stepUpAt: NOW() - 3600 };
+// Factor enrolled a minute ago (e.g. by an attacker holding a phished password)
+const aliceNewFactor: AuthenticatedUser = { ...alice, mfaSince: NOW() - 60 };
 const aliceNoMfa: AuthenticatedUser = { id: 'alice', email: 'alice@bank.com', role: 'CUSTOMER', mfa: false };
 const mallory: AuthenticatedUser = { id: 'mallory', email: 'mallory@bank.com', role: 'CUSTOMER' };
 const teller: AuthenticatedUser = { id: 'teller', email: 'teller@bank.com', role: 'TELLER', mfa: true };
@@ -31,6 +37,9 @@ const policy: LedgerPolicy = {
   beneficiaryCoolingMinutes: 60,
   newBeneficiaryLimit: 5_000_000n,
   withdrawalCodeTtlMinutes: 15,
+  withdrawalCodeStepUpThreshold: 2_500_000n,
+  stepUpMaxAgeSeconds: 300,
+  mfaFactorMinAgeHours: 24,
 };
 
 const row = (id: string, balance: bigint, customer: string, extra: Partial<any> = {}) => ({
@@ -47,10 +56,23 @@ const row = (id: string, balance: bigint, customer: string, extra: Partial<any> 
 });
 
 const DRAWER = row('drawer-teller', 0n, 'teller', { kind: 'TELLER_CASH', account_number: 'DRAWER-teller', daily_limit: 900_000_000_000_000_000n });
-const openSession = () => ({ id: 'sess-1', tellerId: 'teller', status: 'OPEN', businessDate: istBusinessDate(), drawerAccountId: DRAWER.id });
+const VAULT = row('vault', 0n, 'BANK', { kind: 'VAULT_CASH', account_number: 'VAULT-CASH' });
+const SUSPENSE = row('suspense', 0n, 'BANK', { kind: 'CASH_SUSPENSE', account_number: 'CASH-SUSPENSE' });
+const openSession = () => ({
+  id: 'sess-1',
+  tellerId: 'teller',
+  status: 'OPEN',
+  businessDate: istBusinessDate(),
+  drawerAccountId: DRAWER.id,
+  openingFloat: 0n,
+  declaredClosing: null,
+  expectedClosing: null,
+  discrepancy: null,
+});
 
-function buildPrisma(rows: any[], owners: Record<string, string>) {
-  const all = [...rows, DRAWER];
+function buildPrisma(rows: any[], owners: Record<string, string>, drawerBalance = 0n) {
+  const drawer = { ...DRAWER, balance: drawerBalance };
+  const all = [...rows, drawer, VAULT, SUSPENSE];
   const prisma: any = {
     $queryRaw: jest.fn((strings: TemplateStringsArray) => {
       const sql = strings.join('?');
@@ -71,7 +93,8 @@ function buildPrisma(rows: any[], owners: Record<string, string>) {
     ledgerAccount: {
       update: jest.fn(),
       create: jest.fn(),
-      findFirst: jest.fn(({ where }: any) => Promise.resolve(where.kind === 'TELLER_CASH' ? { id: DRAWER.id } : null)),
+      findFirst: jest.fn(({ where }: any) => Promise.resolve(where.kind === 'TELLER_CASH' ? { id: DRAWER.id, balance: drawerBalance } : null)),
+      upsert: jest.fn(({ where }: any) => Promise.resolve(where.accountNumber === 'VAULT-CASH' ? { id: VAULT.id } : { id: SUSPENSE.id })),
       findUnique: jest.fn(({ where }: any) => {
         if (where.accountNumber) {
           const match = rows.find((r) => r.account_number === where.accountNumber);
@@ -87,8 +110,18 @@ function buildPrisma(rows: any[], owners: Record<string, string>) {
       count: jest.fn().mockResolvedValue(0),
       create: jest.fn(({ data }: any) => ({ id: 'b-new', createdAt: new Date(), ...data })),
     },
-    tellerSession: { findFirst: jest.fn().mockResolvedValue(openSession()) },
-    withdrawalAuthorization: { findFirst: jest.fn().mockResolvedValue(null), updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
+    tellerSession: {
+      findFirst: jest.fn().mockResolvedValue(openSession()),
+      findUnique: jest.fn().mockResolvedValue(null),
+      findUniqueOrThrow: jest.fn(),
+      create: jest.fn(({ data }: any) => ({ id: 'sess-1', ...data })),
+      update: jest.fn(({ data }: any) => ({ ...openSession(), ...data })),
+    },
+    withdrawalAuthorization: {
+      findFirst: jest.fn().mockResolvedValue(null),
+      updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+      create: jest.fn(),
+    },
     outboxEvent: { create: jest.fn() },
     auditLog: { create: jest.fn(), count: jest.fn().mockResolvedValue(1) },
     cashOperation: {
@@ -120,12 +153,26 @@ describe('LedgerService: transfers', () => {
     expect(prisma.transaction.create).not.toHaveBeenCalled();
   });
 
-  it('STEP-UP: large transfers need an MFA-authenticated session', async () => {
-    const prisma = buildPrisma([row('acc-1', 90_000_000n, 'alice', { daily_limit: 90_000_000n }), row('acc-2', 0n, 'bob')], { 'acc-1': 'alice', 'acc-2': 'bob' });
-    const err: any = await new LedgerService(prisma, policy)
-      .executeTransfer({ sourceAccountId: 'acc-1', destinationAccountId: 'acc-2', amountInPaise: 10_000_000n }, aliceNoMfa)
-      .catch((e) => e);
-    expect(err.errorCode).toBe('STEP_UP_REQUIRED');
+  it('STEP-UP: large transfers need a RECENT TOTP check on an ESTABLISHED factor', async () => {
+    const prisma = buildPrisma([row('acc-1', 90_000_000n, 'alice', { daily_limit: 90_000_000n }), row('acc-2', 0n, 'alice')], { 'acc-1': 'alice', 'acc-2': 'alice' });
+    const send = (actor: AuthenticatedUser) =>
+      new LedgerService(prisma, policy)
+        .executeTransfer({ sourceAccountId: 'acc-1', destinationAccountId: 'acc-2', amountInPaise: 10_000_000n }, actor)
+        .then(() => 'OK', (e) => e.errorCode);
+    expect(await send(aliceNoMfa)).toBe('STEP_UP_REQUIRED');
+    expect(await send(aliceStale)).toBe('STEP_UP_REQUIRED'); // MFA session, but not verified recently
+    expect(await send(aliceNewFactor)).toBe('STEP_UP_REQUIRED'); // factor enrolled minutes ago
+    expect(await send(alice)).toBe('OK');
+  });
+
+  it('ENUMERATION: without a registered payee, existing and non-existent accounts give the same answer', async () => {
+    const prisma = buildPrisma([row('acc-1', 50_000n, 'alice'), row('acc-2', 0n, 'bob', { account_number: '100100000002' })], { 'acc-1': 'alice' });
+    prisma.beneficiary.findUnique.mockResolvedValue(null);
+    const svc = new LedgerService(prisma, policy);
+    const code = (destinationAccountNumber: string) =>
+      svc.executeTransfer({ sourceAccountId: 'acc-1', destinationAccountNumber, amountInPaise: 1n }, alice).catch((e: any) => e.errorCode);
+    expect(await code('100100000002')).toBe('BENEFICIARY_REQUIRED'); // exists
+    expect(await code('999999999999')).toBe('BENEFICIARY_REQUIRED'); // doesn't
   });
 
   it("ORACLE: checks the caller's own funds before revealing anything about the destination", async () => {
@@ -304,25 +351,89 @@ describe('TellerService: cash operations (drawer, session, maker-checker)', () =
     await expect(new TellerService(prisma, policy).approveCashOperation('op-1', checker)).rejects.toThrow(ConflictError);
   });
 
-  it('a teller cannot sign off their own session', async () => {
+  it('FLOAT: issued by a supervisor, booked vault -> drawer only when the teller counts the same amount', async () => {
     const prisma = buildPrisma([], {});
-    prisma.tellerSession.findUnique = jest.fn().mockResolvedValue({ ...openSession(), status: 'CLOSED' });
-    await expect(new TellerService(prisma, policy).signOffSession({ ...teller, role: 'BANK_ADMIN' }, 'sess-1')).rejects.toThrow(ForbiddenError);
+    prisma.tellerSession.findFirst.mockResolvedValue(null); // the teller has no unfinished session
+    const svc = new TellerService(prisma, policy);
+    await expect(svc.issueFloat(checker, 'checker', 100_000n)).rejects.toThrow(ForbiddenError);
+    const issued = await svc.issueFloat(checker, 'teller', 100_000n);
+    expect(issued.status).toBe('ISSUED');
+    expect(prisma.ledgerEntry.create).not.toHaveBeenCalled(); // nothing booked yet
+
+    prisma.tellerSession.findFirst.mockResolvedValue({ ...openSession(), status: 'ISSUED', openingFloat: 100_000n, issuedBy: 'checker' });
+    const wrong: any = await svc.acceptFloat(teller, 90_000n).catch((e) => e);
+    expect(wrong.errorCode).toBe('FLOAT_MISMATCH');
+    expect(prisma.ledgerEntry.create).not.toHaveBeenCalled();
+
+    await svc.acceptFloat(teller, 100_000n);
+    expect(prisma.ledgerEntry.create).toHaveBeenNthCalledWith(1, { data: expect.objectContaining({ accountId: DRAWER.id, entryType: 'DEBIT', amount: 100_000n }) });
+    expect(prisma.ledgerEntry.create).toHaveBeenNthCalledWith(2, { data: expect.objectContaining({ accountId: VAULT.id, entryType: 'CREDIT', amount: 100_000n }) });
+  });
+
+  it('a float cannot be issued while the drawer still holds booked cash', async () => {
+    const prisma = buildPrisma([], {}, 5_000n);
+    prisma.tellerSession.findFirst.mockResolvedValue(null);
+    const svc = new TellerService(prisma, policy);
+    await expect(svc.issueFloat(checker, 'teller', 100_000n)).rejects.toThrow(ConflictError);
+  });
+
+  it('BLIND CLOSE: the teller is never told what the ledger expects', async () => {
+    const prisma = buildPrisma([], {}, 150_000n);
+    prisma.cashOperation.count = jest.fn().mockResolvedValue(0);
+    const closed: any = await new TellerService(prisma, policy).closeSession(teller, 150_000n);
+    expect(closed.status).toBe('CLOSED');
+    expect(closed).not.toHaveProperty('expectedClosing');
+    expect(closed).not.toHaveProperty('discrepancy');
+  });
+
+  it('SIGN-OFF: a second blind count must match; cash returns to the vault and a shortage goes to suspense', async () => {
+    const prisma = buildPrisma([], {}, 100_500n);
+    const closed = { ...openSession(), status: 'CLOSED', declaredClosing: 100_000n, openingFloat: 50_000n };
+    prisma.tellerSession.findUniqueOrThrow.mockResolvedValue(closed);
+    const svc = new TellerService(prisma, policy);
+
+    await expect(svc.signOffSession({ ...teller, role: 'BANK_ADMIN' }, 'sess-1', 100_000n)).rejects.toThrow(ForbiddenError);
+    const mismatch: any = await svc.signOffSession(checker, 'sess-1', 99_000n).catch((e) => e);
+    expect(mismatch.errorCode).toBe('COUNT_MISMATCH');
+    expect(prisma.ledgerEntry.create).not.toHaveBeenCalled();
+
+    const done = await svc.signOffSession(checker, 'sess-1', 100_000n);
+    expect(done.status).toBe('RECONCILED');
+    expect(done.discrepancy).toBe('-500');
+    const entries = prisma.ledgerEntry.create.mock.calls.map(([{ data }]: any) => [data.accountId, data.entryType, data.amount]);
+    expect(entries).toEqual([
+      [VAULT.id, 'DEBIT', 100_000n], // counted cash back into the vault
+      [DRAWER.id, 'CREDIT', 100_000n],
+      [SUSPENSE.id, 'DEBIT', 500n], // the missing cash, under investigation
+      [DRAWER.id, 'CREDIT', 500n],
+    ]);
+  });
+
+  it('WITHDRAWAL CODES: large codes need recent strong auth; every code is audited and emailed', async () => {
+    const prisma = buildPrisma([row('acc-1', 9_000_000n, 'alice')], { 'acc-1': 'alice' });
+    const svc = new TellerService(prisma, policy);
+    const err: any = await svc.createWithdrawalCode(aliceNoMfa, 'acc-1', 3_000_000n).catch((e) => e);
+    expect(err.errorCode).toBe('STEP_UP_REQUIRED');
+    await svc.createWithdrawalCode(aliceNoMfa, 'acc-1', 100_000n); // small: fine without step-up
+    expect(prisma.auditLog.create.mock.calls.at(-1)[0].data.action).toBe('WITHDRAWAL_CODE_CREATED');
+    expect(prisma.outboxEvent.create.mock.calls.at(-1)[0].data.eventType).toBe('withdrawal.code.created.v1');
+    await expect(svc.createWithdrawalCode(alice, 'acc-1', 3_000_000n)).resolves.toHaveProperty('authorizationCode');
   });
 });
 
 describe('BeneficiaryService', () => {
-  it('adding with an MFA session activates immediately; without one there is a cooling-off period', async () => {
+  it('a payee is active immediately only with recent strong auth; otherwise there is a cooling-off period', async () => {
     const rows = [row('acc-2', 0n, 'bob', { account_number: '100100000002' })];
     const prisma = buildPrisma(rows, {});
     const svc = new BeneficiaryService(prisma, policy);
-    await svc.add(alice, '100100000002', 'Bob');
-    const withMfa = prisma.beneficiary.create.mock.calls[0][0].data.activatesAt.getTime();
-    expect(withMfa).toBeLessThanOrEqual(Date.now());
-
-    await svc.add(aliceNoMfa, '100100000002', 'Bob');
-    const withoutMfa = prisma.beneficiary.create.mock.calls[1][0].data.activatesAt.getTime();
-    expect(withoutMfa).toBeGreaterThan(Date.now() + 59 * 60_000);
+    const activatesAt = async (actor: AuthenticatedUser) => {
+      await svc.add(actor, '100100000002', 'Bob');
+      return prisma.beneficiary.create.mock.calls.at(-1)[0].data.activatesAt.getTime();
+    };
+    expect(await activatesAt(alice)).toBeLessThanOrEqual(Date.now());
+    for (const actor of [aliceNoMfa, aliceStale, aliceNewFactor]) {
+      expect(await activatesAt(actor)).toBeGreaterThan(Date.now() + 59 * 60_000);
+    }
   });
 
   it('a customer cannot add their own account or an unknown account', async () => {
