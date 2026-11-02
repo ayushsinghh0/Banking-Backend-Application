@@ -3,12 +3,31 @@ import { Prisma } from '../../generated/client';
 import { AuthenticatedUser, HttpError, hasRecentStrongAuth } from '@banksphere/common';
 import { EntryType, TransactionResult, TransactionStatus, TransactionType } from '../types';
 import { DailyLimitExceededError } from '../errors';
+import { notePosting } from './ledger-commits';
+import { appendAudit } from './audit-chain';
 
 export type TxClient = Prisma.TransactionClient;
 
+export type LedgerAccountKindName = 'CUSTOMER' | 'TELLER_CASH' | 'VAULT_CASH' | 'CASH_SUSPENSE' | 'PAYMENT_CLEARING';
+
+/**
+ * Asset accounts of the bank (debit-normal: debits increase the balance): teller drawers, the vault, cash
+ * suspense and PAYMENT_CLEARING (money receivable from the payment provider). CUSTOMER accounts are the
+ * bank's liability to its customers (credit-normal). Reconciliation checks
+ * sum(CUSTOMER balances) == sum(asset balances).
+ */
+export const ASSET_KINDS = ['TELLER_CASH', 'VAULT_CASH', 'CASH_SUSPENSE', 'PAYMENT_CLEARING'] as const;
+
+export function isAssetKind(kind: string): boolean {
+  if (kind === 'CUSTOMER') return false;
+  if ((ASSET_KINDS as readonly string[]).includes(kind)) return true;
+  // A kind without a sign convention must never be posted to: its balance would silently go the wrong way
+  throw new Error(`Ledger account kind ${kind} has no balance convention`);
+}
+
 export interface LockedAccount {
   id: string;
-  kind: 'CUSTOMER' | 'TELLER_CASH' | 'VAULT_CASH' | 'CASH_SUSPENSE';
+  kind: LedgerAccountKindName;
   balance: bigint;
   is_active: boolean;
   closed_at: Date | null;
@@ -148,6 +167,9 @@ export function assertBalanceCap(newBalance: bigint): void {
   }
 }
 
+/** Debits that are not the customer's own outflow (see assertWithinDailyLimits) */
+export const CUSTOMER_LIMIT_EXEMPT_TYPES: TransactionType[] = [TransactionType.TOP_UP_REFUND];
+
 /**
  * Per-account and per-customer daily outgoing limits. Must be called with the customer's advisory lock
  * and the account row lock held, so concurrent debits are serialised and can't race past either limit.
@@ -159,10 +181,13 @@ export async function assertWithinDailyLimits(
   policy: LedgerPolicy
 ): Promise<void> {
   const since = startOfIstDay();
+  // Refunds of top-ups are bank-initiated (the money goes back to where it came from): they don't use up
+  // the customer's own daily allowance
+  const customerOutflow = { type: { notIn: CUSTOMER_LIMIT_EXEMPT_TYPES } };
   const [accountSpent, customerSpent] = await Promise.all([
     tx.ledgerEntry.aggregate({
       _sum: { amount: true },
-      where: { accountId: account.id, entryType: EntryType.DEBIT, createdAt: { gte: since } },
+      where: { accountId: account.id, entryType: EntryType.DEBIT, createdAt: { gte: since }, transaction: customerOutflow },
     }),
     tx.ledgerEntry.aggregate({
       _sum: { amount: true },
@@ -170,6 +195,7 @@ export async function assertWithinDailyLimits(
         entryType: EntryType.DEBIT,
         createdAt: { gte: since },
         account: { customerId: account.customer_id, kind: 'CUSTOMER' },
+        transaction: customerOutflow,
       },
     }),
   ]);
@@ -208,12 +234,22 @@ export function toResult(transaction: {
   };
 }
 
-/** TRANSACTIONAL OUTBOX: staged in the same DB transaction as the ledger writes */
-export async function stageTransactionEvent(tx: TxClient, transactionId: string, payload: Record<string, unknown>): Promise<void> {
+/**
+ * TRANSACTIONAL OUTBOX: staged in the same DB transaction as the ledger writes. The Kafka key (outbox
+ * aggregate) is the customer account the event is about (the source of a transfer or withdrawal, the
+ * destination of a deposit or top-up), so one account's events are published and consumed in order: a
+ * top-up is always scored before the transfer that moves it on (fraud's pass-through rule relies on it).
+ */
+export async function stageTransactionEvent(
+  tx: TxClient,
+  transactionId: string,
+  accountKey: string,
+  payload: Record<string, unknown>
+): Promise<void> {
   await tx.outboxEvent.create({
     data: {
       aggregateType: 'TRANSACTION',
-      aggregateId: transactionId,
+      aggregateId: accountKey,
       eventType: 'transaction.completed.v1',
       payload: {
         eventId: crypto.randomUUID(),
@@ -243,35 +279,42 @@ export async function commitThenRefuse<T>(transaction: Promise<T | Refusal>): Pr
   return result;
 }
 
+/**
+ * Appends a hash-chained audit row inside the caller's transaction (see appendAudit): call it after the
+ * transaction's other locks. Outside a transaction, wrap it: prisma.$transaction((tx) => audit(tx, ...)).
+ */
 export async function audit(
-  tx: TxClient | { auditLog: TxClient['auditLog'] },
+  tx: TxClient,
   actorId: string,
   action: string,
   targetId: string,
   details?: Record<string, unknown>
 ): Promise<void> {
-  await tx.auditLog.create({
-    data: { actorId, action, targetId, details: details as Prisma.InputJsonValue | undefined },
-  });
+  await appendAudit(tx, actorId, action, targetId, details);
 }
 
 /**
  * Posts one balanced double-entry movement: `amount` is DEBITED from `debit` and CREDITED to `credit`.
  * Balance semantics: a CUSTOMER account's balance is what the bank owes the customer (credits increase
- * it); every cash account (drawer, vault, suspense) is an asset whose balance is the cash it should hold
- * (debits increase it). Hence sum(CUSTOMER balances) == sum(cash account balances) at all times.
+ * it); every asset account (drawer, vault, suspense, payment clearing) holds what the bank should have
+ * (debits increase it). Hence sum(CUSTOMER balances) == sum(asset balances) at all times.
+ *
+ * Must run inside LedgerCommits.run: the posting is recorded there, and the touched accounts' cached
+ * balances and history are invalidated once (and only if) the transaction commits.
  */
 export async function postDoubleEntry(
   tx: TxClient,
   params: {
     transactionId: string;
+    type: TransactionType;
     debit: LockedAccount;
     credit: LockedAccount;
     amount: bigint;
   }
 ): Promise<{ debitBalance: bigint; creditBalance: bigint }> {
+  notePosting(params.type, [params.debit.id, params.credit.id]);
   const delta = (account: LockedAccount, side: 'DEBIT' | 'CREDIT') =>
-    (account.kind !== 'CUSTOMER') === (side === 'DEBIT') ? params.amount : -params.amount;
+    isAssetKind(account.kind) === (side === 'DEBIT') ? params.amount : -params.amount;
 
   const debitBalance = params.debit.balance + delta(params.debit, 'DEBIT');
   const creditBalance = params.credit.balance + delta(params.credit, 'CREDIT');

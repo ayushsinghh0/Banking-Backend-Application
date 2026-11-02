@@ -1,0 +1,11 @@
+import { chromium } from '@playwright/test';
+const b = await chromium.launch();
+const p = await b.newPage({ viewport: { width: 1440, height: 900 } });
+await p.goto('http://localhost:8080/login');
+let t = Date.now();
+await p.screenshot({ path: process.env.TEMP + '/probe-a.png', timeout: 60000 });
+console.log('viewport shot ms', Date.now() - t);
+t = Date.now();
+await p.screenshot({ path: process.env.TEMP + '/probe-b.png', fullPage: true, animations: 'disabled', timeout: 60000 });
+console.log('fullpage+anim-disabled ms', Date.now() - t);
+await b.close();

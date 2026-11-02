@@ -1,7 +1,7 @@
 import { useId, useMemo, useState, type ReactNode } from 'react';
 import { Link } from 'react-router';
 import { useQueries } from '@tanstack/react-query';
-import { ArrowDownLeft, ArrowLeftRight, ArrowUpRight, Banknote, ChevronRight, Plus, ReceiptText, UserPlus, Wallet } from 'lucide-react';
+import { ArrowDownLeft, ArrowLeftRight, ArrowUpRight, Banknote, ChevronRight, CirclePlus, Plus, ReceiptText, UserPlus, Wallet } from 'lucide-react';
 import type { BankAccount, KycStatus } from '@/lib/api/types';
 import { useApi } from '@/lib/auth/AuthProvider';
 import { qk } from '@/lib/query';
@@ -206,9 +206,11 @@ function QuickActions({ kycStatus, className }: { kycStatus: KycStatus | null | 
     // Labels may wrap to a second line under their circle (as in Control Center), never run into a neighbour
     'group flex min-w-0 flex-col items-center gap-2 rounded-2xl px-0.5 py-1 text-center text-[12.5px] font-medium leading-4 tracking-[-0.01em] [text-wrap:balance] focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-40 cursor-pointer';
   const circle =
-    'flex size-[52px] items-center justify-center rounded-full bg-muted text-foreground transition-[transform,background-color] duration-200 group-hover:bg-secondary group-active:scale-95 group-focus-visible:ring-2 group-focus-visible:ring-ring group-focus-visible:ring-offset-2 group-focus-visible:ring-offset-card [&_svg]:size-[22px]';
+    // Five across: a touch smaller where the side column is narrowest (small laptops)
+    'flex size-[52px] items-center justify-center rounded-full bg-muted text-foreground transition-[transform,background-color] duration-200 group-hover:bg-secondary group-active:scale-95 group-focus-visible:ring-2 group-focus-visible:ring-ring group-focus-visible:ring-offset-2 group-focus-visible:ring-offset-card lg:size-12 xl:size-[52px] [&_svg]:size-[22px]';
   const links = [
     { to: '/transfer', label: 'Transfer', Icon: ArrowLeftRight, primary: true },
+    { to: '/add-money', label: 'Add money', Icon: CirclePlus },
     { to: '/payees?add=1', label: 'Add payee', Icon: UserPlus },
     { to: '/cash-withdrawal', label: 'Withdraw', name: 'Withdraw cash', Icon: Banknote },
   ];
@@ -217,7 +219,7 @@ function QuickActions({ kycStatus, className }: { kycStatus: KycStatus | null | 
       <h2 id={id} className="sr-only">
         Quick actions
       </h2>
-      <div className="grid grid-cols-4 gap-1">
+      <div className="grid grid-cols-5 gap-0.5 sm:gap-1">
         {links.map(({ to, label, name, Icon, primary }) => (
           <Link key={to} to={to} className={action} aria-label={name}>
             <span className={cn(circle, primary && 'bg-ink text-ink-foreground group-hover:bg-ink/85')}>

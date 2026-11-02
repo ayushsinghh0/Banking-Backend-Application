@@ -2,12 +2,31 @@ import express, { Express, Request, Response, NextFunction } from 'express';
 import helmet from 'helmet';
 import { correlationIdMiddleware } from '../middleware/correlation-id.middleware';
 import { NotFoundError } from '../errors/app-error';
+import { httpMetricsMiddleware } from '../observability/metrics';
+import { traceContextMiddleware } from '../observability/trace-context';
+
+declare global {
+  namespace Express {
+    interface Request {
+      /** The exact request bytes, kept only for paths that verify a signature over them (see keepRawBody) */
+      rawBody?: Buffer;
+    }
+  }
+}
+
+export interface BaseAppOptions {
+  /**
+   * Requests whose raw body must be kept (as req.rawBody) next to the parsed JSON, e.g. webhooks whose
+   * signature covers the exact bytes. Re-serialising the parsed body would not reproduce them.
+   */
+  keepRawBody?: (req: Request) => boolean;
+}
 
 /**
  * Creates an Express app with the security baseline shared by every service:
- * hardened headers, no framework fingerprint, bounded JSON bodies, request tracing.
+ * hardened headers, no framework fingerprint, bounded JSON bodies, request tracing and metrics.
  */
-export function createBaseApp(): Express {
+export function createBaseApp(options: BaseAppOptions = {}): Express {
   const app = express();
   app.disable('x-powered-by');
   const trustProxy = parseTrustProxy(process.env.TRUST_PROXY);
@@ -15,8 +34,19 @@ export function createBaseApp(): Express {
     app.set('trust proxy', trustProxy);
   }
   app.use(helmet());
-  app.use(express.json({ limit: '100kb' }));
+  app.use(httpMetricsMiddleware);
+  app.use(
+    express.json({
+      limit: '100kb',
+      verify: options.keepRawBody
+        ? (req, _res, buf) => {
+            if (options.keepRawBody!(req as Request)) (req as Request).rawBody = Buffer.from(buf);
+          }
+        : undefined,
+    })
+  );
   app.use(correlationIdMiddleware);
+  app.use(traceContextMiddleware);
   // Liveness: the process is serving requests. /health (per service) is readiness: its dependencies.
   app.get('/health/live', (_req, res) => {
     res.json({ status: 'UP' });

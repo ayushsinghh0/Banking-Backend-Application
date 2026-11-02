@@ -3,6 +3,7 @@ import {
   Banknote,
   BellRing,
   ClipboardCheck,
+  CreditCard,
   HandCoins,
   House,
   Landmark,
@@ -10,6 +11,7 @@ import {
   ReceiptText,
   ScanFace,
   Search,
+  ShieldAlert,
   ShieldCheck,
   Siren,
   Stamp,
@@ -33,6 +35,10 @@ export interface NavSection {
   title?: string;
   items: NavItem[];
 }
+
+/** Operations shared by several staff roles (platform design, section 14) */
+const payments: NavItem = { to: '/payments', label: 'Payments', icon: CreditCard };
+const securityCentre: NavItem = { to: '/security-centre', label: 'Security centre', short: 'Security', icon: ShieldAlert };
 
 /**
  * Where each role works. Personal settings (profile, security) are not destinations: they live in the
@@ -74,6 +80,7 @@ export const NAVIGATION: Record<Role, NavSection[]> = {
       items: [
         { to: '/fraud', label: 'Fraud alerts', short: 'Alerts', icon: Siren },
         { to: '/notifications', label: 'Notifications', icon: BellRing },
+        payments,
       ],
     },
   ],
@@ -92,6 +99,8 @@ export const NAVIGATION: Record<Role, NavSection[]> = {
         { to: '/cash-operations', label: 'Cash operations', short: 'Cash', icon: HandCoins },
         { to: '/fraud', label: 'Fraud alerts', short: 'Alerts', icon: Siren },
         { to: '/notifications', label: 'Notifications', icon: BellRing },
+        payments,
+        securityCentre,
       ],
     },
   ],
@@ -122,6 +131,8 @@ export const NAVIGATION: Record<Role, NavSection[]> = {
       items: [
         { to: '/fraud', label: 'Fraud alerts', short: 'Alerts', icon: Siren },
         { to: '/notifications', label: 'Notifications', icon: BellRing },
+        payments,
+        securityCentre,
       ],
     },
   ],

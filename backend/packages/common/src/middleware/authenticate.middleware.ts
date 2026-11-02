@@ -11,6 +11,7 @@ import {
 } from '../errors/app-error';
 import { logger } from '../logger/logger';
 import { isAddressAllowed, staffNetworkError, staffNetworksFromEnv } from '../http/network';
+import { tagPolicy } from '../auth/route-policy';
 
 declare global {
   namespace Express {
@@ -112,8 +113,9 @@ export function createAuthenticate(tokenState: TokenStateStore, options: Authent
   };
 }
 
-export function requireRoles(...roles: UserRole[]) {
-  return (req: Request, _res: Response, next: NextFunction): void => {
+export function requireRoles(...roles: UserRole[]): RequestHandler {
+  if (!roles.length) throw new Error('requireRoles() needs at least one role');
+  const handler = (req: Request, _res: Response, next: NextFunction): void => {
     if (!req.user) {
       next(new UnauthorizedError());
       return;
@@ -124,6 +126,8 @@ export function requireRoles(...roles: UserRole[]) {
     }
     next();
   };
+  // Readable by the route-policy tests (see auth/route-policy.ts)
+  return tagPolicy(handler, { kind: 'roles', roles });
 }
 
 export function getAuthenticatedUser(req: Request): AuthenticatedUser {

@@ -1,11 +1,14 @@
 import { delay, http } from 'msw';
-import { screen, waitFor, within } from '@testing-library/react';
-import { afterEach, describe, expect, it } from 'vitest';
+import { fireEvent, screen, waitFor, within } from '@testing-library/react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { server } from '@/test/server';
 import { apiUrl, fail, ok, renderWithApp } from '@/test/render';
 import { anAlert, IDS } from '@/test/fixtures';
 import { STAFF, asStaff, queryOf, resetToasts } from './testing';
+import { emitRealtime } from '@/features/ops/test/realtime';
 import FraudAlertsPage from './FraudAlertsPage';
+
+vi.mock('@/lib/realtime', async () => (await import('@/features/ops/test/realtime')).realtimeModule);
 
 afterEach(resetToasts);
 
@@ -121,5 +124,41 @@ describe('FraudAlertsPage', () => {
     renderWithApp(<FraudAlertsPage />, { ...asStaff('FRAUD_ANALYST'), route: '/fraud' });
     await screen.findByText('No open alerts');
     expect(screen.queryByText(/only fraud analysts can triage alerts/i)).not.toBeInTheDocument();
+  });
+
+  it('refreshes the queue live and tells the analyst, with a way to the new alert', async () => {
+    const calls = alertsHandler(() => ok([anAlert()]));
+    renderWithApp(<FraudAlertsPage />, { ...asStaff('FRAUD_ANALYST'), route: '/fraud' });
+    await screen.findByRole('button', { name: /open alert: amount/i });
+    const before = calls.length;
+    emitRealtime('fraud.alert', { alertId: 'alert-9', severity: 'HIGH', accountId: IDS.savings });
+    await waitFor(() => expect(calls.length).toBeGreaterThan(before));
+    expect(await screen.findByText('New alert')).toBeInTheDocument();
+    expect(screen.getByText('High severity')).toBeInTheDocument();
+    // A plain click: the toast's swipe handling wants pointer capture, which jsdom lacks
+    fireEvent.click(screen.getByRole('button', { name: 'View' }));
+    expect(screen.getByTestId('location')).toHaveTextContent('/fraud/alert-9');
+  });
+
+  it('counts a burst of alerts into one toast', async () => {
+    alertsHandler(() => ok([]));
+    renderWithApp(<FraudAlertsPage />, { ...asStaff('FRAUD_ANALYST'), route: '/fraud' });
+    await screen.findByText('No open alerts');
+    emitRealtime('fraud.alert', { alertId: 'alert-8', severity: 'LOW', accountId: IDS.savings });
+    expect(await screen.findByText('New alert')).toBeInTheDocument();
+    emitRealtime('fraud.alert', { alertId: 'alert-9', severity: 'CRITICAL', accountId: IDS.savings });
+    expect(await screen.findByText('2 new alerts')).toBeInTheDocument();
+    expect(screen.queryByText('New alert')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'View queue' })).toBeInTheDocument();
+  });
+
+  it('refreshes quietly for colleagues who don’t triage', async () => {
+    const calls = alertsHandler(() => ok([]));
+    renderWithApp(<FraudAlertsPage />, { ...asStaff('SUPPORT'), route: '/fraud' });
+    await screen.findByText('No open alerts');
+    const before = calls.length;
+    emitRealtime('fraud.alert', { alertId: 'alert-9', severity: 'HIGH', accountId: IDS.savings });
+    await waitFor(() => expect(calls.length).toBeGreaterThan(before));
+    expect(screen.queryByText('New alert')).not.toBeInTheDocument();
   });
 });

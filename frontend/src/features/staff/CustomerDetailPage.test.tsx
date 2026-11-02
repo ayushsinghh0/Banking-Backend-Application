@@ -6,6 +6,7 @@ import { apiUrl, fail, ok, renderWithApp } from '@/test/render';
 import { aBalance, aDirectoryUser, aKycEvent, anAccount, anEntry, aProfile, IDS } from '@/test/fixtures';
 import type { BankAccount, CustomerProfile, DirectoryUser, KycEvent } from '@/lib/api/types';
 import { STAFF, asStaff, queryOf, resetToasts } from './testing';
+import { aSession, sessionsHandler } from '@/features/ops/test/handlers';
 import CustomerDetailPage from './CustomerDetailPage';
 
 afterEach(resetToasts);
@@ -50,6 +51,10 @@ function setup({ profile = aProfile(), accounts = [anAccount()], history = [aKyc
     http.get(apiUrl('/auth/admin/users'), ({ request }) => {
       log(request);
       return respond(directory);
+    }),
+    sessionsHandler((request) => {
+      log(request);
+      return [aSession()];
     })
   );
   return requests;
@@ -540,5 +545,32 @@ describe('CustomerDetailPage — sign-in controls', () => {
     renderWithApp(<CustomerDetailPage />, { ...asStaff('BANK_ADMIN'), route: `/customers/${STAFF.admin}`, path: PATH });
     expect(await screen.findByText(/you can’t change your own sign-in/i)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Disable sign-in' })).not.toBeInTheDocument();
+  });
+});
+
+describe('CustomerDetailPage — sessions and devices', () => {
+  it('shows support where the customer is signed in, read-only', async () => {
+    const requests = setup();
+    render('SUPPORT');
+    const panel = await screen.findByRole('region', { name: 'Sessions and devices' });
+    expect(await within(panel).findByText('Chrome on Windows')).toBeInTheDocument();
+    expect(within(panel).getByText('203.0.113.x')).toBeInTheDocument();
+    expect(within(panel).queryByRole('button', { name: /sign out/i })).not.toBeInTheDocument();
+    expect(requests).toContain(`GET /auth/admin/users/${IDS.customer}/sessions`);
+  });
+
+  it('lets administrators sign a session out', async () => {
+    setup();
+    render('BANK_ADMIN');
+    const panel = await screen.findByRole('region', { name: 'Sessions and devices' });
+    expect(await within(panel).findByRole('button', { name: 'Sign out Chrome on Windows, 203.0.113.x' })).toBeInTheDocument();
+  });
+
+  it.each(['KYC_OFFICER', 'FRAUD_ANALYST', 'TELLER'] as const)('keeps sessions from %s', async (role) => {
+    const requests = setup();
+    render(role);
+    expect(await screen.findByRole('heading', { level: 1, name: 'Asha Rao' })).toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Sessions and devices' })).not.toBeInTheDocument();
+    expect(requests.some((r) => r.includes('/sessions'))).toBe(false);
   });
 });

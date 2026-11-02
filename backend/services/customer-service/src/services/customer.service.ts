@@ -1,6 +1,6 @@
 import { PrismaClient, Prisma, CustomerProfile, KycStatus } from '../../generated/client';
-import Redis from 'ioredis';
-import { AuthenticatedUser, ConflictError, ForbiddenError, HttpError, NotFoundError, logger } from '@banksphere/common';
+import { AuthenticatedUser, ConflictError, ForbiddenError, HttpError, NotFoundError } from '@banksphere/common';
+import { CustomerCache } from './customer-cache';
 
 export interface CreateProfileDTO {
   userId: string;
@@ -26,68 +26,23 @@ export interface StaffProfileFilter {
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export class CustomerService {
-  private readonly cacheTTLSeconds: number;
-
   constructor(
     private readonly prisma: PrismaClient,
-    private readonly redis: Redis,
-    cacheTTLSeconds = 1800 // 30 minutes default TTL
-  ) {
-    this.cacheTTLSeconds = cacheTTLSeconds;
-  }
-
-  private getCacheKey(userId: string): string {
-    return `customer:profile:${userId}`;
-  }
+    private readonly cache: CustomerCache = new CustomerCache()
+  ) {}
 
   /**
-   * CACHE-ASIDE PATTERN:
-   * 1. Query Redis cache first.
-   * 2. On Cache Hit: return cached JSON immediately.
-   * 3. On Cache Miss: query PostgreSQL, populate Redis (only if still empty), and return result.
-   *
-   * Consistency: writers store the profile they just committed (see storeCommittedProfile), and a reader
-   * only fills an EMPTY slot (SET NX). A reader that loaded an older version before a concurrent write can
-   * therefore never replace what that writer stored. (The Redis ACL allows GET/SET/DEL only, no scripts.)
+   * The caller's own profile, read through the cache (see CustomerCache). A missing profile is a 404 and is
+   * never cached, so creating one needs no invalidation.
    */
   public async getProfileByUserId(
     userId: string
   ): Promise<{ profile: CustomerProfile; fromCache: boolean }> {
-    const cacheKey = this.getCacheKey(userId);
-
-    // 1. Check Redis cache
-    try {
-      const cached = await this.redis.get(cacheKey);
-      if (cached) {
-        const parsed = JSON.parse(cached);
-        // Re-hydrate Date objects
-        if (parsed.dateOfBirth) parsed.dateOfBirth = new Date(parsed.dateOfBirth);
-        if (parsed.createdAt) parsed.createdAt = new Date(parsed.createdAt);
-        if (parsed.updatedAt) parsed.updatedAt = new Date(parsed.updatedAt);
-        return { profile: parsed, fromCache: true };
-      }
-    } catch (cacheErr) {
-      // Non-blocking cache error: log and fallback directly to Postgres
-      logger.warn({ err: cacheErr }, 'Redis cache read failed, falling back to database');
-    }
-
-    // 2. Query PostgreSQL
-    const profile = await this.prisma.customerProfile.findUnique({
-      where: { userId },
+    return this.cache.profile(userId, async () => {
+      const profile = await this.prisma.customerProfile.findUnique({ where: { userId } });
+      if (!profile) throw new NotFoundError('Customer profile not found');
+      return profile;
     });
-
-    if (!profile) {
-      throw new NotFoundError('Customer profile not found');
-    }
-
-    // 3. Populate Redis with TTL, unless a writer stored a (newer) profile meanwhile
-    try {
-      await this.redis.set(cacheKey, JSON.stringify(profile), 'EX', this.cacheTTLSeconds, 'NX');
-    } catch (cacheErr) {
-      logger.warn({ err: cacheErr }, 'Redis cache write failed');
-    }
-
-    return { profile, fromCache: false };
   }
 
   /**
@@ -112,7 +67,6 @@ export class CustomerService {
       },
     });
 
-    await this.storeCommittedProfile(profile);
     return profile;
   }
 
@@ -167,49 +121,28 @@ export class CustomerService {
           },
         });
       }
-      return result;
+      return { result, resetKyc };
     });
 
-    await this.storeCommittedProfile(updated);
-    return updated;
+    // After the commit: an identity change that sent KYC back to PENDING also makes the KYC view stale
+    if (updated.resetKyc) await this.cache.kycChanged(userId);
+    else await this.cache.profileChanged(userId);
+    return updated.result;
   }
 
   /**
-   * CACHE UPDATE ON MUTATION (write-through): after a commit, the cache gets the committed profile, unless it
-   * already holds a newer version (two writers finishing out of order). If Redis fails here, the entry is
-   * dropped so a stale profile can't outlive the write.
-   */
-  private async storeCommittedProfile(profile: CustomerProfile): Promise<void> {
-    const cacheKey = this.getCacheKey(profile.userId);
-    try {
-      const cached = await this.redis.get(cacheKey);
-      const cachedVersion = cached ? Number(JSON.parse(cached)?.version) : NaN;
-      if (Number.isInteger(cachedVersion) && cachedVersion > profile.version) return;
-      await this.redis.set(cacheKey, JSON.stringify(profile), 'EX', this.cacheTTLSeconds);
-    } catch (cacheErr) {
-      logger.warn({ err: cacheErr }, 'Redis cache update failed, dropping the entry');
-      await this.invalidateCache(profile.userId);
-    }
-  }
-
-  private async invalidateCache(userId: string): Promise<void> {
-    try {
-      await this.redis.del(this.getCacheKey(userId));
-    } catch (cacheErr) {
-      logger.warn({ err: cacheErr }, 'Redis cache invalidation failed');
-    }
-  }
-
-  /**
-   * Authoritative KYC status (bypasses the cache: used for account-opening decisions).
-   * Customers without a profile are reported as PENDING.
+   * KYC status for account-opening decisions, cached for 60 s and invalidated after every committed decision
+   * or KYC reset, so a reader never sees a status older than the last commit. Customers without a profile are
+   * reported as PENDING.
    */
   public async getKycStatus(userId: string): Promise<KycStatus> {
-    const profile = await this.prisma.customerProfile.findUnique({
-      where: { userId },
-      select: { kycStatus: true },
+    return this.cache.kycStatus(userId, async () => {
+      const profile = await this.prisma.customerProfile.findUnique({
+        where: { userId },
+        select: { kycStatus: true },
+      });
+      return profile?.kycStatus ?? KycStatus.PENDING;
     });
-    return profile?.kycStatus ?? KycStatus.PENDING;
   }
 
   /**
@@ -251,7 +184,7 @@ export class CustomerService {
       return tx.customerProfile.findUniqueOrThrow({ where: { userId } });
     });
 
-    await this.storeCommittedProfile(updated);
+    await this.cache.kycChanged(userId);
     return updated;
   }
 

@@ -1,0 +1,247 @@
+# Who may call whom (ingress side). Every edge also needs the matching egress rule in egress-apps.yaml.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: web-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: web
+  policyTypes:
+    - Ingress
+  ingress:
+    # Only the ingress controller (namespace and pod labels of a standard ingress-nginx install)
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-gateway-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: api-gateway
+  policyTypes:
+    - Ingress
+  ingress:
+    # Only through the web pods' nginx, which overwrites X-Forwarded-For (the gateway trusts exactly one hop)
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: web
+      ports:
+        - protocol: TCP
+          port: 8000
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: auth-service-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: auth-service
+  policyTypes:
+    - Ingress
+  ingress:
+    # public auth API
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: api-gateway
+      ports:
+        - protocol: TCP
+          port: 8001
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: customer-service-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: customer-service
+  policyTypes:
+    - Ingress
+  ingress:
+    # profiles/KYC; internal KYC checks (CUSTOMER_INTERNAL_TOKEN) and the assistant's tools
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: api-gateway
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: account-service
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: payment-service
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: assistant-service
+      ports:
+        - protocol: TCP
+          port: 8002
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: account-service-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: account-service
+  policyTypes:
+    - Ingress
+  ingress:
+    # accounts API; the assistant's list_accounts tool
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: api-gateway
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: assistant-service
+      ports:
+        - protocol: TCP
+          port: 8003
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: transaction-service-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: transaction-service
+  policyTypes:
+    - Ingress
+  ingress:
+    # ledger API; ledger provisioning (account), payment credits/refunds (/internal/v1/payments), the assistant's tools
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: api-gateway
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: account-service
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: payment-service
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: assistant-service
+      ports:
+        - protocol: TCP
+          port: 8004
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: notification-service-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: notification-service
+  policyTypes:
+    - Ingress
+  ingress:
+    # staff notification API
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: api-gateway
+      ports:
+        - protocol: TCP
+          port: 8005
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fraud-service-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: fraud-service
+  policyTypes:
+    - Ingress
+  ingress:
+    # fraud alerts API
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: api-gateway
+      ports:
+        - protocol: TCP
+          port: 8006
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: payment-service-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: payment-service
+  policyTypes:
+    - Ingress
+  ingress:
+    # top-ups API and Razorpay webhooks (via web and the gateway); the assistant's list_top_ups tool
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: api-gateway
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: assistant-service
+      ports:
+        - protocol: TCP
+          port: 8007
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: assistant-service-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: assistant-service
+  policyTypes:
+    - Ingress
+  ingress:
+    # assistant API (SSE)
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: api-gateway
+      ports:
+        - protocol: TCP
+          port: 8008
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: realtime-service-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: realtime-service
+  policyTypes:
+    - Ingress
+  ingress:
+    # event stream (SSE)
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: api-gateway
+      ports:
+        - protocol: TCP
+          port: 8009

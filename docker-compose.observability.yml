@@ -1,0 +1,7 @@
+# Observability overlay for the full stack: Prometheus, Grafana (provisioned dashboards), alert rules and the
+# Postgres, Redis and Kafka exporters. Dev and staging only unless you put Grafana behind your own sign-on.
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml -f docker-compose.observability.yml up -d
+# Grafana: http://localhost:3000, Prometheus: http://localhost:9090 (both bound to 127.0.0.1).
+include:
+  - path: backend/docker-compose.observability.yml
+    env_file: backend/.env

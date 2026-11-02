@@ -2,6 +2,7 @@ import { useLocation, useNavigate } from 'react-router';
 import { useQuery } from '@tanstack/react-query';
 import { ShieldCheck } from 'lucide-react';
 import { useApi, useUser } from '@/lib/auth/AuthProvider';
+import { useLiveFraudAlerts } from '@/features/ops/useLiveFraudAlerts';
 import { qk } from '@/lib/query';
 import type { AlertStatus, FraudAlert } from '@/lib/api/types';
 import { Badge, Callout, Card, Mono, PageHeader } from '@/components/ui/primitives';
@@ -52,6 +53,8 @@ export default function FraudAlertsPage() {
   const tab = TABS.find((t) => t.value === params.get('status')) ?? TABS[0]!;
   const triages = user.role === 'FRAUD_ANALYST';
   const now = Date.now();
+  // New alerts arrive live: the list refreshes, and analysts get a quiet heads-up
+  useLiveFraudAlerts({ notify: triages });
 
   const query = useQuery({
     queryKey: qk.alerts(tab.status, offset),

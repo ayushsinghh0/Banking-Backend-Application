@@ -94,11 +94,14 @@ export class BeneficiaryService {
   }
 
   public async remove(customer: AuthenticatedUser, beneficiaryId: string) {
-    const result = await this.prisma.beneficiary.updateMany({
-      where: { id: beneficiaryId, customerId: customer.id, revokedAt: null },
-      data: { revokedAt: new Date() },
+    // The removal and its audit row commit together
+    await this.prisma.$transaction(async (tx) => {
+      const result = await tx.beneficiary.updateMany({
+        where: { id: beneficiaryId, customerId: customer.id, revokedAt: null },
+        data: { revokedAt: new Date() },
+      });
+      if (result.count !== 1) throw new NotFoundError('Beneficiary not found');
+      await audit(tx, customer.id, 'BENEFICIARY_REMOVED', beneficiaryId);
     });
-    if (result.count !== 1) throw new NotFoundError('Beneficiary not found');
-    await audit(this.prisma, customer.id, 'BENEFICIARY_REMOVED', beneficiaryId);
   }
 }

@@ -5,6 +5,7 @@ import type {
   Beneficiary,
   CashOperation,
   CustomerProfile,
+  DeviceSession,
   DirectoryUser,
   FraudAlert,
   FraudAlertEvent,
@@ -12,7 +13,10 @@ import type {
   LedgerEntry,
   Me,
   NotificationLog,
+  PaymentConfig,
+  SecurityEvent,
   TellerSession,
+  TopUp,
 } from '@/lib/api/types';
 
 /** Stable ids so tests can refer to them */
@@ -206,5 +210,63 @@ export const aNotificationLog = (o: Partial<NotificationLog> = {}): Notification
   retryCount: 0,
   lastError: null,
   createdAt: NOW,
+  ...o,
+});
+
+export type PaymentConfigOverrides = Omit<Partial<PaymentConfig>, 'limits'> & { limits?: Partial<PaymentConfig['limits']> };
+
+export const aPaymentConfig = (o: PaymentConfigOverrides = {}): PaymentConfig => ({
+  provider: 'RAZORPAY',
+  mode: 'simulator',
+  keyId: 'rzp_test_banksphere',
+  ...o,
+  limits: {
+    minPaise: '100',
+    maxPaise: '10000000',
+    dailyLimitPaise: '20000000',
+    usedTodayPaise: '5000000',
+    remainingTodayPaise: '15000000',
+    ...o.limits,
+  },
+});
+
+export const aTopUp = (o: Partial<TopUp> = {}): TopUp => ({
+  id: 'top-1',
+  accountId: IDS.savings,
+  accountNumberLast4: '6789',
+  amountPaise: '50000',
+  currency: 'INR',
+  status: 'CREATED',
+  method: null,
+  providerOrderId: 'order_SIM1',
+  providerPaymentId: null,
+  failureReason: null,
+  createdAt: NOW,
+  updatedAt: NOW,
+  creditedAt: null,
+  expiresAt: '2026-10-27T10:00:00.000Z',
+  refundedAt: null,
+  refundReason: null,
+  ...o,
+});
+
+export const aDeviceSession = (o: Partial<DeviceSession> = {}): DeviceSession => ({
+  id: 'dev-1',
+  current: true,
+  deviceLabel: 'Chrome on Windows',
+  ipMasked: '203.0.113.x',
+  createdAt: '2026-10-20T08:00:00.000Z',
+  lastSeenAt: NOW,
+  mfa: false,
+  ...o,
+});
+
+export const aSecurityEvent = (o: Partial<SecurityEvent> = {}): SecurityEvent => ({
+  id: 'sec-1',
+  type: 'SIGN_IN_SUCCEEDED',
+  deviceLabel: 'Chrome on Windows',
+  ipMasked: '203.0.113.x',
+  at: NOW,
+  details: null,
   ...o,
 });

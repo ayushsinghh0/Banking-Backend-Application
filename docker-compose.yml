@@ -37,5 +37,7 @@ services:
       API_UPSTREAM: api-gateway:8000
       # Set to your load balancer's CIDR if one terminates TLS in front of this container
       TRUSTED_PROXY_CIDR: ${WEB_TRUSTED_PROXY_CIDR:-127.0.0.1/32}
+      # "on" when payment-service uses real Razorpay keys: lets Razorpay Checkout's script and frames load
+      RAZORPAY_CHECKOUT: ${RAZORPAY_CHECKOUT:-off}
     depends_on:
       api-gateway: { condition: service_healthy }

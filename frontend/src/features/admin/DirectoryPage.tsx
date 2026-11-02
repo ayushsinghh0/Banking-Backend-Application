@@ -1,7 +1,7 @@
 import { useEffect, useId, useState } from 'react';
 import { Link, useSearchParams } from 'react-router';
 import { keepPreviousData, useQuery } from '@tanstack/react-query';
-import { Search, UserPlus, Users } from 'lucide-react';
+import { MonitorSmartphone, Search, UserPlus, Users } from 'lucide-react';
 import { useApi, useUser } from '@/lib/auth/AuthProvider';
 import { ROLES, type Role } from '@/lib/auth/session';
 import type { DirectoryUser } from '@/lib/api/types';
@@ -9,6 +9,7 @@ import { qk } from '@/lib/query';
 import { Button } from '@/components/ui/button';
 import { DataTable, Pagination, type Column } from '@/components/ui/data';
 import { Input, NativeSelect } from '@/components/ui/input';
+import { Tooltip } from '@/components/ui/overlays';
 import { Avatar, Badge, Card, PageHeader } from '@/components/ui/primitives';
 import { cn } from '@/lib/cn';
 import { formatDate } from './components/format';
@@ -16,6 +17,7 @@ import { RequestStaffDialog } from './components/RequestStaffDialog';
 import { ROLE_INFO, STAFF_ROLES, roleLabel } from './components/roles';
 import { useDebouncedValue } from './components/useDebouncedValue';
 import { UserActionDialog, UserActionsMenu, type UserAction } from './components/UserActions';
+import { UserSessionsSheet } from './components/UserSessionsSheet';
 
 const PAGE_SIZE = 20;
 
@@ -60,6 +62,7 @@ export default function DirectoryPage() {
     placeholderData: keepPreviousData,
   });
 
+  const [sessionsFor, setSessionsFor] = useState<DirectoryUser | null>(null);
   const [action, setAction] = useState<UserAction | null>(null);
   const [actionOpen, setActionOpen] = useState(false);
   const [requestOpen, setRequestOpen] = useState(false);
@@ -127,8 +130,30 @@ export default function DirectoryPage() {
               setAction(next);
               setActionOpen(true);
             }}
+            onSessions={setSessionsFor}
           />
         ),
+    });
+  } else {
+    // Read-only: support can still see where someone is signed in
+    columns.push({
+      key: 'sessions',
+      header: <span className="sr-only">Sessions</span>,
+      align: 'right',
+      className: 'w-14 max-md:pl-0',
+      cell: (user) => (
+        <Tooltip content="Sessions and devices">
+          <Button
+            variant="ghost"
+            size="icon"
+            className="text-muted-foreground hover:text-foreground max-md:size-11"
+            aria-label={`Sessions and devices for ${user.email}`}
+            onClick={() => setSessionsFor(user)}
+          >
+            <MonitorSmartphone aria-hidden="true" />
+          </Button>
+        </Tooltip>
+      ),
     });
   }
 
@@ -227,6 +252,7 @@ export default function DirectoryPage() {
           />
         ) : null}
       </Card>
+      {sessionsFor ? <UserSessionsSheet user={sessionsFor} canRevoke={canManage} onClose={() => setSessionsFor(null)} /> : null}
       {canManage ? (
         <>
           <UserActionDialog action={action} open={actionOpen} onOpenChange={setActionOpen} />

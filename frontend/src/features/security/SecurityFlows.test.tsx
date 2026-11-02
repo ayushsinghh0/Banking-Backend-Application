@@ -1,6 +1,6 @@
 import { http } from 'msw';
 import { screen, waitFor, within } from '@testing-library/react';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { server } from '@/test/server';
 import { apiUrl, fail, ok, renderWithApp } from '@/test/render';
 import { makeAccessToken } from '@/test/tokens';
@@ -8,6 +8,7 @@ import { aMe } from '@/test/fixtures';
 import MfaEnrolPage from '@/features/auth/MfaEnrolPage';
 import { setEnrolmentToken } from '@/features/auth/enrolment';
 import SecurityPage from './SecurityPage';
+import { mockSecurityApi } from './testing';
 
 const SETUP = { secret: 'JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP', otpauthUri: 'otpauth://totp/BankSphere:meera?secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP&issuer=BankSphere' };
 
@@ -96,6 +97,9 @@ describe('MfaEnrolPage (staff)', () => {
 });
 
 describe('SecurityPage', () => {
+  // Sessions and sign-in activity have their own tests (Sessions.test.tsx)
+  beforeEach(() => mockSecurityApi());
+
   it('changes the password and adopts the new session tokens', async () => {
     const fresh = makeAccessToken({ sub: 'u-new-token' });
     let body: unknown;

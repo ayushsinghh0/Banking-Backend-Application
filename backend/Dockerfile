@@ -14,6 +14,10 @@ COPY services/account-service/package.json services/account-service/
 COPY services/transaction-service/package.json services/transaction-service/
 COPY services/notification-service/package.json services/notification-service/
 COPY services/fraud-service/package.json services/fraud-service/
+COPY services/payment-service/package.json services/payment-service/
+COPY services/assistant-service/package.json services/assistant-service/
+COPY services/realtime-service/package.json services/realtime-service/
+COPY services/razorpay-simulator/package.json services/razorpay-simulator/
 RUN npm ci --no-audit --no-fund
 COPY packages ./packages
 COPY services ./services

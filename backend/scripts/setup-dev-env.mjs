@@ -30,7 +30,31 @@ function writeIfAbsent(file, content, overwrite = force) {
   console.log(`write  ${path.relative(root, file)}`);
 }
 
-const SERVICES = ['AUTH', 'CUSTOMER', 'ACCOUNT', 'LEDGER', 'NOTIFICATION', 'FRAUD'];
+const SERVICES = ['AUTH', 'CUSTOMER', 'ACCOUNT', 'LEDGER', 'NOTIFICATION', 'FRAUD', 'PAYMENT', 'ASSISTANT'];
+const CACHE_USERS = ['LEDGER', 'ACCOUNT', 'CUSTOMER', 'PAYMENT', 'ASSISTANT', 'REALTIME'];
+
+// Secrets added after the first release: written into new .env files and appended to existing ones.
+// Razorpay keys are the simulator's (rzp_test_ prefix, random); replace them with real test/live keys to talk
+// to Razorpay. LLM_API_KEY stays empty: the assistant then uses its built-in engine.
+const laterSecrets = () => [
+  ...SERVICES.flatMap((s) => [
+    [`${s}_DB_OWNER_PASSWORD`, secret()],
+    [`${s}_DB_APP_PASSWORD`, secret()],
+  ]),
+  ...CACHE_USERS.map((u) => [`REDIS_CACHE_${u}_PASSWORD`, secret()]),
+  ['KAFKA_PAYMENT_PASSWORD', secret()],
+  ['KAFKA_REALTIME_PASSWORD', secret()],
+  ['PAYMENT_LEDGER_INTERNAL_TOKEN', token()],
+  ['RAZORPAY_KEY_ID', `rzp_test_sim${crypto.randomBytes(6).toString('hex')}`],
+  ['RAZORPAY_KEY_SECRET', crypto.randomBytes(18).toString('base64url')],
+  ['RAZORPAY_WEBHOOK_SECRET', secret()],
+  ['LLM_API_KEY', ''],
+  // Observability overlay (docker-compose.observability.yml): least-privilege monitoring principals and Grafana
+  ['MONITORING_DB_PASSWORD', secret()],
+  ['REDIS_CACHE_MONITOR_PASSWORD', secret()],
+  ['KAFKA_MONITOR_PASSWORD', secret()],
+  ['GRAFANA_ADMIN_PASSWORD', secret()],
+];
 
 const rootEnvFile = path.join(root, '.env');
 if (!fs.existsSync(rootEnvFile) || force) {
@@ -79,6 +103,9 @@ STAFF_ALLOWED_CIDRS=127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1/128
   );
 } else {
   console.log('skip   .env (exists)');
+}
+
+{
   // Secrets introduced after the .env was generated are appended, never rotated
   const existing = fs.readFileSync(rootEnvFile, 'utf8');
   const added = [
@@ -88,6 +115,7 @@ STAFF_ALLOWED_CIDRS=127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1/128
     ['STAFF_EMAIL_DOMAIN', 'banksphere.local'],
     ['GATEWAY_TRUST_PROXY', '0'],
     ['STAFF_ALLOWED_CIDRS', '127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1/128'],
+    ...laterSecrets(),
   ].filter(([k]) => !new RegExp(`^${k}=`, 'm').test(existing));
   if (added.length) {
     fs.appendFileSync(rootEnvFile, `${existing.endsWith('\n') ? '' : '\n'}${added.map(([k, v]) => `${k}=${v}`).join('\n')}\n`);
@@ -133,13 +161,20 @@ const reader = redis('reader', 'REDIS_READER_PASSWORD');
 
 const kafka = (user, pw) => `KAFKA_USERNAME=${user}\nKAFKA_PASSWORD=${env[pw]}\n`;
 
+// Cache Redis ACL users (docker/redis/cache-start.sh), published on 6382 by the dev overlay
+const cache = (user, pw) => `CACHE_REDIS_URL="redis://${user}:${env[pw]}@127.0.0.1:6382"\n`;
+
 const services = {
   'auth-service': `PORT=8001\nKAFKA_CLIENT_ID=auth-service\n${redis('auth-svc', 'REDIS_AUTH_PASSWORD')}RATE_LIMIT_REDIS_URL="redis://:${env.RATE_LIMIT_REDIS_PASSWORD}@127.0.0.1:6381"\nSTAFF_EMAIL_DOMAIN=${env.STAFF_EMAIL_DOMAIN}\n${kafka('auth-svc', 'KAFKA_AUTH_PASSWORD')}${db('AUTH', 'auth_schema')}\nJWT_SIGNING_KEY="${env.JWT_SIGNING_KEY}"\nJWT_SIGNING_KEY_ID=${env.JWT_SIGNING_KEY_ID}\nJWT_ACCESS_EXPIRATION=${env.JWT_ACCESS_EXPIRATION}\nJWT_REFRESH_EXPIRATION_DAYS=${env.JWT_REFRESH_EXPIRATION_DAYS}\nMFA_ENCRYPTION_KEY=${env.MFA_ENCRYPTION_KEY}\nAPP_BASE_URL=${env.APP_BASE_URL}\n${smtp}# Relaxed per-IP limits so the local e2e suite can be re-run (production defaults: 30 / 10 per 15 min)\nAUTH_RATE_LIMIT_MAX=500\nAUTH_RECOVERY_RATE_LIMIT_MAX=500\n`,
-  'customer-service': `PORT=8002\n${redis('customer-svc', 'REDIS_CUSTOMER_PASSWORD')}${db('CUSTOMER', 'customer_schema')}\nCUSTOMER_INTERNAL_TOKEN="${env.CUSTOMER_INTERNAL_TOKEN}"\n`,
-  'account-service': `PORT=8003\n${reader}KAFKA_CLIENT_ID=account-service\n${kafka('account-svc', 'KAFKA_ACCOUNT_PASSWORD')}LEDGER_SERVICE_URL=http://localhost:8004\nCUSTOMER_SERVICE_URL=http://localhost:8002\n${db('ACCOUNT', 'account_schema')}\nLEDGER_INTERNAL_TOKEN="${env.LEDGER_INTERNAL_TOKEN}"\nCUSTOMER_INTERNAL_TOKEN="${env.CUSTOMER_INTERNAL_TOKEN}"\n`,
-  'transaction-service': `PORT=8004\n${reader}# Dev only: a just-enrolled authenticator counts for step-up (production: 24h)\nMFA_FACTOR_MIN_AGE_HOURS=0\nKAFKA_CLIENT_ID=transaction-service\n${kafka('ledger-svc', 'KAFKA_LEDGER_PASSWORD')}${db('LEDGER', 'ledger_schema')}\nLEDGER_INTERNAL_TOKEN="${env.LEDGER_INTERNAL_TOKEN}"\n`,
+  'customer-service': `PORT=8002\n${redis('customer-svc', 'REDIS_CUSTOMER_PASSWORD')}${cache('customer-svc', 'REDIS_CACHE_CUSTOMER_PASSWORD')}${db('CUSTOMER', 'customer_schema')}\nCUSTOMER_INTERNAL_TOKEN="${env.CUSTOMER_INTERNAL_TOKEN}"\n`,
+  'account-service': `PORT=8003\n${reader}${cache('account-svc', 'REDIS_CACHE_ACCOUNT_PASSWORD')}KAFKA_CLIENT_ID=account-service\n${kafka('account-svc', 'KAFKA_ACCOUNT_PASSWORD')}LEDGER_SERVICE_URL=http://localhost:8004\nCUSTOMER_SERVICE_URL=http://localhost:8002\n${db('ACCOUNT', 'account_schema')}\nLEDGER_INTERNAL_TOKEN="${env.LEDGER_INTERNAL_TOKEN}"\nCUSTOMER_INTERNAL_TOKEN="${env.CUSTOMER_INTERNAL_TOKEN}"\n`,
+  'transaction-service': `PORT=8004\n${reader}${cache('ledger-svc', 'REDIS_CACHE_LEDGER_PASSWORD')}# Dev only: a just-enrolled authenticator counts for step-up (production: 24h)\nMFA_FACTOR_MIN_AGE_HOURS=0\nKAFKA_CLIENT_ID=transaction-service\n${kafka('ledger-svc', 'KAFKA_LEDGER_PASSWORD')}${db('LEDGER', 'ledger_schema')}\nLEDGER_INTERNAL_TOKEN="${env.LEDGER_INTERNAL_TOKEN}"\nPAYMENT_LEDGER_INTERNAL_TOKEN="${env.PAYMENT_LEDGER_INTERNAL_TOKEN}"\n`,
   'notification-service': `PORT=8005\n${reader}KAFKA_CLIENT_ID=notification-service\n${kafka('notification-svc', 'KAFKA_NOTIFICATION_PASSWORD')}SECURITY_ALERT_EMAIL=${env.SECURITY_ALERT_EMAIL}\n${db('NOTIFICATION', 'notification_schema')}\n${smtp}`,
   'fraud-service': `PORT=8006\n${reader}KAFKA_CLIENT_ID=fraud-service\n${kafka('fraud-svc', 'KAFKA_FRAUD_PASSWORD')}${db('FRAUD', 'fraud_schema')}\n`,
+  'payment-service': `PORT=8007\n${reader}${cache('payment-svc', 'REDIS_CACHE_PAYMENT_PASSWORD')}KAFKA_CLIENT_ID=payment-service\n${kafka('payment-svc', 'KAFKA_PAYMENT_PASSWORD')}${db('PAYMENT', 'payment_schema')}\nLEDGER_SERVICE_URL=http://localhost:8004\nCUSTOMER_SERVICE_URL=http://localhost:8002\nPAYMENT_LEDGER_INTERNAL_TOKEN="${env.PAYMENT_LEDGER_INTERNAL_TOKEN}"\nCUSTOMER_INTERNAL_TOKEN="${env.CUSTOMER_INTERNAL_TOKEN}"\n# Simulator keys (scripts generate rzp_test_sim...); run services/razorpay-simulator on 8010 alongside\nRAZORPAY_KEY_ID=${env.RAZORPAY_KEY_ID}\nRAZORPAY_KEY_SECRET="${env.RAZORPAY_KEY_SECRET}"\nRAZORPAY_WEBHOOK_SECRET="${env.RAZORPAY_WEBHOOK_SECRET}"\nRAZORPAY_API_BASE=http://localhost:8010\n`,
+  'assistant-service': `PORT=8008\n${reader}${cache('assistant-svc', 'REDIS_CACHE_ASSISTANT_PASSWORD')}${db('ASSISTANT', 'assistant_schema')}\nACCOUNT_SERVICE_URL=http://localhost:8003\nTRANSACTION_SERVICE_URL=http://localhost:8004\nCUSTOMER_SERVICE_URL=http://localhost:8002\nPAYMENT_SERVICE_URL=http://localhost:8007\n# Empty: the built-in assistant answers (set an OpenAI-compatible key, base URL and model to use an LLM)\nLLM_API_KEY=${env.LLM_API_KEY ?? ''}\n`,
+  'realtime-service': `PORT=8009\n${reader}${cache('realtime-svc', 'REDIS_CACHE_REALTIME_PASSWORD')}KAFKA_CLIENT_ID=realtime-service\n${kafka('realtime-svc', 'KAFKA_REALTIME_PASSWORD')}`,
+  'razorpay-simulator': `PORT=8010\nRAZORPAY_KEY_ID=${env.RAZORPAY_KEY_ID}\nRAZORPAY_KEY_SECRET="${env.RAZORPAY_KEY_SECRET}"\nRAZORPAY_WEBHOOK_SECRET="${env.RAZORPAY_WEBHOOK_SECRET}"\nSIM_WEBHOOK_URL=http://localhost:8007/api/v1/payments/webhooks/razorpay\n`,
 };
 
 for (const [svc, specific] of Object.entries(services)) {
@@ -153,8 +188,11 @@ PORT=8000
 NODE_ENV=development
 LOG_LEVEL=info
 REDIS_URL="redis://:${env.RATE_LIMIT_REDIS_PASSWORD}@127.0.0.1:6381"
-# Relaxed so the e2e suite can be re-run back to back (production default: 300 per minute per IP)
+JWT_VERIFY_KEYS="${env.JWT_VERIFY_KEYS}"
+# Relaxed so the e2e suite can be re-run back to back (production defaults: 600/min per IP, 300/min per user)
 GATEWAY_RATE_LIMIT_PER_MINUTE=5000
+GATEWAY_IP_RATE=100000/min
+GATEWAY_USER_RATE=20000/min
 STAFF_ALLOWED_CIDRS=${env.STAFF_ALLOWED_CIDRS}
 CORS_ORIGINS=${env.CORS_ORIGINS}
 AUTH_SERVICE_URL=http://localhost:8001
@@ -163,6 +201,9 @@ ACCOUNT_SERVICE_URL=http://localhost:8003
 TRANSACTION_SERVICE_URL=http://localhost:8004
 NOTIFICATION_SERVICE_URL=http://localhost:8005
 FRAUD_SERVICE_URL=http://localhost:8006
+PAYMENT_SERVICE_URL=http://localhost:8007
+ASSISTANT_SERVICE_URL=http://localhost:8008
+REALTIME_SERVICE_URL=http://localhost:8009
 `,
   rewriteServices
 );

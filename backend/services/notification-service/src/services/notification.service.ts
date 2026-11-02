@@ -9,6 +9,8 @@ import {
   WithdrawalCodeCreatedEvent,
   BeneficiaryAddedEvent,
   EmailDispatchOptions,
+  NewDeviceLoginEvent,
+  PaymentUpdatedEvent,
 } from '../types';
 import { MoneyUtil, TransientError, isTransientError, logger, redactEmails, redactErrorForLog } from '@banksphere/common';
 
@@ -93,6 +95,74 @@ function formatUtc(date: Date): string {
 function emailDomain(address: string): string | undefined {
   const at = address.lastIndexOf('@');
   return at >= 0 ? address.slice(at + 1).toLowerCase() : undefined;
+}
+
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+/** India Standard Time is UTC+05:30 all year (no daylight saving) */
+const IST_OFFSET_MS = (5 * 60 + 30) * 60 * 1000;
+
+/** "2026-10-28T14:05:09Z" -> "28 Oct 2026, 7:35 PM IST" (deterministic: no locale data involved) */
+export function formatIst(date: Date): string {
+  const ist = new Date(date.getTime() + IST_OFFSET_MS);
+  const hours = ist.getUTCHours();
+  const minutes = String(ist.getUTCMinutes()).padStart(2, '0');
+  const hour12 = hours % 12 === 0 ? 12 : hours % 12;
+  return `${ist.getUTCDate()} ${MONTHS[ist.getUTCMonth()]} ${ist.getUTCFullYear()}, ${hour12}:${minutes} ${hours < 12 ? 'AM' : 'PM'} IST`;
+}
+
+function validDate(value: unknown): Date | null {
+  if (typeof value !== 'string' || !value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+/** Razorpay method codes in customer words; unknown codes are not echoed */
+const METHOD_NAMES: Record<string, string> = { upi: 'UPI', card: 'card', netbanking: 'net banking', wallet: 'wallet', emi: 'EMI' };
+const REFUND_DESTINATIONS: Record<string, string> = {
+  upi: 'the UPI account you paid from',
+  card: 'the card you paid with',
+  netbanking: 'the bank account you paid from',
+  wallet: 'the wallet you paid with',
+  emi: 'the card you paid with',
+};
+
+function paymentMethodName(method: unknown): string {
+  return (typeof method === 'string' && METHOD_NAMES[method.toLowerCase()]) || 'UPI, card or net banking';
+}
+
+function refundDestination(method: unknown): string {
+  return (typeof method === 'string' && REFUND_DESTINATIONS[method.toLowerCase()]) || 'UPI, card or net banking';
+}
+
+/** Why a captured top-up could not be credited, in plain words; internal reasons are never shown as is */
+function creditBlockedReason(reason: unknown): string {
+  const code = typeof reason === 'string' ? reason.toUpperCase() : '';
+  if (!/^[A-Z0-9_]{1,64}$/.test(code)) return '';
+  if (code.includes('CLOSED')) return ' because the account is closed';
+  if (/FROZEN|INACTIVE|NOT_CREDITABLE|BLOCKED/.test(code)) return " because the account can't receive money right now";
+  if (/AMOUNT|MISMATCH/.test(code)) return " because the amount paid didn't match the top-up";
+  return '';
+}
+
+/**
+ * The device label of a sign-in, made safe to put in a security email: it comes from the User-Agent of
+ * whoever signed in, so an attacker could otherwise write "call this number" or a link into our alert.
+ */
+function deviceLabelForEmail(value: unknown): string {
+  // A small alphabet (no control, bidi, markup or quote characters), collapsed and bounded
+  const label = (typeof value === 'string' ? value : '')
+    .replace(/[^A-Za-z0-9 .()/+_,-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 60)
+    .trim();
+  const looksLikeLinkOrNumber = /[A-Za-z0-9-]\.[A-Za-z]{2,}/.test(label) || /\d{6,}/.test(label.replace(/[\s()+-]/g, ''));
+  return label && !looksLikeLinkOrNumber ? label : 'Unrecognised device';
+}
+
+/** A masked network ("203.0.113.x", "2001:db8:1::/48"); anything else is shown as unknown */
+function networkForEmail(value: unknown): string {
+  return typeof value === 'string' && /^[0-9A-Fa-fx.:/]{3,64}$/.test(value) ? value : 'unknown';
 }
 
 export class NotificationService {
@@ -192,18 +262,22 @@ export class NotificationService {
     }
 
     const formattedAmount = MoneyUtil.formatINR(event.amountInPaise);
+    // A top-up moves money from the bank's payment-clearing account to the customer, and its refund back:
+    // only the customer's side is told (the clearing account belongs to nobody)
+    const isTopUp = event.type === 'ONLINE_TOP_UP';
+    const isTopUpRefund = event.type === 'TOP_UP_REFUND';
     // `side` is part of the delivery key: on a transfer between a customer's own accounts the same address
     // gets both the debit and the credit notice
     const parties: Array<{ email: string | null; direction: 'debited from' | 'credited to'; side: 'debit' | 'credit' }> = [];
 
-    if (event.sourceAccountId) {
+    if (event.sourceAccountId && !isTopUp) {
       parties.push({
         email: await this.resolveAccountOwnerEmail(event.sourceAccountId, event.sourceCustomerId),
         direction: 'debited from',
         side: 'debit',
       });
     }
-    if (event.destinationAccountId) {
+    if (event.destinationAccountId && !isTopUpRefund) {
       parties.push({
         email: await this.resolveAccountOwnerEmail(event.destinationAccountId, event.destinationCustomerId),
         direction: 'credited to',
@@ -211,18 +285,28 @@ export class NotificationService {
       });
     }
 
+    const reference = `Transaction Reference: ${event.referenceId}\nTimestamp: ${event.timestamp}`;
     for (const party of parties) {
       if (!party.email) {
         this.contactMissing(event.eventId, event.timestamp);
         continue;
+      }
+      let subject = `BankSphere Alert: ${formattedAmount} ${party.direction} your account`;
+      let body = `Dear Customer,\n\n${formattedAmount} has been ${party.direction} your account (${event.type}).\n\n${reference}\n\nIf you did not authorise this transaction, contact BankSphere immediately.\n\nThank you for banking with BankSphere.`;
+      if (isTopUp) {
+        subject = `BankSphere Alert: ${formattedAmount} credited to your account (online top-up)`;
+        body = `Dear Customer,\n\n${formattedAmount} has been added to your account through an online top-up via Razorpay (${paymentMethodName(event.method)}).\n\n${reference}\n\nIf you did not make this payment, contact BankSphere immediately.\n\nThank you for banking with BankSphere.`;
+      } else if (isTopUpRefund) {
+        subject = `BankSphere Alert: ${formattedAmount} debited from your account (top-up refund)`;
+        body = `Dear Customer,\n\n${formattedAmount} has been debited from your account to refund your online top-up. The money goes back to your original payment method (${refundDestination(event.method)}); we'll email you when the refund has been processed.\n\n${reference}\n\nIf you didn't expect this refund, contact BankSphere.\n\nThank you for banking with BankSphere.`;
       }
       await this.dispatchEmail(
         event.eventId,
         event.eventType,
         {
           recipient: party.email,
-          subject: `BankSphere Alert: ${formattedAmount} ${party.direction} your account`,
-          body: `Dear Customer,\n\n${formattedAmount} has been ${party.direction} your account (${event.type}).\n\nTransaction Reference: ${event.referenceId}\nTimestamp: ${event.timestamp}\n\nIf you did not authorise this transaction, contact BankSphere immediately.\n\nThank you for banking with BankSphere.`,
+          subject,
+          body,
           metadata: { transactionId: event.transactionId, referenceId: event.referenceId },
         },
         party.side
@@ -335,6 +419,93 @@ export class NotificationService {
         subject: 'BankSphere security notice: a new payee was added',
         body: `Dear Customer,\n\nA new payee was added to your BankSphere online banking.\n\nPayee: ${nickname}\nAccount number: ••••${digits.slice(-4)}\n\n${activation}\n\nIf this wasn't you, freeze your account and contact the bank immediately.`,
         metadata: { beneficiaryId: event.beneficiaryId },
+      });
+    } else {
+      this.contactMissing(event.eventId, event.timestamp);
+    }
+    await this.markEventProcessed(event.eventId, event.eventType);
+    return true;
+  }
+
+  /**
+   * Top-up status changes (payment.updated.v1). Only two need an email of their own:
+   * - REFUNDED: the money is on its way back to the customer's original payment method
+   * - CREDIT_BLOCKED: the customer paid but the money couldn't be added to the account (closed or frozen
+   *   account, amount mismatch); it will be refunded
+   * CREDITED is NOT emailed: the ledger's transaction.completed.v1 (ONLINE_TOP_UP) already sends the money-in
+   * email. Other states are visible in the app and need no email.
+   */
+  public async handlePaymentUpdated(event: PaymentUpdatedEvent): Promise<boolean> {
+    if (event.status !== 'REFUNDED' && event.status !== 'CREDIT_BLOCKED') return false;
+    if (
+      typeof event.customerId !== 'string' ||
+      !event.customerId ||
+      typeof event.topUpId !== 'string' ||
+      !/^[A-Za-z0-9_-]{1,64}$/.test(event.topUpId) ||
+      !/^\d{1,18}$/.test(String(event.amountInPaise))
+    ) {
+      throw new Error('Malformed payment.updated.v1 event'); // permanent: dead-lettered by the consumer
+    }
+    if (await this.isEventProcessed(event.eventId)) {
+      return false;
+    }
+
+    const recipient = await this.resolveEmail(event.customerId);
+    if (recipient) {
+      const amount = MoneyUtil.formatINR(String(event.amountInPaise));
+      const reference = `Top-up reference: ${event.topUpId}`;
+      const destination = refundDestination(event.method);
+      const email: EmailDispatchOptions =
+        event.status === 'REFUNDED'
+          ? {
+              recipient,
+              subject: `BankSphere: ${amount} refunded to your original payment method`,
+              body: `Dear Customer,\n\n${amount} from your online top-up has been refunded to your original payment method (${destination}).\n\nIt can take a few working days to show on your statement, depending on your bank or card issuer.\n\n${reference}\n\nIf you have questions about this refund, contact BankSphere.`,
+              metadata: { topUpId: event.topUpId, status: event.status },
+            }
+          : {
+              recipient,
+              subject: `BankSphere: we couldn't add your ${amount} top-up to your account`,
+              body: `Dear Customer,\n\nWe received your payment of ${amount}, but we couldn't add it to your BankSphere account${creditBlockedReason(event.failureReason)}.\n\nYou don't need to do anything: the full amount will be refunded to your original payment method (${destination}), and we'll email you when the refund has been processed.\n\n${reference}\n\nIf you have questions, contact BankSphere.`,
+              metadata: { topUpId: event.topUpId, status: event.status },
+            };
+      await this.dispatchEmail(event.eventId, event.eventType, email);
+    } else {
+      this.contactMissing(event.eventId, event.timestamp);
+    }
+    await this.markEventProcessed(event.eventId, event.eventType);
+    return true;
+  }
+
+  /**
+   * A sign-in from a browser/OS family and network not seen in 90 days (security.new_device_login.v1).
+   * The alert goes to the address ON FILE (the read model built from user.registered.v1), so an event can
+   * never redirect a security alert; the event's own address (from auth-service, the only producer allowed
+   * on the topic) is used only when none is on file yet, so a new customer's alert is not held back.
+   * The device label is derived from the User-Agent, i.e. chosen by whoever signed in: it is reduced to a
+   * plain label and anything that looks like a link or phone number is dropped.
+   */
+  public async handleNewDeviceLogin(event: NewDeviceLoginEvent): Promise<boolean> {
+    const at = validDate(event.at) ?? validDate(event.timestamp);
+    if (typeof event.userId !== 'string' || !event.userId || !at) {
+      throw new Error('Malformed security.new_device_login.v1 event'); // permanent: dead-lettered by the consumer
+    }
+    if (await this.isEventProcessed(event.eventId)) {
+      return false;
+    }
+
+    const onFile = await this.resolveEmail(event.userId);
+    const fromEvent = typeof event.email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(event.email) ? event.email : null;
+    if (onFile && fromEvent && onFile.toLowerCase() !== fromEvent.toLowerCase()) {
+      logger.warn({ eventId: event.eventId, userId: event.userId, alert: 'CONTACT_MISMATCH' }, 'New-device alert sent to the address on file, not the one in the event');
+    }
+    const recipient = onFile ?? fromEvent;
+    if (recipient) {
+      await this.dispatchEmail(event.eventId, event.eventType, {
+        recipient,
+        subject: 'New sign-in to BankSphere',
+        body: `Hello,\n\nWe noticed a new sign-in to your BankSphere account from a device or network you haven't used recently.\n\nDevice: ${deviceLabelForEmail(event.deviceLabel)}\nApproximate network: ${networkForEmail(event.ipMasked)}\nTime: ${formatIst(at)}\n\nIf this was you, you don't need to do anything.\n\nIf this wasn't you, act now: open Security in BankSphere and choose "Sign out everywhere else" to sign out every other device, then change your password. If you see payments you don't recognise, contact the bank immediately.\n\nBankSphere will never ask you for your password, OTP or PIN.`,
+        metadata: { userId: event.userId, kind: 'NEW_DEVICE_LOGIN' },
       });
     } else {
       this.contactMissing(event.eventId, event.timestamp);

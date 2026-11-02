@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from 'react';
+import { useState } from 'react';
 import { useNavigate } from 'react-router';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useForm } from 'react-hook-form';
@@ -15,28 +15,14 @@ import { passwordSchema, totpSchema } from '@/lib/validation';
 import { ROLE_LABEL } from '@/app/navigation';
 import { Button } from '@/components/ui/button';
 import { Field, OtpInput, PasswordInput } from '@/components/ui/input';
-import { Badge, Callout, Card, CardContent, CardDescription, CardHeader, CardTitle, DescriptionList, PageHeader, Skeleton } from '@/components/ui/primitives';
+import { Badge, Callout, DescriptionList, PageHeader, Skeleton } from '@/components/ui/primitives';
 import { Dialog, DialogContent, DialogFooter, DialogHeader } from '@/components/ui/overlays';
 import { ErrorState } from '@/components/ui/data';
 import { PasswordChecklist } from '@/features/auth/components/PasswordFields';
 import { AuthenticatorSetup } from './AuthenticatorSetup';
-
-function Section({ title, description, children, aside }: { title: string; description: string; children: ReactNode; aside?: ReactNode }) {
-  return (
-    <Card>
-      <section aria-labelledby={`sec-${title}`}>
-        <CardHeader className="flex-row items-start justify-between gap-4 space-y-0">
-          <div className="space-y-1">
-            <CardTitle id={`sec-${title}`}>{title}</CardTitle>
-            <CardDescription>{description}</CardDescription>
-          </div>
-          {aside}
-        </CardHeader>
-        <CardContent className="pt-3">{children}</CardContent>
-      </section>
-    </Card>
-  );
-}
+import { Section } from './Section';
+import { SessionsSection } from './SessionsSection';
+import { SignInActivity } from './SignInActivity';
 
 const changeSchema = z
   .object({ currentPassword: z.string().min(1, 'Enter your current password'), password: passwordSchema, confirm: z.string().min(1, 'Confirm your new password') })
@@ -215,10 +201,11 @@ function TwoFactor({ enabled }: { enabled: boolean }) {
 }
 
 export default function SecurityPage() {
-  const user = useUser();
-  const { api, signOut } = useAuth();
+  const { api, signOut, user } = useAuth();
   const navigate = useNavigate();
   const me = useQuery({ queryKey: qk.me, queryFn: () => api.auth.me() });
+  // Turning off two-factor ends every session: render nothing on the way to the sign-in page
+  if (!user) return null;
 
   return (
     <div className="space-y-6 lg:space-y-8">
@@ -235,6 +222,8 @@ export default function SecurityPage() {
           >
             {me.isPending ? <Skeleton className="h-20 w-full" /> : me.isError ? <ErrorState error={me.error} onRetry={() => void me.refetch()} /> : <TwoFactor enabled={me.data.mfaEnabled} />}
           </Section>
+          <SessionsSection />
+          <SignInActivity />
         </div>
         <div className="space-y-5 lg:col-span-4 lg:space-y-6">
           <Section title="Account" description="Your sign-in identity.">

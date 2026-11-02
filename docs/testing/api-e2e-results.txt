@@ -1,4 +1,4 @@
-BankSphere E2E against http://localhost:8080 (run 8dd0aa5f)
+BankSphere E2E against http://localhost:8080 (run 1fccd936)
 
 Administrators: MFA & four-eyes staff onboarding
   ✔ MFA: with MFA enrolled, the password alone only returns a challenge (no tokens)

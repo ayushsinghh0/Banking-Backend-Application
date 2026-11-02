@@ -1,0 +1,137 @@
+# api-gateway: Edge of the API: verifies access-token signatures only to key limits by user, GCRA limits, IP rules and bans,
+# load shedding, a circuit breaker per upstream and the streaming proxy. Reachable only from the web pods.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: api-gateway
+  labels:
+    app.kubernetes.io/name: api-gateway
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-gateway
+  labels:
+    app.kubernetes.io/name: api-gateway
+    app.kubernetes.io/component: gateway
+    banksphere.io/runtime: node
+spec:
+  # No spec.replicas: the HorizontalPodAutoscaler owns the count, and a value here would reset it on every apply
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: api-gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: api-gateway
+        app.kubernetes.io/component: gateway
+        banksphere.io/runtime: node
+      annotations:
+        # Annotation-based discovery for a plain Prometheus; the prometheus-operator component adds a PodMonitor
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9464"
+        prometheus.io/path: /metrics
+    spec:
+      serviceAccountName: api-gateway
+      # Proxies SSE streams; the process itself force-exits 15 s after SIGTERM
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        # The image's USER is the name "node", which the kubelet cannot prove is non-root: give the uid explicitly
+        runAsUser: 1000
+        runAsGroup: 1000
+      containers:
+        - name: app
+          image: banksphere/api-gateway
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+            # Prometheus listener (METRICS_PORT); never exposed through the Service, the gateway or the ingress
+            - name: metrics
+              containerPort: 9464
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: banksphere-common
+            - configMapRef:
+                name: api-gateway-config
+            - secretRef:
+                name: banksphere-jwt
+            - secretRef:
+                name: api-gateway-secrets
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 384Mi
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 3
+            failureThreshold: 40
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # Readiness on /health/live, not /health: the gateway's /health reports its critical upstreams, so one
+          # failing service would take every gateway pod out of the Service and turn a partial outage into a full
+          # one. The per-upstream circuit breakers answer 503 UPSTREAM_UNAVAILABLE for just the affected routes.
+          readinessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-gateway
+  labels:
+    app.kubernetes.io/name: api-gateway
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: api-gateway
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-gateway
+  labels:
+    app.kubernetes.io/name: api-gateway
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api-gateway
+  minReplicas: 2
+  maxReplicas: 3
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api-gateway
+  labels:
+    app.kubernetes.io/name: api-gateway
+spec:
+  maxUnavailable: 1
+  # A crash-looping pod must never block a node drain
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: api-gateway

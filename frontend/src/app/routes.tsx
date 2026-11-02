@@ -71,6 +71,7 @@ export const routes: RouteObject[] = [
             page('/accounts', () => import('@/features/customer/AccountsPage')),
             page('/accounts/:accountId', () => import('@/features/customer/AccountDetailPage')),
             page('/transfer', () => import('@/features/customer/TransferPage')),
+            page('/add-money', () => import('@/features/customer/AddMoneyPage')),
             page('/payees', () => import('@/features/customer/PayeesPage')),
             page('/cash-withdrawal', () => import('@/features/customer/CashWithdrawalPage')),
             page('/profile', () => import('@/features/customer/ProfilePage')),
@@ -87,10 +88,14 @@ export const routes: RouteObject[] = [
             page('/fraud/:alertId', () => import('@/features/staff/FraudAlertDetailPage')),
           ]),
           roles(['FRAUD_ANALYST', 'BANK_ADMIN', 'SUPPORT'], [page('/notifications', () => import('@/features/staff/NotificationsPage'))]),
+          // Operations (platform design, section 14): payments:read:any; refunds and reconciliation stay admin-only inside the page
+          roles(['FRAUD_ANALYST', 'BANK_ADMIN', 'SUPPORT'], [page('/payments', () => import('@/features/ops/PaymentsPage'))]),
           roles(['BANK_ADMIN', 'SUPPORT'], [
             page('/teller-sessions', () => import('@/features/branch/TellerSessionsPage')),
             page('/cash-operations', () => import('@/features/branch/CashOperationsPage')),
             page('/directory', () => import('@/features/admin/DirectoryPage')),
+            // security:ip-rules:read; the events tab resolves people through the staff directory, which these two roles may read
+            page('/security-centre', () => import('@/features/ops/SecurityCentrePage')),
           ]),
           roles(['BANK_ADMIN'], [
             page('/overview', () => import('@/features/admin/OverviewPage')),

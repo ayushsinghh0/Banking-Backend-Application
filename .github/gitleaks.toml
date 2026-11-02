@@ -1,0 +1,31 @@
+# Secret scanning rules for this repository (used by .github/workflows/security.yml).
+# gitleaks' default rule set plus narrowly scoped allowlists for values that are test fixtures by design.
+# The default rules decode base64, so a committed JWT_SIGNING_KEY (base64 PKCS#8 PEM) is caught by the
+# private-key rule; the public JWT_VERIFY_KEYS are not.
+
+title = "BankSphere"
+
+[extend]
+useDefault = true
+
+# Test suites: fixed test passwords, idempotency keys, keys generated at run time, RFC 6238 test vectors and a
+# forged alg=none JWT are the point of these tests. Only the two generic heuristics are silenced here; every
+# provider-specific rule (cloud keys, payment keys, private keys, ...) still applies to test files.
+[[allowlists]]
+description = "Unit, component and end-to-end test fixtures"
+targetRules = ["generic-api-key", "jwt"]
+paths = [
+  '''(^|/)tests/([^/]+/)*[^/]+\.(ts|js|mjs)$''',
+  '''(^|/)src/([^/]+/)*[^/]+\.test\.tsx?$''',
+  '''(^|/)e2e/([^/]+/)*[^/]+\.(ts|mjs)$''',
+  '''(^|/)scripts/(lib/)?e2e[^/]*\.mjs$''',
+]
+
+# README: the documented create-admin command for a local laptop stack (example password, never a real one)
+[[allowlists]]
+description = "Local-development create-admin example in README files"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''(^|/)README\.md$''']
+regexTarget = "line"
+regexes = ['''\bADMIN_PASSWORD=''']

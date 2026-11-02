@@ -1,0 +1,24 @@
+# Prometheus (namespace "monitoring", pod label of a kube-prometheus-stack / prometheus-operator install) may
+# scrape the metrics listener of every Node service, and nothing else on it. Adjust the selectors in an overlay
+# if Prometheus runs elsewhere.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: metrics-ingress
+spec:
+  podSelector:
+    matchLabels:
+      banksphere.io/runtime: node
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - protocol: TCP
+          port: 9464

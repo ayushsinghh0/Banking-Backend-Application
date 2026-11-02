@@ -5,6 +5,7 @@ import { LedgerService } from '../services/ledger.service';
 import { TellerService } from '../services/teller.service';
 import { BeneficiaryService } from '../services/beneficiary.service';
 import { IdempotencyService } from '../services/idempotency.service';
+import { AuditChainService } from '../services/audit-chain';
 import { CashOperationResult } from '../types';
 
 // Max 18 digits keeps amounts well inside Postgres BIGINT
@@ -81,7 +82,8 @@ export class TransactionController {
     private readonly ledgerService: LedgerService,
     private readonly tellerService: TellerService,
     private readonly beneficiaryService: BeneficiaryService,
-    private readonly idempotencyService: IdempotencyService
+    private readonly idempotencyService: IdempotencyService,
+    private readonly auditChain?: AuditChainService
   ) {}
 
   private async runIdempotent(
@@ -245,6 +247,14 @@ export class TransactionController {
     const { limit, offset } = parsePagination(req.query);
     const data = await this.tellerService.listCashOperations(status, limit, offset, getAuthenticatedUser(req));
     res.json({ success: true, data, pagination: { limit, offset } });
+  });
+
+  // --- integrity ------------------------------------------------------------
+
+  /** BANK_ADMIN (audit:verify): re-walks the audit chain; { ok, checked, brokenAt?, reason? } */
+  public verifyAuditChain = wrap(async (_req, res) => {
+    if (!this.auditChain) throw new Error('Audit chain verification is not configured');
+    res.json({ success: true, data: await this.auditChain.verify() });
   });
 
   // --- reads ----------------------------------------------------------------

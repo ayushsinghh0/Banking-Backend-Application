@@ -34,6 +34,9 @@ function setup(responseData: unknown = { ok: true }, status = 200) {
   return { api: createEndpoints(client), captured };
 }
 
+const PROOF = { razorpayPaymentId: 'pay_1', razorpayOrderId: 'order_1', razorpaySignature: 'sig' };
+const plainClient = () => new ApiClient({ getAccessToken: () => 'tok', refreshAccessToken: async () => 'tok', onSessionExpired: () => {} });
+
 type Case = [name: string, call: (api: Endpoints) => Promise<unknown>, method: string, path: string, body?: unknown];
 
 const cases: Case[] = [
@@ -92,6 +95,22 @@ const cases: Case[] = [
   ['fraud.updateAlert note', (a) => a.fraud.updateAlert('al1', 'RESOLVED', 'Customer confirmed'), 'PATCH', '/fraud/alerts/al1', { status: 'RESOLVED', note: 'Customer confirmed' }],
   ['fraud.history', (a) => a.fraud.history('al1'), 'GET', '/fraud/alerts/al1/history'],
   ['notifications.logs', (a) => a.notifications.logs({ recipient: 'a@b.in' }), 'GET', '/notifications/logs'],
+  ['payments.config', (a) => a.payments.config(), 'GET', '/payments/config'],
+  ['payments.confirmTopUp', (a) => a.payments.confirmTopUp('t1', PROOF), 'POST', '/payments/top-ups/t1/confirm', PROOF],
+  ['payments.cancelTopUp', (a) => a.payments.cancelTopUp('t1'), 'POST', '/payments/top-ups/t1/cancel'],
+  ['payments.simulateTopUp', (a) => a.payments.simulateTopUp('t1', 'success', 'upi'), 'POST', '/payments/top-ups/t1/simulate', { outcome: 'success', method: 'upi' }],
+  ['payments.topUps', (a) => a.payments.topUps({ limit: 10 }), 'GET', '/payments/top-ups'],
+  ['payments.topUp', (a) => a.payments.topUp('t1'), 'GET', '/payments/top-ups/t1'],
+  ['assistant.meta', (a) => a.assistant.meta(), 'GET', '/assistant/meta'],
+  ['assistant.conversations', (a) => a.assistant.conversations(), 'GET', '/assistant/conversations'],
+  ['assistant.createConversation', (a) => a.assistant.createConversation('Spending'), 'POST', '/assistant/conversations', { title: 'Spending' }],
+  ['assistant.createConversation untitled', (a) => a.assistant.createConversation(), 'POST', '/assistant/conversations', {}],
+  ['assistant.conversation', (a) => a.assistant.conversation('c1'), 'GET', '/assistant/conversations/c1'],
+  ['assistant.deleteConversation', (a) => a.assistant.deleteConversation('c1'), 'DELETE', '/assistant/conversations/c1'],
+  ['security.sessions', (a) => a.security.sessions(), 'GET', '/auth/sessions'],
+  ['security.revokeSession', (a) => a.security.revokeSession('s1'), 'DELETE', '/auth/sessions/s1'],
+  ['security.revokeOtherSessions', (a) => a.security.revokeOtherSessions(), 'POST', '/auth/sessions/revoke-others'],
+  ['security.events', (a) => a.security.events(), 'GET', '/auth/security-events'],
 ];
 
 describe('endpoint contracts', () => {
@@ -158,5 +177,72 @@ describe('endpoint contracts', () => {
     const { api, captured } = setup();
     await api.accounts.get('a/../b');
     expect(captured[0]!.path).toBe('/accounts/a%2F..%2Fb');
+  });
+
+  it('creates a top-up with its idempotency key and reads the checkout details', async () => {
+    const created = { topUp: { id: 't1', status: 'CREATED' }, checkout: { orderId: 'order_1' } };
+    const { api, captured } = setup(created, 201);
+    await expect(api.payments.createTopUp({ accountId: 'a1', amountPaise: '50000' }, 'k-topup-1')).resolves.toEqual(created);
+    expect(captured[0]).toMatchObject({ method: 'POST', path: '/payments/top-ups', idempotencyKey: 'k-topup-1' });
+    expect(captured[0]!.body).toEqual({ accountId: 'a1', amountPaise: '50000' });
+  });
+
+  it('unwraps a top-up whether or not it is wrapped in { topUp }', async () => {
+    let { api } = setup({ topUp: { id: 't1', status: 'CREDITED' } });
+    await expect(api.payments.confirmTopUp('t1', PROOF)).resolves.toEqual({ id: 't1', status: 'CREDITED' });
+    ({ api } = setup({ id: 't1', status: 'PENDING' }));
+    await expect(api.payments.topUp('t1')).resolves.toEqual({ id: 't1', status: 'PENDING' });
+    ({ api } = setup({ topUp: { id: 't1', status: 'CANCELLED' } }));
+    await expect(api.payments.cancelTopUp('t1')).resolves.toEqual({ id: 't1', status: 'CANCELLED' });
+  });
+
+  it('accepts a cancel with no body', async () => {
+    server.use(http.post('http://localhost:3000/api/v1/payments/top-ups/t1/cancel', () => new HttpResponse(null, { status: 204 })));
+    await expect(createEndpoints(plainClient()).payments.cancelTopUp('t1')).resolves.toBeUndefined();
+  });
+
+  it('reads cursor pages in either shape', async () => {
+    const { api, captured } = setup({ items: [{ id: 't1' }], nextCursor: 'c2' });
+    await expect(api.payments.topUps({ limit: 10, cursor: 'c1' })).resolves.toEqual({ items: [{ id: 't1' }], nextCursor: 'c2' });
+    expect(Object.fromEntries(captured[0]!.search)).toEqual({ limit: '10', cursor: 'c1' });
+    server.use(
+      http.get('http://localhost:3000/api/v1/payments/top-ups', () =>
+        HttpResponse.json({ success: true, data: [{ id: 't9' }], pagination: { limit: 10, nextCursor: 'c3' } })
+      )
+    );
+    await expect(createEndpoints(plainClient()).payments.topUps()).resolves.toEqual({ items: [{ id: 't9' }], nextCursor: 'c3' });
+  });
+
+  it('reads the simulated payment proof in camel or snake case', async () => {
+    let { api } = setup(PROOF);
+    await expect(api.payments.simulateTopUp('t1', 'success', 'card')).resolves.toEqual(PROOF);
+    ({ api } = setup({ razorpay_payment_id: 'pay_1', razorpay_order_id: 'order_1', razorpay_signature: 'sig' }));
+    await expect(api.payments.simulateTopUp('t1', 'success', 'card')).resolves.toEqual(PROOF);
+    ({ api } = setup({ status: 'failed' }));
+    await expect(api.payments.simulateTopUp('t1', 'failure', 'upi')).resolves.toBeNull();
+  });
+
+  it('checks the cards of a stored conversation', async () => {
+    const { api } = setup({
+      id: 'c1',
+      title: 'Balance',
+      messages: [
+        { id: 'm1', role: 'assistant', content: 'Here you go', cards: [{ type: 'help', title: 'T', steps: [] }, { type: 'script' }], createdAt: 'x' },
+        { id: 'm2', role: 'user', content: 'hi', cards: null, createdAt: 'x' },
+      ],
+    });
+    const conversation = await api.assistant.conversation('c1');
+    expect(conversation.messages[0]!.cards).toEqual([{ type: 'help', title: 'T', steps: [] }]);
+    expect(conversation.messages[1]!.cards).toEqual([]);
+  });
+
+  it('reads lists returned bare or as { items }', async () => {
+    let { api } = setup([{ id: 's1' }]);
+    await expect(api.security.sessions()).resolves.toEqual([{ id: 's1' }]);
+    ({ api } = setup({ items: [{ id: 'c1' }] }));
+    await expect(api.assistant.conversations()).resolves.toEqual([{ id: 'c1' }]);
+    const next = setup([]);
+    await next.api.security.events(5);
+    expect(next.captured[0]!.search.get('limit')).toBe('5');
   });
 });

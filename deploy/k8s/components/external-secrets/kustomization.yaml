@@ -1,0 +1,6 @@
+# Creates every Secret the workloads reference (by name only) from the cluster's secret manager.
+# Requires the External Secrets Operator and a ClusterSecretStore named "banksphere" (docs/operations/kubernetes.md).
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+  - external-secrets.yaml

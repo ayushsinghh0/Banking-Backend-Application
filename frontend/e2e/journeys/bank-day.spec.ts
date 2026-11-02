@@ -2,7 +2,8 @@
  * A full day at the bank, driven through the browser against the real stack:
  * administrators onboard staff (four-eyes) → a customer signs up, verifies email, completes KYC → accounts →
  * teller float, deposit, code-authorised withdrawal → transfer → supervisor approval → fraud triage →
- * blind close-out and sign-off → security settings. Screenshots for the docs are taken along the way.
+ * blind close-out and sign-off → security settings → add money, Sphere, sessions and the operations consoles.
+ * Screenshots for the docs are taken along the way.
  */
 import { expect, test, type Browser, type Locator, type Page } from '@playwright/test';
 import { enrolAuthenticator, freshTotp, linkFrom, PASSWORD, readState, rememberSecret, RUN_ID, signIn, signOut, waitForEmail } from '../support/helpers';
@@ -347,6 +348,71 @@ test('security: a mistyped password keeps the session; authenticator setup; relo
   await signOut(page);
   await signIn(page, customer.email, PASSWORD, secret);
   await expect(page).toHaveURL(/\/dashboard$/);
+});
+
+test('platform: add money through the test checkout, ask Sphere, review sessions, and the operations consoles', async () => {
+  test.setTimeout(180_000);
+  const page = pages.customer!;
+
+  // Add money: Razorpay in simulator mode, so the checkout is the built-in test sheet
+  await page.goto('/add-money');
+  await expect(page.getByRole('heading', { name: 'Add money', level: 1 })).toBeVisible();
+  await page.getByLabel('Amount', { exact: true }).fill('500');
+  await shot(page, '23a-add-money');
+  await page.getByRole('button', { name: 'Continue' }).click();
+  const checkout = page.getByRole('dialog', { name: 'Test checkout' });
+  await expect(checkout.getByText('Simulated payment — no real money moves')).toBeVisible();
+  await shot(page, '23b-add-money-checkout');
+  await checkout.getByRole('button', { name: 'Pay ₹500.00' }).click();
+  await expect(page.getByRole('heading', { name: 'Money added' })).toBeVisible({ timeout: 30_000 });
+  await shot(page, '23-add-money-receipt');
+
+  // Sphere answers from the customer's own data (built-in engine when no LLM key is configured)
+  await page.goto('/dashboard');
+  await page.getByRole('button', { name: 'Ask Sphere' }).click();
+  const sphere = page.getByRole('dialog', { name: 'Sphere' });
+  await sphere.getByLabel('Message Sphere').fill('What are my account balances?');
+  await page.keyboard.press('Enter');
+  const conversation = sphere.getByRole('list', { name: 'Conversation' });
+  await expect(conversation).toContainText('What are my account balances?');
+  await expect(sphere.getByRole('button', { name: 'Stop answering' })).toBeHidden({ timeout: 45_000 });
+  await expect(conversation).toContainText(/Savings|Current/);
+  await shot(page, '24-sphere', { fullPage: false });
+  await page.keyboard.press('Escape');
+  await expect(sphere).toBeHidden();
+
+  // Sessions and devices: this browser is listed and marked as the current device
+  await page.goto('/settings/security');
+  const sessions = page.getByRole('list', { name: 'Signed-in devices' });
+  await expect(sessions.getByText('This device')).toBeVisible();
+  await page.getByRole('heading', { name: 'Sessions and devices' }).scrollIntoViewIfNeeded();
+  await shot(page, '25-sessions', { fullPage: false });
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/add-money');
+  await expect(page.getByLabel('Amount', { exact: true })).toBeVisible();
+  await shot(page, '23-add-money-mobile');
+  await page.setViewportSize({ width: 1440, height: 900 });
+
+  // Payments console: the top-up above, newest first, with its status history
+  const lead = pages.lead!;
+  await lead.goto('/payments');
+  await expect(lead.getByRole('heading', { name: 'Payments', level: 1 })).toBeVisible();
+  const row = lead.getByRole('button', { name: /^Open top-up: ₹500\.00/ }).first();
+  await expect(row).toBeVisible();
+  await shot(lead, '26-payments-console');
+  await row.click();
+  await expect(dialogOf(lead)).toBeVisible();
+  await shot(lead, '26a-top-up-detail');
+  await lead.keyboard.press('Escape');
+
+  // Security centre: gateway IP rules, automatic bans and sign-in activity across the bank
+  await lead.goto('/security-centre');
+  await expect(lead.getByRole('heading', { name: 'Security centre', level: 1 })).toBeVisible();
+  await shot(lead, '27-security-centre');
+  await lead.getByRole('tab', { name: 'Security events' }).click();
+  await expect(lead.getByRole('tab', { name: 'Security events' })).toHaveAttribute('aria-selected', 'true');
+  await shot(lead, '27a-security-events');
 });
 
 test('documentation screenshots: dashboards, statements, staff consoles, dark mode and mobile', async () => {

@@ -152,7 +152,8 @@ export interface BankAccount {
 
 // --- ledger ---------------------------------------------------------------------------------
 
-export type TransactionType = 'DEPOSIT' | 'WITHDRAWAL' | 'TRANSFER' | 'CASH_TRANSFER';
+/** ONLINE_TOP_UP credits a Razorpay top-up; TOP_UP_REFUND takes it back when the bank refunds it */
+export type TransactionType = 'DEPOSIT' | 'WITHDRAWAL' | 'TRANSFER' | 'CASH_TRANSFER' | 'ONLINE_TOP_UP' | 'TOP_UP_REFUND';
 
 export interface Balance {
   accountId: string;
@@ -311,4 +312,169 @@ export interface NotificationLog {
   retryCount: number;
   lastError: string | null;
   createdAt: string;
+}
+
+// --- payments: Razorpay top-ups -------------------------------------------------------------
+
+/** `simulator` is development only: the bank's stand-in for Razorpay, paid from a test sheet in the app */
+export type PaymentMode = 'live' | 'test' | 'simulator';
+
+/** Paise strings; the daily figures follow the bank's (IST) day */
+export interface TopUpLimits {
+  minPaise: string;
+  maxPaise: string;
+  dailyLimitPaise: string;
+  usedTodayPaise: string;
+  remainingTodayPaise: string;
+}
+
+export interface PaymentConfig {
+  provider: 'RAZORPAY';
+  mode: PaymentMode;
+  keyId: string;
+  limits: TopUpLimits;
+}
+
+export type TopUpStatus =
+  | 'CREATED'
+  | 'PENDING'
+  | 'CAPTURED'
+  | 'CREDITED'
+  | 'CREDIT_BLOCKED'
+  | 'REFUND_PENDING'
+  | 'REFUNDED'
+  | 'CANCELLED'
+  | 'FAILED'
+  | 'EXPIRED';
+
+export interface TopUpHistoryEntry {
+  from: TopUpStatus | null;
+  to: TopUpStatus;
+  source: string;
+  at: string;
+}
+
+export interface TopUp {
+  id: string;
+  accountId: string;
+  accountNumberLast4: string;
+  amountPaise: string;
+  currency: string;
+  status: TopUpStatus;
+  /** How the customer paid, as Razorpay reports it: upi, card, netbanking, wallet… */
+  method: string | null;
+  providerOrderId: string | null;
+  providerPaymentId: string | null;
+  failureReason: string | null;
+  createdAt: string;
+  updatedAt: string;
+  creditedAt: string | null;
+  expiresAt: string | null;
+  refundedAt: string | null;
+  refundReason: string | null;
+  history?: TopUpHistoryEntry[];
+}
+
+/** What Razorpay Checkout needs to open the payment window for an order */
+export interface CheckoutDetails {
+  keyId: string;
+  orderId: string;
+  /** Paise */
+  amount: string | number;
+  currency: string;
+  name: string;
+  description: string;
+  prefill: { email?: string };
+}
+
+export interface CreatedTopUp {
+  topUp: TopUp;
+  checkout: CheckoutDetails;
+}
+
+/** The signed result Checkout hands the browser after a payment; the server verifies it */
+export interface PaymentProof {
+  razorpayPaymentId: string;
+  razorpayOrderId: string;
+  razorpaySignature: string;
+}
+
+export type SimulatedOutcome = 'success' | 'failure';
+export type SimulatedMethod = 'upi' | 'card' | 'netbanking';
+
+export interface TopUpPage {
+  items: TopUp[];
+  nextCursor: string | null;
+}
+
+// --- Sphere assistant -----------------------------------------------------------------------
+
+export interface AssistantMeta {
+  provider: 'llm' | 'builtin';
+  model?: string;
+  /** Prompts suited to the signed-in role */
+  suggestions: string[];
+}
+
+export interface ConversationSummary {
+  id: string;
+  title: string | null;
+  updatedAt: string;
+}
+
+/** Structured answer blocks. Data only: the app draws them; the assistant never sends markup. */
+export type AssistantCard =
+  | { type: 'accounts'; accounts: Array<{ id: string; label: string; last4: string; balancePaise: string }> }
+  | {
+      type: 'transactions';
+      accountLabel: string;
+      items: Array<{ id: string; at: string; description: string; direction: 'CREDIT' | 'DEBIT'; amountPaise: string }>;
+    }
+  | { type: 'spending'; days: number; inPaise: string; outPaise: string; byDay: Array<{ date: string; inPaise: string; outPaise: string }> }
+  | { type: 'payees'; items: Array<{ nickname: string; last4: string; active: boolean }> }
+  | { type: 'topups'; items: Array<{ id: string; amountPaise: string; status: TopUpStatus; at: string }> }
+  | { type: 'transferDraft'; fromAccountId: string; toPayeeNickname?: string; amountPaise?: string; note?: string }
+  | { type: 'help'; title: string; steps: string[] };
+
+export type AssistantCardType = AssistantCard['type'];
+
+export interface AssistantMessage {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  cards: AssistantCard[];
+  createdAt: string;
+}
+
+export interface Conversation {
+  id: string;
+  title: string | null;
+  messages: AssistantMessage[];
+}
+
+// --- account security -----------------------------------------------------------------------
+
+/** One signed-in browser or device (a refresh-token family) */
+export interface DeviceSession {
+  id: string;
+  /** The session making this request */
+  current: boolean;
+  /** "Chrome on Windows" */
+  deviceLabel: string;
+  /** Network part only: "203.0.113.x" */
+  ipMasked: string | null;
+  createdAt: string;
+  lastSeenAt: string | null;
+  /** Signed in with the second factor */
+  mfa: boolean;
+}
+
+export interface SecurityEvent {
+  id: string;
+  /** Sign-in succeeded or failed, MFA failed, new device, session revoked, password changed, IP auto-banned */
+  type: string;
+  deviceLabel: string | null;
+  ipMasked: string | null;
+  at: string;
+  details: Record<string, unknown> | null;
 }

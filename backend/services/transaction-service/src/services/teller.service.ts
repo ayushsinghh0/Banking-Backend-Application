@@ -23,6 +23,7 @@ import {
   stepUpRequired,
   toResult,
 } from './ledger-core';
+import { LedgerCommits } from './ledger-commits';
 
 const CODE_ATTEMPTS_BEFORE_LOCK = 5;
 const hashCode = (authorizationId: string, code: string) =>
@@ -43,16 +44,20 @@ const hashCode = (authorizationId: string, code: string) =>
 export class TellerService {
   constructor(
     private readonly prisma: PrismaClient,
-    private readonly policy: LedgerPolicy = defaultLedgerPolicy()
+    private readonly policy: LedgerPolicy = defaultLedgerPolicy(),
+    private readonly commits: LedgerCommits = new LedgerCommits()
   ) {}
 
+  /** The caller's transaction, or a new one whose postings are applied to the cache once it commits */
   private inTransaction<T>(tx: TxClient | undefined, work: (tx: TxClient) => Promise<T>): Promise<T> {
     if (tx) return work(tx);
-    return this.prisma.$transaction(work, {
-      isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted,
-      maxWait: 10_000,
-      timeout: 15_000,
-    });
+    return this.commits.run(() =>
+      this.prisma.$transaction(work, {
+        isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted,
+        maxWait: 10_000,
+        timeout: 15_000,
+      })
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -103,7 +108,7 @@ export class TellerService {
       },
     });
     // Cash arriving at `to` is a debit of that asset account, cash leaving `from` a credit
-    await postDoubleEntry(tx, { transactionId: transaction.id, debit: to, credit: from, amount });
+    await postDoubleEntry(tx, { transactionId: transaction.id, type: TransactionType.CASH_TRANSFER, debit: to, credit: from, amount });
     return transaction;
   }
 
@@ -137,7 +142,7 @@ export class TellerService {
   /** Step 2 (teller): count the float received; only an exact match books it vault -> drawer */
   public async acceptFloat(teller: AuthenticatedUser, countedFloat: bigint) {
     return commitThenRefuse(
-      this.prisma.$transaction(async (tx) => {
+      this.commits.run(() => this.prisma.$transaction(async (tx) => {
         await advisoryLock(tx, `teller:${teller.id}`);
         const session = await tx.tellerSession.findFirst({ where: { tellerId: teller.id, status: 'ISSUED' } });
         if (!session) throw new ConflictError('No float has been issued to you');
@@ -160,15 +165,18 @@ export class TellerService {
         }
         await audit(tx, teller.id, 'TELLER_SESSION_OPENED', session.id, { openingFloat: session.openingFloat.toString(), issuedBy: session.issuedBy });
         return this.tellerView({ ...session, status: 'OPEN', acceptedAt });
-      })
+      }))
     );
   }
 
   /** A supervisor can withdraw a float the teller never accepted */
   public async cancelFloat(supervisor: AuthenticatedUser, sessionId: string) {
-    const result = await this.prisma.tellerSession.updateMany({ where: { id: sessionId, status: 'ISSUED' }, data: { status: 'CANCELLED' } });
-    if (result.count !== 1) throw new ConflictError('Only an issued, unaccepted float can be cancelled');
-    await audit(this.prisma, supervisor.id, 'TELLER_FLOAT_CANCELLED', sessionId);
+    // The cancellation and its audit row commit together
+    await this.prisma.$transaction(async (tx) => {
+      const result = await tx.tellerSession.updateMany({ where: { id: sessionId, status: 'ISSUED' }, data: { status: 'CANCELLED' } });
+      if (result.count !== 1) throw new ConflictError('Only an issued, unaccepted float can be cancelled');
+      await audit(tx, supervisor.id, 'TELLER_FLOAT_CANCELLED', sessionId);
+    });
   }
 
   /**
@@ -223,7 +231,7 @@ export class TellerService {
    */
   public async signOffSession(supervisor: AuthenticatedUser, sessionId: string, supervisorCount: bigint) {
     if (supervisorCount < 0n) throw new InvalidAmountError('Counted cash cannot be negative');
-    return commitThenRefuse(this.prisma.$transaction(async (tx) => {
+    return commitThenRefuse(this.commits.run(() => this.prisma.$transaction(async (tx) => {
       const [locked] = await tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM teller_sessions WHERE id = ${sessionId} FOR UPDATE`;
       if (!locked) throw new NotFoundError('Teller session not found');
       const session = await tx.tellerSession.findUniqueOrThrow({ where: { id: sessionId } });
@@ -296,7 +304,7 @@ export class TellerService {
         ...(confirmsDispute && { declared: session.declaredClosing?.toString() ?? null, disputedBy: session.disputedBy }),
       });
       return this.supervisorView(reconciled);
-    }));
+    })));
   }
 
   public async listSessions(status: 'ISSUED' | 'OPEN' | 'CLOSED' | 'RECONCILED' | 'CANCELLED' | undefined, limit: number, offset: number) {
@@ -469,21 +477,27 @@ export class TellerService {
     }
   }
 
-  /** Counts failures per account (append-only audit) and burns the codes after too many wrong guesses */
+  /**
+   * Counts failures per account (append-only audit) and burns the codes after too many wrong guesses. The
+   * audit row is written last, after the authorisation rows are locked: the audit chain lock is always the
+   * last lock a transaction takes (a withdrawal locks its authorisation, then audits), so the two can't
+   * deadlock.
+   */
   private async recordWithdrawalCodeFailure(failure: WithdrawalCodeRejectedError): Promise<void> {
     const { accountId } = failure;
     await this.prisma.$transaction(async (tx) => {
       // Serialised per account, so concurrent wrong guesses can't all count below the threshold
       await advisoryLock(tx, `withdrawal-code:${accountId}`);
-      await audit(tx, failure.tellerId, 'WITHDRAWAL_CODE_FAILED', accountId);
-      // Served by audit_log(action, target_id, created_at)
-      const failures = await tx.auditLog.count({
+      // Earlier failures since the code was issued; this one is recorded below. Served by
+      // audit_log(action, target_id, created_at)
+      const earlier = await tx.auditLog.count({
         where: { action: 'WITHDRAWAL_CODE_FAILED', targetId: accountId, createdAt: { gte: failure.authorizationCreatedAt } },
       });
-      if (failures >= CODE_ATTEMPTS_BEFORE_LOCK) {
+      if (earlier + 1 >= CODE_ATTEMPTS_BEFORE_LOCK) {
         await tx.withdrawalAuthorization.updateMany({ where: { accountId, usedAt: null }, data: { usedAt: new Date() } });
         logger.warn({ accountId, alert: 'WITHDRAWAL_CODE_BRUTE_FORCE' }, 'Withdrawal codes invalidated after repeated wrong attempts');
       }
+      await audit(tx, failure.tellerId, 'WITHDRAWAL_CODE_FAILED', accountId);
     });
   }
 
@@ -662,12 +676,13 @@ export class TellerService {
     // Deposit: cash into the drawer (DEBIT drawer), owed to the customer (CREDIT customer). Withdrawal: reverse.
     await postDoubleEntry(tx, {
       transactionId: transaction.id,
+      type: isDeposit ? TransactionType.DEPOSIT : TransactionType.WITHDRAWAL,
       debit: isDeposit ? drawerRow : account,
       credit: isDeposit ? account : drawerRow,
       amount: dto.amountInPaise,
     });
 
-    await stageTransactionEvent(tx, transaction.id, {
+    await stageTransactionEvent(tx, transaction.id, account.id, {
       referenceId: transaction.referenceId,
       type: transaction.type,
       amountInPaise: dto.amountInPaise.toString(),

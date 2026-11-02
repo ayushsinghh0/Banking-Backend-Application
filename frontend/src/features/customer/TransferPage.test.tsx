@@ -115,6 +115,30 @@ describe('TransferPage', () => {
     });
   });
 
+  it('fills in a transfer drafted by Sphere for the customer to review', async () => {
+    const sent = transferApi(() => ok(result({ destinationAccountId: IDS.payeeAccount, amountInPaise: '250000' }), 201));
+    const { user } = setup(`/transfer?from=${IDS.current}&payeeName=ravi%20(LANDLORD)&amount=250000&note=October%20rent`);
+    expect(await screen.findByLabelText('From')).toHaveValue(IDS.current);
+    expect(screen.getByRole('radio', { name: 'Payee' })).toBeChecked();
+    expect(screen.getByLabelText('Recipient')).toHaveValue('ben-1');
+    expect(screen.getByLabelText('Amount')).toHaveValue('2500.00');
+    expect(screen.getByLabelText(/note/i)).toHaveValue('October rent');
+    // Nothing is sent until the customer reviews and confirms it
+    expect(sent).toHaveLength(0);
+    await user.click(screen.getByRole('button', { name: 'Review transfer' }));
+    await user.click(await screen.findByRole('button', { name: 'Send ₹2,500.00' }));
+    expect(await screen.findByRole('heading', { name: 'Money sent' })).toBeInTheDocument();
+    expect(sent[0]!.body).toMatchObject({ sourceAccountId: IDS.current, destinationAccountNumber: '100198765432', amountInPaise: '250000', description: 'October rent' });
+  });
+
+  it('says when a drafted payee is not one of the customer’s payees, and ignores a bad amount', async () => {
+    setup('/transfer?payeeName=Meera&amount=12.5');
+    expect(await screen.findByText('We couldn’t find “Meera” in your payees')).toBeInTheDocument();
+    expect(screen.getByRole('radio', { name: 'Payee' })).toBeChecked();
+    expect(screen.getByLabelText('Recipient')).toHaveValue('');
+    expect(screen.getByLabelText('Amount')).toHaveValue('');
+  });
+
   it('starts from the account in the link and shows its available balance', async () => {
     setup(`/transfer?from=${IDS.current}`);
     expect(await screen.findByLabelText('From')).toHaveValue(IDS.current);

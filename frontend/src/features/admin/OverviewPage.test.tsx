@@ -1,13 +1,17 @@
 import { delay, http } from 'msw';
 import { screen, waitFor, within } from '@testing-library/react';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { toast } from 'sonner';
 import { server } from '@/test/server';
 import { apiUrl, fail, ok, renderWithApp } from '@/test/render';
 import { aCashOperation, anAdminRequest, anAlert, aTellerSession, IDS } from '@/test/fixtures';
 import type { AdminRequest, CashOperation, FraudAlert, TellerSession } from '@/lib/api/types';
 import { asAdmin, directoryLookupHandler, hoursAgo, hoursFromNow, ME } from './testData';
+import { anAudit, auditHandlers } from '@/features/ops/test/handlers';
+import { emitRealtime } from '@/features/ops/test/realtime';
 import OverviewPage from './OverviewPage';
+
+vi.mock('@/lib/realtime', async () => (await import('@/features/ops/test/realtime')).realtimeModule);
 
 // sonner replays still-active toasts to every new Toaster, so clear them between tests
 afterEach(() => {
@@ -23,6 +27,7 @@ interface Queues {
   allCash?: Reply<CashOperation>;
   closedSessions?: Reply<TellerSession>;
   openAlerts?: Reply<FraudAlert>;
+  ledgerAudit?: Parameters<typeof auditHandlers>[0];
 }
 
 const reply = <T,>(value: Reply<T> | undefined) => (typeof value === 'function' ? value() : ok(value ?? []));
@@ -49,7 +54,8 @@ function setup(queues: Queues = {}) {
       record('alerts', request);
       return reply(queues.openAlerts);
     }),
-    directoryLookupHandler()
+    directoryLookupHandler(),
+    ...auditHandlers(queues.ledgerAudit)
   );
   const utils = renderWithApp(<OverviewPage />, { ...asAdmin, route: '/overview' });
   return { ...utils, calls };
@@ -228,5 +234,30 @@ describe('OverviewPage', () => {
     const chart = screen.getByRole('region', { name: 'Cash operations by status' });
     const items = await within(chart).findAllByRole('listitem');
     expect(items.map((li) => li.textContent)).toEqual(['Awaiting approval2', 'Executed3', 'Rejected1']);
+  });
+
+  it('verifies the audit chains', async () => {
+    setup();
+    const card = await screen.findByRole('region', { name: 'Audit integrity' });
+    await waitFor(() => expect(card).toHaveTextContent('12,840 records checked'));
+    expect(card).toHaveTextContent('Sign-in and administration');
+    expect(screen.queryByText('An audit log has been altered')).not.toBeInTheDocument();
+  });
+
+  it('raises a broken audit chain at the top of the page', async () => {
+    setup({ ledgerAudit: anAudit({ ok: false, checked: 90, brokenAt: 'seq 77' }) });
+    // A banner under the greeting; the card says which chain and where
+    expect(await screen.findByText('An audit log has been altered')).toBeInTheDocument();
+    const card = screen.getByRole('region', { name: 'Audit integrity' });
+    await waitFor(() => expect(card).toHaveTextContent('First broken link at record seq 77'));
+  });
+
+  it('refreshes the fraud alert count when a new alert arrives, without a toast', async () => {
+    const { calls } = setup();
+    await screen.findByRole('link', { name: 'Open fraud alerts: 0' });
+    const before = calls.alerts!.length;
+    emitRealtime('fraud.alert', { alertId: 'alert-5', severity: 'CRITICAL', accountId: IDS.savings });
+    await waitFor(() => expect(calls.alerts!.length).toBeGreaterThan(before));
+    expect(screen.queryByText('New alert')).not.toBeInTheDocument();
   });
 });

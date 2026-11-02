@@ -1,4 +1,5 @@
 import type { ApiClient } from './client';
+import { normalizeCards } from './cards';
 import type {
   AccountLookup,
   AccountStatus,
@@ -6,6 +7,8 @@ import type {
   AdminRequest,
   AdminRequestStatus,
   AlertStatus,
+  AssistantMessage,
+  AssistantMeta,
   Balance,
   BankAccount,
   Beneficiary,
@@ -13,7 +16,11 @@ import type {
   CashOperation,
   CashOperationResult,
   CashOperationStatus,
+  Conversation,
+  ConversationSummary,
+  CreatedTopUp,
   CustomerProfile,
+  DeviceSession,
   DirectoryUser,
   Envelope,
   FraudAlert,
@@ -27,12 +34,19 @@ import type {
   MfaSetup,
   NotificationLog,
   Page,
+  PaymentConfig,
+  PaymentProof,
   ProfileInput,
   QueuedRequest,
+  SecurityEvent,
   SessionTokens,
+  SimulatedMethod,
+  SimulatedOutcome,
   StaffActivation,
   TellerSession,
   TellerSessionStatus,
+  TopUp,
+  TopUpPage,
   TransactionResult,
   TransferInput,
   WithdrawalCode,
@@ -51,6 +65,37 @@ function queuedOr<T>(data: unknown): MaybeQueued<T> {
   }
   return { queued: false, result: data as T };
 }
+
+/** Some routes answer `{ topUp }`, others the top-up itself: accept either */
+function unwrapTopUp(data: unknown): TopUp {
+  const candidate = data as { topUp?: TopUp } | undefined;
+  return (candidate && typeof candidate === 'object' && 'topUp' in candidate ? candidate.topUp : data) as TopUp;
+}
+
+/** A cursor page as `{ items, nextCursor }`, or a plain list with the cursor in the envelope's pagination */
+function toTopUpPage(envelope: (Envelope<unknown> & { pagination?: { nextCursor?: string | null } }) | undefined): TopUpPage {
+  const data = envelope?.data as { items?: TopUp[]; nextCursor?: string | null } | TopUp[] | undefined;
+  if (Array.isArray(data)) return { items: data, nextCursor: envelope?.pagination?.nextCursor ?? null };
+  return { items: data?.items ?? [], nextCursor: data?.nextCursor ?? null };
+}
+
+/** The signed triple, whether it comes back camelCased or exactly as Checkout.js names it */
+function toPaymentProof(data: unknown): PaymentProof | null {
+  const raw = (data ?? {}) as Record<string, unknown>;
+  const pick = (camel: string, snake: string) => {
+    const value = raw[camel] ?? raw[snake];
+    return typeof value === 'string' && value ? value : null;
+  };
+  const razorpayPaymentId = pick('razorpayPaymentId', 'razorpay_payment_id');
+  const razorpayOrderId = pick('razorpayOrderId', 'razorpay_order_id');
+  const razorpaySignature = pick('razorpaySignature', 'razorpay_signature');
+  return razorpayPaymentId && razorpayOrderId && razorpaySignature ? { razorpayPaymentId, razorpayOrderId, razorpaySignature } : null;
+}
+
+const withCards = (message: AssistantMessage): AssistantMessage => ({ ...message, content: message.content ?? '', cards: normalizeCards(message.cards) });
+
+/** Lists may arrive bare or as `{ items }` */
+const listOf = <T>(data: unknown): T[] => (Array.isArray(data) ? data : ((data as { items?: T[] } | undefined)?.items ?? [])) as T[];
 
 export function createEndpoints(client: ApiClient) {
   const get = async <T>(path: string, query?: object) =>
@@ -175,6 +220,47 @@ export function createEndpoints(client: ApiClient) {
       updateAlert: (alertId: string, status: AlertStatus, note?: string) =>
         send<FraudAlert>('PATCH', `/fraud/alerts/${id(alertId)}`, note ? { status, note } : { status }),
       history: (alertId: string) => get<FraudAlertEvent[]>(`/fraud/alerts/${id(alertId)}/history`),
+    },
+
+    payments: {
+      config: () => get<PaymentConfig>('/payments/config'),
+      /** One intent, one key: reuse the key when retrying the same top-up after an unclear failure */
+      createTopUp: (input: { accountId: string; amountPaise: string }, idempotencyKey: string) =>
+        send<CreatedTopUp>('POST', '/payments/top-ups', input, { idempotencyKey }),
+      confirmTopUp: async (topUpId: string, proof: PaymentProof) =>
+        unwrapTopUp(await send('POST', `/payments/top-ups/${id(topUpId)}/confirm`, proof)),
+      cancelTopUp: async (topUpId: string) => {
+        const data = await send('POST', `/payments/top-ups/${id(topUpId)}/cancel`);
+        return data === undefined ? undefined : unwrapTopUp(data);
+      },
+      /** Simulator mode only: pays (or declines) the order and returns what Checkout would have */
+      simulateTopUp: async (topUpId: string, outcome: SimulatedOutcome, method: SimulatedMethod) =>
+        toPaymentProof(await send('POST', `/payments/top-ups/${id(topUpId)}/simulate`, { outcome, method })),
+      topUps: async (params: { limit?: number; cursor?: string | null } = {}) =>
+        toTopUpPage(
+          await client.request<Envelope<unknown> & { pagination?: { nextCursor?: string | null } }>('/payments/top-ups', {
+            query: { limit: params.limit, cursor: params.cursor ?? undefined },
+          })
+        ),
+      topUp: async (topUpId: string) => unwrapTopUp(await get(`/payments/top-ups/${id(topUpId)}`)),
+    },
+
+    assistant: {
+      meta: () => get<AssistantMeta>('/assistant/meta'),
+      conversations: async () => listOf<ConversationSummary>(await get('/assistant/conversations')),
+      createConversation: (title?: string) => send<ConversationSummary>('POST', '/assistant/conversations', title ? { title } : {}),
+      conversation: async (conversationId: string) => {
+        const conversation = await get<Conversation>(`/assistant/conversations/${id(conversationId)}`);
+        return { ...conversation, messages: (conversation.messages ?? []).map(withCards) };
+      },
+      deleteConversation: (conversationId: string) => send<undefined>('DELETE', `/assistant/conversations/${id(conversationId)}`),
+    },
+
+    security: {
+      sessions: async () => listOf<DeviceSession>(await get('/auth/sessions')),
+      revokeSession: (sessionId: string) => send<undefined>('DELETE', `/auth/sessions/${id(sessionId)}`),
+      revokeOtherSessions: () => send<{ revoked?: number } | undefined>('POST', '/auth/sessions/revoke-others'),
+      events: async (limit = 20) => listOf<SecurityEvent>(await get('/auth/security-events', { limit })),
     },
 
     notifications: {

@@ -1,0 +1,212 @@
+# GENERATED from backend/docker/observability/prometheus/alerts.yml by backend/scripts/prometheus-rule.mjs.
+# Edit the source file, then re-run the script. Runbooks: docs/operations/runbooks.md
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: banksphere
+  labels:
+    # The default ruleSelector of kube-prometheus-stack; change it to match your Prometheus
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: banksphere-availability
+      rules:
+        - alert: ServiceDown
+          # Compose names each job after its service; the Kubernetes PodMonitor's job is <namespace>/banksphere
+          expr: up{job=~".+-service|api-gateway|.*/banksphere"} == 0
+          for: 2m
+          labels: { severity: critical }
+          annotations:
+            summary: "{{ $labels.job }} ({{ $labels.instance }}) is not answering metrics scrapes"
+            runbook: docs/operations/runbooks.md#service-down
+
+        - alert: HighErrorRatio
+          # 5xx share of all responses per service, over 5 minutes, with a minimum volume so one failed request at
+          # night doesn't page anyone
+          expr: |
+            (
+              sum by (service) (rate(http_server_requests_seconds_count{status=~"5.."}[5m]))
+              / sum by (service) (rate(http_server_requests_seconds_count[5m]))
+            ) > 0.02
+            and sum by (service) (rate(http_server_requests_seconds_count[5m])) > 1
+          for: 5m
+          labels: { severity: critical }
+          annotations:
+            summary: "{{ $labels.service }}: {{ $value | humanizePercentage }} of responses are 5xx"
+            runbook: docs/operations/runbooks.md#high-error-ratio
+
+        - alert: ErrorBudgetBurnFast
+          # Multi-window burn rate for the 99.9 % availability SLO (14.4x = 2 % of a 30-day budget in an hour)
+          expr: |
+            (
+              sum(rate(http_server_requests_seconds_count{service="api-gateway",status=~"5.."}[1h]))
+              / sum(rate(http_server_requests_seconds_count{service="api-gateway"}[1h]))
+            ) > (14.4 * 0.001)
+            and
+            (
+              sum(rate(http_server_requests_seconds_count{service="api-gateway",status=~"5.."}[5m]))
+              / sum(rate(http_server_requests_seconds_count{service="api-gateway"}[5m]))
+            ) > (14.4 * 0.001)
+          labels: { severity: critical }
+          annotations:
+            summary: "The edge is burning the monthly error budget 14x too fast"
+            runbook: docs/operations/runbooks.md#error-budget-burn
+
+        - alert: SlowRequests
+          expr: |
+            histogram_quantile(0.95, sum by (service, le) (rate(http_server_requests_seconds_bucket{route!~".*stream.*|.*/messages"}[5m]))) > 0.3
+            and sum by (service) (rate(http_server_requests_seconds_count[5m])) > 1
+          for: 10m
+          labels: { severity: warning }
+          annotations:
+            summary: "{{ $labels.service }}: p95 latency {{ $value | humanizeDuration }} (SLO 300 ms)"
+            runbook: docs/operations/runbooks.md#slow-requests
+
+    - name: banksphere-edge
+      rules:
+        - alert: GatewayShedding
+          expr: sum by (reason) (rate(gateway_shed_total[5m])) > 1
+          for: 5m
+          labels: { severity: warning }
+          annotations:
+            summary: "The gateway is refusing requests ({{ $labels.reason }}): add gateway replicas or find the slow upstream"
+            runbook: docs/operations/runbooks.md#gateway-shedding
+
+        - alert: CircuitBreakerOpen
+          expr: max by (service, upstream) (circuit_breaker_state) == 2
+          for: 1m
+          labels: { severity: critical }
+          annotations:
+            summary: "{{ $labels.service }} stopped calling {{ $labels.upstream }} (circuit open)"
+            runbook: docs/operations/runbooks.md#circuit-breaker-open
+
+        - alert: RateLimiterUnavailable
+          # The gateway fails open when the edge Redis is down: limits are not enforced while this fires
+          expr: sum(rate(gateway_rate_limiter_errors_total[5m])) > 0
+          for: 2m
+          labels: { severity: critical }
+          annotations:
+            summary: "Edge rate limits cannot be checked (edge Redis errors); the gateway is failing open"
+            runbook: docs/operations/runbooks.md#rate-limiter-unavailable
+
+        - alert: CredentialStuffingBans
+          expr: increase(auth_ip_bans_total[15m]) > 3
+          labels: { severity: warning }
+          annotations:
+            summary: "{{ $value }} addresses were banned for credential stuffing in 15 minutes"
+            runbook: docs/operations/runbooks.md#credential-stuffing
+
+    - name: banksphere-money
+      rules:
+        - alert: OutboxBacklog
+          # Events committed but not yet on Kafka: notifications, fraud scoring and real-time updates lag behind
+          expr: max by (service) (outbox_oldest_pending_seconds) > 120
+          for: 5m
+          labels: { severity: critical }
+          annotations:
+            summary: "{{ $labels.service }}: oldest unpublished event is {{ $value | humanizeDuration }} old"
+            runbook: docs/operations/runbooks.md#outbox-backlog
+
+        - alert: OutboxFailedEvents
+          expr: max by (service) (outbox_failed_events) > 0
+          for: 10m
+          labels: { severity: warning }
+          annotations:
+            summary: "{{ $labels.service }} has {{ $value }} outbox events that exhausted their retries"
+            runbook: docs/operations/runbooks.md#outbox-backlog
+
+        - alert: PaymentReconcilerFailing
+          expr: sum(increase(payments_reconciler_runs_total{result=~"error|partial"}[15m])) >= 3
+          labels: { severity: critical }
+          annotations:
+            summary: "Payment reconciliation keeps failing: captured payments may not be credited"
+            runbook: docs/operations/runbooks.md#payment-reconciler
+
+        - alert: PaymentReconcilerStopped
+          expr: sum(increase(payments_reconciler_runs_total[10m])) == 0
+          for: 10m
+          labels: { severity: critical }
+          annotations:
+            summary: "No payment reconciliation run in 10 minutes (it runs every 60 s on one replica)"
+            runbook: docs/operations/runbooks.md#payment-reconciler
+
+        - alert: WebhookSignatureFailures
+          expr: sum(increase(payments_webhooks_total{result="invalid_signature"}[15m])) > 5
+          labels: { severity: warning }
+          annotations:
+            summary: "{{ $value }} Razorpay webhooks with a bad signature in 15 minutes (wrong secret, or someone probing)"
+            runbook: docs/operations/runbooks.md#webhook-signature-failures
+
+    - name: banksphere-async
+      rules:
+        - alert: KafkaConsumerLag
+          expr: max by (consumergroup) (sum by (consumergroup, topic) (kafka_consumergroup_lag)) > 1000
+          for: 10m
+          labels: { severity: warning }
+          annotations:
+            summary: "{{ $labels.consumergroup }} is {{ $value }} messages behind"
+            runbook: docs/operations/runbooks.md#kafka-consumer-lag
+
+        - alert: KafkaDeadLetters
+          expr: sum by (topic) (increase(kafka_topic_partition_current_offset{topic=~".*\\.dlq"}[30m])) > 0
+          labels: { severity: warning }
+          annotations:
+            summary: "New messages on {{ $labels.topic }}: a consumer gave up on them"
+            runbook: docs/operations/runbooks.md#dead-letters
+
+        - alert: RealtimeDeliveryStalled
+          expr: |
+            sum(rate(realtime_events_published_total[10m])) > 0
+            and sum(rate(realtime_events_delivered_total[10m])) == 0
+            and sum(realtime_connections) > 0
+          for: 10m
+          labels: { severity: warning }
+          annotations:
+            summary: "Real-time events are published but no open stream receives them"
+            runbook: docs/operations/runbooks.md#realtime-stalled
+
+    - name: banksphere-data
+      rules:
+        - alert: PostgresDown
+          expr: pg_up == 0
+          for: 1m
+          labels: { severity: critical }
+          annotations:
+            summary: "Postgres is unreachable from the exporter"
+            runbook: docs/operations/runbooks.md#postgres
+
+        - alert: PostgresConnectionsHigh
+          expr: sum(pg_stat_activity_count) / max(pg_settings_max_connections) > 0.8
+          for: 10m
+          labels: { severity: warning }
+          annotations:
+            summary: "Postgres uses {{ $value | humanizePercentage }} of max_connections (check PgBouncer pool sizes)"
+            runbook: docs/operations/runbooks.md#postgres
+
+        - alert: RedisDown
+          expr: redis_up == 0
+          for: 1m
+          labels: { severity: critical }
+          annotations:
+            summary: "Redis ({{ $labels.redis }}) is unreachable"
+            runbook: docs/operations/runbooks.md#redis
+
+        - alert: SecurityRedisMemoryHigh
+          # The security Redis never evicts: when it is full, sign-ins and token revocations fail
+          expr: redis_memory_used_bytes{redis="security"} / redis_memory_max_bytes{redis="security"} > 0.8
+          for: 10m
+          labels: { severity: critical }
+          annotations:
+            summary: "Security Redis is {{ $value | humanizePercentage }} full and never evicts"
+            runbook: docs/operations/runbooks.md#redis
+
+        - alert: CacheHitRatioLow
+          expr: |
+            sum by (cache) (rate(cache_requests_total{result="hit"}[15m]))
+            / sum by (cache) (rate(cache_requests_total{result=~"hit|miss"}[15m])) < 0.5
+            and sum by (cache) (rate(cache_requests_total[15m])) > 5
+          for: 30m
+          labels: { severity: info }
+          annotations:
+            summary: "{{ $labels.cache }} cache hit ratio {{ $value | humanizePercentage }}: check memory and evictions"
+            runbook: docs/operations/runbooks.md#redis

@@ -13,6 +13,7 @@ import { Role } from '../../generated/client';
 import { AuthService, LoginContext } from '../services/auth.service';
 import { AdminRequestService } from '../services/admin-requests.service';
 import { clearSessionCookie, issueTokens, readSessionCookie, wantsCookieTransport } from './session-transport';
+import { clientOf } from './client-context';
 
 const emailSchema = z
   .string()
@@ -73,8 +74,8 @@ const changePasswordSchema = z
 const userIdParamsSchema = z.object({ userId: z.string().uuid() });
 const userStatusSchema = z.object({ isActive: z.boolean() }).strict();
 
-/** Client network for lockouts, and the client address for the staff network allowlist */
-const loginContext = (req: Request): LoginContext => ({ network: clientIpKey(req.ip), ip: req.ip });
+/** Client network for lockouts and bans, the client address for the staff network allowlist, and the device */
+const loginContext = (req: Request): LoginContext => ({ network: clientIpKey(req.ip), ip: req.ip, userAgent: req.header('user-agent') });
 
 /**
  * The refresh token of the request: from the body as always, or with cookie transport from the bs_rt cookie
@@ -142,7 +143,7 @@ export class AuthController {
 
   public refresh = wrap(async (req, res) => {
     // A concurrent refresh (409) keeps the cookie: the other request has just set the newest one
-    const tokens = await clearingCookieOn401(req, res, () => this.authService.refreshToken(presentedRefreshToken(req)));
+    const tokens = await clearingCookieOn401(req, res, () => this.authService.refreshToken(presentedRefreshToken(req), clientOf(req)));
     res.status(200).json({ success: true, data: issueTokens(req, res, tokens) });
   });
 
@@ -158,7 +159,7 @@ export class AuthController {
         accessToken = null;
       }
     }
-    await this.authService.logout(refreshToken, accessToken);
+    await this.authService.logout(refreshToken, accessToken, clientOf(req));
     if (wantsCookieTransport(req)) clearSessionCookie(res);
     res.status(200).json({ success: true, message: 'Successfully logged out and session revoked' });
   });
@@ -182,7 +183,7 @@ export class AuthController {
 
   public activateStaff = wrap(async (req, res) => {
     const { token, password } = activateSchema.parse(req.body);
-    const { tokens, enrolmentToken } = await this.authService.activateStaff(token, password);
+    const { tokens, enrolmentToken } = await this.authService.activateStaff(token, password, clientOf(req));
     res.status(200).json({ success: true, data: { tokens: issueTokens(req, res, tokens), enrolmentToken } });
   });
 
@@ -199,7 +200,7 @@ export class AuthController {
 
   public resetPassword = wrap(async (req, res) => {
     const { token, newPassword } = resetSchema.parse(req.body);
-    await this.authService.resetPassword(token, newPassword);
+    await this.authService.resetPassword(token, newPassword, clientOf(req));
     res.status(200).json({
       success: true,
       message: 'Password has been reset. All sessions were signed out; please sign in with your new password.',

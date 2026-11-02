@@ -240,3 +240,99 @@ describe('ApiClient', () => {
     ).resolves.toBeUndefined();
   });
 });
+
+describe('ApiClient.stream', () => {
+  const sse = (body: string) =>
+    new HttpResponse(body, { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' } });
+
+  it('opens an event stream with the bearer token and returns the raw response', async () => {
+    let seen: Request | undefined;
+    server.use(
+      http.post(url('/assistant/conversations/c1/messages'), ({ request }) => {
+        seen = request.clone();
+        return sse('event: token\ndata: {"text":"Hi"}\n\n');
+      })
+    );
+    const response = await makeClient().client.stream('/assistant/conversations/c1/messages', {
+      method: 'POST',
+      body: { content: 'Hello' },
+      headers: { 'Last-Event-ID': '41' },
+    });
+    expect(await response.text()).toContain('event: token');
+    expect(seen?.headers.get('authorization')).toBe('Bearer access-1');
+    expect(seen?.headers.get('accept')).toBe('text/event-stream');
+    expect(seen?.headers.get('last-event-id')).toBe('41');
+    expect(await seen?.json()).toEqual({ content: 'Hello' });
+  });
+
+  it('renews an expired token once and opens the stream again', async () => {
+    const auth: Array<string | null> = [];
+    server.use(
+      http.get(url('/realtime/stream'), ({ request }) => {
+        auth.push(request.headers.get('authorization'));
+        return auth.length === 1 ? unauthorized() : sse(': hello\n\n');
+      })
+    );
+    const { client, config } = makeClient();
+    const response = await client.stream('/realtime/stream');
+    expect(response.ok).toBe(true);
+    expect(auth).toEqual(['Bearer access-1', 'Bearer access-2']);
+    expect(config.refreshAccessToken).toHaveBeenCalledTimes(1);
+  });
+
+  it('maps an error response to an ApiError with Retry-After', async () => {
+    server.use(
+      http.get(url('/realtime/stream'), () =>
+        HttpResponse.json({ error: { code: 'TOO_MANY_STREAMS', message: 'At most 5 streams' } }, { status: 429, headers: { 'Retry-After': '7' } })
+      )
+    );
+    const err = (await makeClient().client.stream('/realtime/stream').catch((e: unknown) => e)) as ApiError;
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err.code).toBe('TOO_MANY_STREAMS');
+    expect(err.retryAfterSeconds).toBe(7);
+  });
+
+  it('times out only while connecting, never while the stream is open', async () => {
+    server.use(
+      http.get(url('/realtime/stream'), async () => {
+        await delay(200);
+        return sse(': late\n\n');
+      })
+    );
+    const err = (await makeClient({ timeoutMs: 20 }).client.stream('/realtime/stream').catch((e: unknown) => e)) as ApiError;
+    expect(err.code).toBe('TIMEOUT');
+
+    server.use(
+      http.get(url('/realtime/stream'), () => {
+        const encoder = new TextEncoder();
+        const body = new ReadableStream<Uint8Array>({
+          async start(controller) {
+            await delay(60);
+            controller.enqueue(encoder.encode(': still here\n\n'));
+            controller.close();
+          },
+        });
+        return new HttpResponse(body, { headers: { 'Content-Type': 'text/event-stream' } });
+      })
+    );
+    const response = await makeClient({ timeoutMs: 20 }).client.stream('/realtime/stream');
+    expect(await response.text()).toBe(': still here\n\n');
+  });
+
+  it('reports a failed connection as a NETWORK_ERROR and a caller abort as an AbortError', async () => {
+    server.use(http.get(url('/realtime/stream'), () => HttpResponse.error()));
+    const err = (await makeClient().client.stream('/realtime/stream').catch((e: unknown) => e)) as ApiError;
+    expect(err.code).toBe('NETWORK_ERROR');
+
+    server.use(
+      http.get(url('/realtime/stream'), async () => {
+        await delay(200);
+        return sse('');
+      })
+    );
+    const controller = new AbortController();
+    const pending = makeClient().client.stream('/realtime/stream', { signal: controller.signal });
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+  });
+});

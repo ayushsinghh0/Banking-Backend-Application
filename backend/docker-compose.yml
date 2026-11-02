@@ -7,8 +7,11 @@
 #   edge     gateway only (published port)
 #   apps     internal: gateway <-> services, plus the rate-limit Redis
 #   backend  internal: services <-> Postgres, Redis, Kafka
-#   egress   outbound internet, only for the services that send email (auth, notification)
+#   egress   outbound internet, only for services that must reach it: email (auth, notification), Razorpay
+#            (payment) and the LLM API (assistant)
 # Every other service has no route to the internet at all.
+# Data tier: Postgres behind PgBouncer; three Redis instances with different jobs (security state, edge rate
+# limits/bans, evictable caches + real-time fan-out); Kafka with one SCRAM user and ACL set per service.
 # For local development add the dev overlay:  docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
 
 x-node-healthcheck: &node-healthcheck
@@ -22,6 +25,8 @@ x-service-env: &service-env
   NODE_ENV: production
   LOG_LEVEL: ${LOG_LEVEL:-info}
   TRUST_PROXY: "1" # requests arrive through the API gateway
+  # Prometheus scrape port (internal networks only; the gateway never routes it)
+  METRICS_PORT: "9464"
   # Staff tokens are refused from outside these networks on every route (by role, not path)
   STAFF_ALLOWED_CIDRS: ${STAFF_ALLOWED_CIDRS:?set STAFF_ALLOWED_CIDRS in .env}
   JWT_VERIFY_KEYS: ${JWT_VERIFY_KEYS:?set JWT_VERIFY_KEYS in .env}
@@ -43,10 +48,18 @@ x-app: &app
   depends_on:
     migrate:
       condition: service_completed_successfully
+    pgbouncer:
+      condition: service_healthy
     redis:
+      condition: service_healthy
+    redis-cache:
       condition: service_healthy
     kafka-init:
       condition: service_completed_successfully
+
+# Runtime DATABASE_URLs go through PgBouncer (transaction pooling, see docker/pgbouncer/start.sh) and end in
+#   &pgbouncer=true&connection_limit=10&pool_timeout=10
+# pgbouncer=true makes Prisma avoid named prepared statements; connection_limit is one replica's client slots.
 
 networks:
   edge: {}
@@ -62,6 +75,36 @@ services:
     restart: always
     mem_limit: 768m
     networks: [backend]
+    # Sized for this container's memory; on a dedicated host scale shared_buffers to ~25 % of RAM.
+    # max_connections stays modest because PgBouncer multiplexes clients onto at most 80 backends.
+    command:
+      - postgres
+      - -c
+      - max_connections=120
+      - -c
+      - shared_buffers=192MB
+      - -c
+      - effective_cache_size=512MB
+      - -c
+      - work_mem=4MB
+      - -c
+      - maintenance_work_mem=64MB
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - wal_compression=on
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.track=top
+      - -c
+      - track_io_timing=on
+      - -c
+      - log_min_duration_statement=500
+      - -c
+      - log_lock_waits=on
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
@@ -81,6 +124,10 @@ services:
       NOTIFICATION_DB_APP_PASSWORD: ${NOTIFICATION_DB_APP_PASSWORD:?set in .env}
       FRAUD_DB_OWNER_PASSWORD: ${FRAUD_DB_OWNER_PASSWORD:?set in .env}
       FRAUD_DB_APP_PASSWORD: ${FRAUD_DB_APP_PASSWORD:?set in .env}
+      PAYMENT_DB_OWNER_PASSWORD: ${PAYMENT_DB_OWNER_PASSWORD:?set in .env}
+      PAYMENT_DB_APP_PASSWORD: ${PAYMENT_DB_APP_PASSWORD:?set in .env}
+      ASSISTANT_DB_OWNER_PASSWORD: ${ASSISTANT_DB_OWNER_PASSWORD:?set in .env}
+      ASSISTANT_DB_APP_PASSWORD: ${ASSISTANT_DB_APP_PASSWORD:?set in .env}
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./docker/postgres/init-schemas.sh:/docker-entrypoint-initdb.d/10-init-schemas.sh:ro
@@ -110,6 +157,101 @@ services:
       - ./docker/redis/start.sh:/usr/local/etc/redis/start.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "redis-cli --user reader --pass \"$$REDIS_READER_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # One-shot job on every deployment: re-applies docker/postgres/init-schemas.sh (idempotent) as the superuser,
+  # so schemas and roles of services added after the volume was created exist before migrations run
+  db-bootstrap:
+    image: postgres:16.4-alpine@sha256:5660c2cbfea50c7a9127d17dc4e48543eedd3d7a41a595a2dfa572471e37e64c
+    networks: [backend]
+    environment:
+      PGHOST: postgres
+      PGUSER: ${POSTGRES_USER:-postgres}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-banksphere}
+      AUTH_DB_OWNER_PASSWORD: ${AUTH_DB_OWNER_PASSWORD}
+      AUTH_DB_APP_PASSWORD: ${AUTH_DB_APP_PASSWORD}
+      CUSTOMER_DB_OWNER_PASSWORD: ${CUSTOMER_DB_OWNER_PASSWORD}
+      CUSTOMER_DB_APP_PASSWORD: ${CUSTOMER_DB_APP_PASSWORD}
+      ACCOUNT_DB_OWNER_PASSWORD: ${ACCOUNT_DB_OWNER_PASSWORD}
+      ACCOUNT_DB_APP_PASSWORD: ${ACCOUNT_DB_APP_PASSWORD}
+      LEDGER_DB_OWNER_PASSWORD: ${LEDGER_DB_OWNER_PASSWORD}
+      LEDGER_DB_APP_PASSWORD: ${LEDGER_DB_APP_PASSWORD}
+      NOTIFICATION_DB_OWNER_PASSWORD: ${NOTIFICATION_DB_OWNER_PASSWORD}
+      NOTIFICATION_DB_APP_PASSWORD: ${NOTIFICATION_DB_APP_PASSWORD}
+      FRAUD_DB_OWNER_PASSWORD: ${FRAUD_DB_OWNER_PASSWORD}
+      FRAUD_DB_APP_PASSWORD: ${FRAUD_DB_APP_PASSWORD}
+      PAYMENT_DB_OWNER_PASSWORD: ${PAYMENT_DB_OWNER_PASSWORD}
+      PAYMENT_DB_APP_PASSWORD: ${PAYMENT_DB_APP_PASSWORD}
+      ASSISTANT_DB_OWNER_PASSWORD: ${ASSISTANT_DB_OWNER_PASSWORD}
+      ASSISTANT_DB_APP_PASSWORD: ${ASSISTANT_DB_APP_PASSWORD}
+      # Observability overlay only: the pg_monitor role for postgres-exporter (empty = not created)
+      MONITORING_DB_PASSWORD: ${MONITORING_DB_PASSWORD:-}
+    volumes:
+      - ./docker/postgres/init-schemas.sh:/init-schemas.sh:ro
+    entrypoint: ["sh", "/init-schemas.sh"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Transaction-pooling proxy in front of Postgres for every service (migrations bypass it)
+  pgbouncer:
+    image: edoburu/pgbouncer:v1.25.2-p0@sha256:7d7a27d9e90985cab5cf42256f5c13a3120baa4b055b69df37beb272b89b2340
+    restart: always
+    read_only: true
+    # A block entry: in a flow list ([...]) the commas would split the options into separate mounts
+    tmpfs:
+      - /tmp:uid=70,gid=70,mode=0700
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    mem_limit: 96m
+    networks: [backend]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-banksphere}
+      AUTH_DB_APP_PASSWORD: ${AUTH_DB_APP_PASSWORD}
+      CUSTOMER_DB_APP_PASSWORD: ${CUSTOMER_DB_APP_PASSWORD}
+      ACCOUNT_DB_APP_PASSWORD: ${ACCOUNT_DB_APP_PASSWORD}
+      LEDGER_DB_APP_PASSWORD: ${LEDGER_DB_APP_PASSWORD}
+      NOTIFICATION_DB_APP_PASSWORD: ${NOTIFICATION_DB_APP_PASSWORD}
+      FRAUD_DB_APP_PASSWORD: ${FRAUD_DB_APP_PASSWORD}
+      PAYMENT_DB_APP_PASSWORD: ${PAYMENT_DB_APP_PASSWORD}
+      ASSISTANT_DB_APP_PASSWORD: ${ASSISTANT_DB_APP_PASSWORD}
+    volumes:
+      - ./docker/pgbouncer/start.sh:/start.sh:ro
+    entrypoint: ["sh", "/start.sh"]
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 6432"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    depends_on:
+      db-bootstrap:
+        condition: service_completed_successfully
+
+  # Application caches and real-time fan-out: evictable, not persisted, one ACL user per service
+  redis-cache:
+    image: redis:7.4-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
+    restart: always
+    mem_limit: 256m
+    networks: [backend]
+    environment:
+      REDIS_CACHE_LEDGER_PASSWORD: ${REDIS_CACHE_LEDGER_PASSWORD:?set REDIS_CACHE_LEDGER_PASSWORD in .env}
+      REDIS_CACHE_ACCOUNT_PASSWORD: ${REDIS_CACHE_ACCOUNT_PASSWORD:?set REDIS_CACHE_ACCOUNT_PASSWORD in .env}
+      REDIS_CACHE_CUSTOMER_PASSWORD: ${REDIS_CACHE_CUSTOMER_PASSWORD:?set REDIS_CACHE_CUSTOMER_PASSWORD in .env}
+      REDIS_CACHE_PAYMENT_PASSWORD: ${REDIS_CACHE_PAYMENT_PASSWORD:?set REDIS_CACHE_PAYMENT_PASSWORD in .env}
+      REDIS_CACHE_ASSISTANT_PASSWORD: ${REDIS_CACHE_ASSISTANT_PASSWORD:?set REDIS_CACHE_ASSISTANT_PASSWORD in .env}
+      REDIS_CACHE_REALTIME_PASSWORD: ${REDIS_CACHE_REALTIME_PASSWORD:?set REDIS_CACHE_REALTIME_PASSWORD in .env}
+      # Observability overlay only: key-less `monitor` ACL user for redis_exporter (empty = not created)
+      REDIS_CACHE_MONITOR_PASSWORD: ${REDIS_CACHE_MONITOR_PASSWORD:-}
+    command: ["sh", "/usr/local/etc/redis/cache-start.sh"]
+    volumes:
+      - ./docker/redis/cache-start.sh:/usr/local/etc/redis/cache-start.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --user realtime-svc --pass \"$$REDIS_CACHE_REALTIME_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -190,6 +332,11 @@ services:
       KAFKA_LEDGER_PASSWORD: ${KAFKA_LEDGER_PASSWORD:?set KAFKA_LEDGER_PASSWORD in .env}
       KAFKA_FRAUD_PASSWORD: ${KAFKA_FRAUD_PASSWORD:?set KAFKA_FRAUD_PASSWORD in .env}
       KAFKA_NOTIFICATION_PASSWORD: ${KAFKA_NOTIFICATION_PASSWORD:?set KAFKA_NOTIFICATION_PASSWORD in .env}
+      KAFKA_PAYMENT_PASSWORD: ${KAFKA_PAYMENT_PASSWORD:?set KAFKA_PAYMENT_PASSWORD in .env}
+      KAFKA_REALTIME_PASSWORD: ${KAFKA_REALTIME_PASSWORD:?set KAFKA_REALTIME_PASSWORD in .env}
+      KAFKA_TOPIC_PARTITIONS: ${KAFKA_TOPIC_PARTITIONS:-12}
+      # Observability overlay only: describe-only SCRAM user for kafka-exporter (empty = not created)
+      KAFKA_MONITOR_PASSWORD: ${KAFKA_MONITOR_PASSWORD:-}
     volumes:
       - ./docker/kafka/init.sh:/init.sh:ro
     entrypoint: ["/bin/bash", "/init.sh"]
@@ -205,12 +352,14 @@ services:
       TRANSACTION_URL: postgresql://ledger_owner:${LEDGER_DB_OWNER_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=ledger_schema
       NOTIFICATION_URL: postgresql://notification_owner:${NOTIFICATION_DB_OWNER_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=notification_schema
       FRAUD_URL: postgresql://fraud_owner:${FRAUD_DB_OWNER_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=fraud_schema
+      PAYMENT_URL: postgresql://payment_owner:${PAYMENT_DB_OWNER_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=payment_schema
+      ASSISTANT_URL: postgresql://assistant_owner:${ASSISTANT_DB_OWNER_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=assistant_schema
     command:
       - sh
       - -c
       - |
         set -e
-        for s in AUTH:auth CUSTOMER:customer ACCOUNT:account TRANSACTION:transaction NOTIFICATION:notification FRAUD:fraud; do
+        for s in AUTH:auth CUSTOMER:customer ACCOUNT:account TRANSACTION:transaction NOTIFICATION:notification FRAUD:fraud PAYMENT:payment ASSISTANT:assistant; do
           var=$${s%%:*}_URL; svc=$${s##*:}
           echo "Migrating $$svc-service"
           # A few retries ride out a database that is still starting or restarting
@@ -222,8 +371,8 @@ services:
           done
         done
     depends_on:
-      postgres:
-        condition: service_healthy
+      db-bootstrap:
+        condition: service_completed_successfully
 
   api-gateway:
     <<: *app
@@ -238,26 +387,47 @@ services:
       # Number of proxies in front that OVERWRITE X-Forwarded-For (0 = none). Required: a wrong value breaks
       # per-IP limits and lockouts for everyone, so the gateway refuses to start without it.
       TRUST_PROXY: ${GATEWAY_TRUST_PROXY:?set GATEWAY_TRUST_PROXY in .env (0 if nothing sits in front of the gateway)}
+      METRICS_PORT: "9464"
+      # Edge Redis: GCRA buckets, IP rules mirror and bans (written by auth-service)
       REDIS_URL: redis://:${RATE_LIMIT_REDIS_PASSWORD}@redis-ratelimit:6379
+      # Public keys only: the gateway verifies tokens to key per-user limits, it never authorizes
+      JWT_VERIFY_KEYS: ${JWT_VERIFY_KEYS:?set JWT_VERIFY_KEYS in .env}
       CORS_ORIGINS: ${CORS_ORIGINS:-}
-      GATEWAY_RATE_LIMIT_PER_MINUTE: ${GATEWAY_RATE_LIMIT_PER_MINUTE:-300}
       # Comma-separated CIDRs (VPN/office) allowed to call staff-only APIs (required in production)
       STAFF_ALLOWED_CIDRS: ${STAFF_ALLOWED_CIDRS:?set STAFF_ALLOWED_CIDRS in .env}
+      # Edge limits (design section 10); empty = the built-in default (see api-gateway/src/config.ts)
+      GATEWAY_RATE_LIMIT_PER_MINUTE: ${GATEWAY_RATE_LIMIT_PER_MINUTE:-}
+      GATEWAY_RATE_IP: ${GATEWAY_RATE_IP:-}
+      GATEWAY_BURST_IP: ${GATEWAY_BURST_IP:-}
+      GATEWAY_RATE_USER: ${GATEWAY_RATE_USER:-}
+      GATEWAY_BURST_USER: ${GATEWAY_BURST_USER:-}
+      GATEWAY_RATE_MONEY_WRITE: ${GATEWAY_RATE_MONEY_WRITE:-}
+      GATEWAY_BURST_MONEY_WRITE: ${GATEWAY_BURST_MONEY_WRITE:-}
+      GATEWAY_RATE_ASSISTANT: ${GATEWAY_RATE_ASSISTANT:-}
+      GATEWAY_BURST_ASSISTANT: ${GATEWAY_BURST_ASSISTANT:-}
+      GATEWAY_MAX_INFLIGHT: ${GATEWAY_MAX_INFLIGHT:-}
+      GATEWAY_MAX_STREAMS: ${GATEWAY_MAX_STREAMS:-}
       AUTH_SERVICE_URL: http://auth-service:8001
       CUSTOMER_SERVICE_URL: http://customer-service:8002
       ACCOUNT_SERVICE_URL: http://account-service:8003
       TRANSACTION_SERVICE_URL: http://transaction-service:8004
       NOTIFICATION_SERVICE_URL: http://notification-service:8005
       FRAUD_SERVICE_URL: http://fraud-service:8006
+      PAYMENT_SERVICE_URL: http://payment-service:8007
+      ASSISTANT_SERVICE_URL: http://assistant-service:8008
+      REALTIME_SERVICE_URL: http://realtime-service:8009
     depends_on:
       redis-ratelimit: { condition: service_healthy }
       auth-service: { condition: service_healthy }
       customer-service: { condition: service_healthy }
       account-service: { condition: service_healthy }
       transaction-service: { condition: service_healthy }
-      # Asynchronous (Kafka consumers): an SMTP or consumer problem must not keep the public API down
+      payment-service: { condition: service_healthy }
+      # Asynchronous or optional: a consumer, SMTP or LLM problem must not keep the core banking API down
       notification-service: { condition: service_started }
       fraud-service: { condition: service_started }
+      assistant-service: { condition: service_started }
+      realtime-service: { condition: service_started }
 
   auth-service:
     <<: *app
@@ -272,7 +442,7 @@ services:
       RATE_LIMIT_REDIS_URL: redis://:${RATE_LIMIT_REDIS_PASSWORD}@redis-ratelimit:6379
       STAFF_EMAIL_DOMAIN: ${STAFF_EMAIL_DOMAIN:?set STAFF_EMAIL_DOMAIN in .env}
       KAFKA_CLIENT_ID: auth-service
-      DATABASE_URL: postgresql://auth_app:${AUTH_DB_APP_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=auth_schema
+      DATABASE_URL: postgresql://auth_app:${AUTH_DB_APP_PASSWORD}@pgbouncer:6432/${POSTGRES_DB:-banksphere}?schema=auth_schema&pgbouncer=true&connection_limit=10&pool_timeout=10
       JWT_SIGNING_KEY: ${JWT_SIGNING_KEY:?set JWT_SIGNING_KEY in .env}
       JWT_SIGNING_KEY_ID: ${JWT_SIGNING_KEY_ID:?set JWT_SIGNING_KEY_ID in .env}
       JWT_ACCESS_EXPIRATION: ${JWT_ACCESS_EXPIRATION:-15m}
@@ -292,6 +462,7 @@ services:
     networks: [apps, backend, egress]
     depends_on:
       migrate: { condition: service_completed_successfully }
+      pgbouncer: { condition: service_healthy }
       redis: { condition: service_healthy }
       redis-ratelimit: { condition: service_healthy }
       kafka-init: { condition: service_completed_successfully }
@@ -303,7 +474,8 @@ services:
       <<: *service-env
       PORT: 8002
       REDIS_URL: redis://customer-svc:${REDIS_CUSTOMER_PASSWORD}@redis:6379
-      DATABASE_URL: postgresql://customer_app:${CUSTOMER_DB_APP_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=customer_schema
+      DATABASE_URL: postgresql://customer_app:${CUSTOMER_DB_APP_PASSWORD}@pgbouncer:6432/${POSTGRES_DB:-banksphere}?schema=customer_schema&pgbouncer=true&connection_limit=10&pool_timeout=10
+      CACHE_REDIS_URL: redis://customer-svc:${REDIS_CACHE_CUSTOMER_PASSWORD}@redis-cache:6379
       CUSTOMER_INTERNAL_TOKEN: ${CUSTOMER_INTERNAL_TOKEN:?set CUSTOMER_INTERNAL_TOKEN in .env}
 
   account-service:
@@ -317,7 +489,8 @@ services:
       KAFKA_CLIENT_ID: account-service
       LEDGER_SERVICE_URL: http://transaction-service:8004
       CUSTOMER_SERVICE_URL: http://customer-service:8002
-      DATABASE_URL: postgresql://account_app:${ACCOUNT_DB_APP_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=account_schema
+      DATABASE_URL: postgresql://account_app:${ACCOUNT_DB_APP_PASSWORD}@pgbouncer:6432/${POSTGRES_DB:-banksphere}?schema=account_schema&pgbouncer=true&connection_limit=10&pool_timeout=10
+      CACHE_REDIS_URL: redis://account-svc:${REDIS_CACHE_ACCOUNT_PASSWORD}@redis-cache:6379
       LEDGER_INTERNAL_TOKEN: ${LEDGER_INTERNAL_TOKEN:?set LEDGER_INTERNAL_TOKEN in .env}
       CUSTOMER_INTERNAL_TOKEN: ${CUSTOMER_INTERNAL_TOKEN}
 
@@ -330,8 +503,11 @@ services:
       KAFKA_PASSWORD: ${KAFKA_LEDGER_PASSWORD}
       PORT: 8004
       KAFKA_CLIENT_ID: transaction-service
-      DATABASE_URL: postgresql://ledger_app:${LEDGER_DB_APP_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=ledger_schema
+      DATABASE_URL: postgresql://ledger_app:${LEDGER_DB_APP_PASSWORD}@pgbouncer:6432/${POSTGRES_DB:-banksphere}?schema=ledger_schema&pgbouncer=true&connection_limit=10&pool_timeout=10
+      CACHE_REDIS_URL: redis://ledger-svc:${REDIS_CACHE_LEDGER_PASSWORD}@redis-cache:6379
       LEDGER_INTERNAL_TOKEN: ${LEDGER_INTERNAL_TOKEN}
+      # Separate credential for payment-service: it may credit/refund top-ups, never provision or close accounts
+      PAYMENT_LEDGER_INTERNAL_TOKEN: ${PAYMENT_LEDGER_INTERNAL_TOKEN:?set PAYMENT_LEDGER_INTERNAL_TOKEN in .env}
 
   notification-service:
     <<: *app
@@ -342,7 +518,7 @@ services:
       KAFKA_PASSWORD: ${KAFKA_NOTIFICATION_PASSWORD}
       PORT: 8005
       KAFKA_CLIENT_ID: notification-service
-      DATABASE_URL: postgresql://notification_app:${NOTIFICATION_DB_APP_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=notification_schema
+      DATABASE_URL: postgresql://notification_app:${NOTIFICATION_DB_APP_PASSWORD}@pgbouncer:6432/${POSTGRES_DB:-banksphere}?schema=notification_schema&pgbouncer=true&connection_limit=10&pool_timeout=10
       SECURITY_ALERT_EMAIL: ${SECURITY_ALERT_EMAIL:?set SECURITY_ALERT_EMAIL in .env}
       EMAIL_TRANSPORT: smtp
       SMTP_HOST: ${SMTP_HOST}
@@ -363,7 +539,69 @@ services:
       KAFKA_PASSWORD: ${KAFKA_FRAUD_PASSWORD}
       PORT: 8006
       KAFKA_CLIENT_ID: fraud-service
-      DATABASE_URL: postgresql://fraud_app:${FRAUD_DB_APP_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=fraud_schema
+      DATABASE_URL: postgresql://fraud_app:${FRAUD_DB_APP_PASSWORD}@pgbouncer:6432/${POSTGRES_DB:-banksphere}?schema=fraud_schema&pgbouncer=true&connection_limit=10&pool_timeout=10
+
+  # Razorpay top-ups: needs the internet (Razorpay API) and receives Razorpay's webhooks through the gateway
+  payment-service:
+    <<: *app
+    build: { context: ., args: { SERVICE: payment-service } }
+    networks: [apps, backend, egress]
+    environment:
+      <<: *service-env
+      KAFKA_USERNAME: payment-svc
+      KAFKA_PASSWORD: ${KAFKA_PAYMENT_PASSWORD}
+      KAFKA_CLIENT_ID: payment-service
+      PORT: 8007
+      DATABASE_URL: postgresql://payment_app:${PAYMENT_DB_APP_PASSWORD}@pgbouncer:6432/${POSTGRES_DB:-banksphere}?schema=payment_schema&pgbouncer=true&connection_limit=10&pool_timeout=10
+      CACHE_REDIS_URL: redis://payment-svc:${REDIS_CACHE_PAYMENT_PASSWORD}@redis-cache:6379
+      LEDGER_SERVICE_URL: http://transaction-service:8004
+      CUSTOMER_SERVICE_URL: http://customer-service:8002
+      PAYMENT_LEDGER_INTERNAL_TOKEN: ${PAYMENT_LEDGER_INTERNAL_TOKEN}
+      CUSTOMER_INTERNAL_TOKEN: ${CUSTOMER_INTERNAL_TOKEN}
+      RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID:?set RAZORPAY_KEY_ID in .env}
+      RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET:?set RAZORPAY_KEY_SECRET in .env}
+      RAZORPAY_WEBHOOK_SECRET: ${RAZORPAY_WEBHOOK_SECRET:?set RAZORPAY_WEBHOOK_SECRET in .env}
+      RAZORPAY_API_BASE: ${RAZORPAY_API_BASE:-https://api.razorpay.com}
+      RAZORPAY_ALLOW_TEST_KEYS: ${RAZORPAY_ALLOW_TEST_KEYS:-false}
+      RAZORPAY_WEBHOOK_ALLOWED_CIDRS: ${RAZORPAY_WEBHOOK_ALLOWED_CIDRS:-}
+      TOPUP_MIN_PAISE: ${TOPUP_MIN_PAISE:-100}
+      TOPUP_MAX_PAISE: ${TOPUP_MAX_PAISE:-10000000}
+      TOPUP_DAILY_LIMIT_PAISE: ${TOPUP_DAILY_LIMIT_PAISE:-20000000}
+      TOPUP_ORDER_TTL_MINUTES: ${TOPUP_ORDER_TTL_MINUTES:-30}
+
+  # Sphere assistant: calls the banking services with the customer's own token; internet only for the LLM API
+  assistant-service:
+    <<: *app
+    build: { context: ., args: { SERVICE: assistant-service } }
+    networks: [apps, backend, egress]
+    environment:
+      <<: *service-env
+      PORT: 8008
+      DATABASE_URL: postgresql://assistant_app:${ASSISTANT_DB_APP_PASSWORD}@pgbouncer:6432/${POSTGRES_DB:-banksphere}?schema=assistant_schema&pgbouncer=true&connection_limit=10&pool_timeout=10
+      CACHE_REDIS_URL: redis://assistant-svc:${REDIS_CACHE_ASSISTANT_PASSWORD}@redis-cache:6379
+      ACCOUNT_SERVICE_URL: http://account-service:8003
+      TRANSACTION_SERVICE_URL: http://transaction-service:8004
+      CUSTOMER_SERVICE_URL: http://customer-service:8002
+      PAYMENT_SERVICE_URL: http://payment-service:8007
+      # Leave LLM_API_KEY empty to use the built-in assistant (no data leaves the platform)
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
+      LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+      ASSISTANT_DAILY_TOKEN_BUDGET: ${ASSISTANT_DAILY_TOKEN_BUDGET:-50000}
+      ASSISTANT_RETENTION_DAYS: ${ASSISTANT_RETENTION_DAYS:-30}
+
+  # Server-Sent Events fan-out: Kafka -> Redis pub/sub -> every replica's open streams
+  realtime-service:
+    <<: *app
+    build: { context: ., args: { SERVICE: realtime-service } }
+    environment:
+      <<: *service-env
+      KAFKA_USERNAME: realtime-svc
+      KAFKA_PASSWORD: ${KAFKA_REALTIME_PASSWORD}
+      KAFKA_CLIENT_ID: realtime-service
+      PORT: 8009
+      CACHE_REDIS_URL: redis://realtime-svc:${REDIS_CACHE_REALTIME_PASSWORD}@redis-cache:6379
+      REALTIME_MAX_CONNECTIONS: ${REALTIME_MAX_CONNECTIONS:-10000}
 
 volumes:
   postgres_data:

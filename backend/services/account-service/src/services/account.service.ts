@@ -14,6 +14,7 @@ import { AccountNumberGenerator } from '../utils/account-number.generator';
 import { LedgerClient } from '../clients/ledger.client';
 import { CustomerClient } from '../clients/customer.client';
 import { StaffAccessAction } from '../types';
+import { AccountListCache } from './account-cache';
 
 export const DEFAULT_DAILY_LIMIT_PAISE = 10000000n; // ₹1,00,000.00
 export const MAX_CUSTOMER_DAILY_LIMIT_PAISE = BigInt(
@@ -36,7 +37,8 @@ export class AccountService {
   constructor(
     private readonly prisma: PrismaClient,
     private readonly ledgerClient: LedgerClient,
-    private readonly customerClient: CustomerClient
+    private readonly customerClient: CustomerClient,
+    private readonly listCache: AccountListCache = new AccountListCache()
   ) {}
 
   /**
@@ -131,6 +133,8 @@ export class AccountService {
     if (!account) {
       throw new ConflictError('Failed to allocate unique account number. Please retry.');
     }
+    // Committed: the customer's cached account list is stale
+    await this.listCache.changed(account.customerId);
 
     // The account is committed: the client must get it back now. An error here would invite a retry that
     // opens a second account, so a failed activation is left to reconcileWithLedger() (the ledger account
@@ -207,13 +211,15 @@ export class AccountService {
   }
 
   /**
-   * Lists all bank accounts owned by a specific customer
+   * Lists all bank accounts owned by a specific customer (cached; see AccountListCache). Callers authorize.
    */
   public async getAccountsByCustomerId(customerId: string): Promise<BankAccount[]> {
-    return this.prisma.bankAccount.findMany({
-      where: { customerId },
-      orderBy: { createdAt: 'desc' },
-    });
+    return this.listCache.list(customerId, () =>
+      this.prisma.bankAccount.findMany({
+        where: { customerId },
+        orderBy: { createdAt: 'desc' },
+      })
+    );
   }
 
   /**
@@ -268,7 +274,7 @@ export class AccountService {
 
     // A unique version for this change, reserved atomically against the version we read: two concurrent
     // writers can never push the same version to the ledger
-    const version = await this.reserveVersion(accountId, account.version);
+    const version = await this.reserveVersion(account, account.version);
 
     // Restrictive changes: ledger first (it is the authority on whether money can move / balance is 0)
     if (status === AccountStatus.CLOSED) {
@@ -300,6 +306,7 @@ export class AccountService {
       }
       return tx.bankAccount.findUniqueOrThrow({ where: { id: accountId } });
     });
+    await this.listCache.changed(account.customerId);
 
     // Permissive change: only after our own commit
     if (status === AccountStatus.ACTIVE) {
@@ -330,13 +337,17 @@ export class AccountService {
     return holders;
   }
 
-  /** Bumps the account's control version iff it is still `expected`; returns the new version */
-  private async reserveVersion(accountId: string, expected: number): Promise<number> {
+  /**
+   * Bumps the account's control version iff it is still `expected`; returns the new version. The version is
+   * part of the account's view, so the owner's cached list is invalidated once it has committed.
+   */
+  private async reserveVersion(account: { id: string; customerId: string }, expected: number): Promise<number> {
     const result = await this.prisma.bankAccount.updateMany({
-      where: { id: accountId, version: expected },
+      where: { id: account.id, version: expected },
       data: { version: { increment: 1 } },
     });
     if (result.count !== 1) throw new ConflictError('Account changed concurrently, please retry');
+    await this.listCache.changed(account.customerId);
     return expected + 1;
   }
 
@@ -382,7 +393,7 @@ export class AccountService {
     const setsCeiling = isAdmin && account.bankLimitCeiling !== dailyLimit;
     if (dailyLimit === account.dailyLimit && !setsCeiling) return account;
 
-    const version = await this.reserveVersion(accountId, account.version);
+    const version = await this.reserveVersion(account, account.version);
     const ledgerState = { isActive: account.status === AccountStatus.ACTIVE, dailyLimitPaise: dailyLimit.toString(), version };
     const lowering = dailyLimit < account.dailyLimit;
     if (lowering) {
@@ -404,6 +415,7 @@ export class AccountService {
       });
       return result;
     });
+    await this.listCache.changed(account.customerId);
     if (!lowering) {
       await this.pushToLedger(accountId, ledgerState);
     }
@@ -469,7 +481,7 @@ export class AccountService {
               } else {
                 // The ledger allows more than it should (or is simply behind): push our state with a fresh version
                 const version =
-                  ledger.controlVersion < account.version ? account.version : await this.reserveVersion(account.id, account.version);
+                  ledger.controlVersion < account.version ? account.version : await this.reserveVersion(account, account.version);
                 const { applied } = await this.ledgerClient.updateAccount(account.id, { isActive: wantActive, dailyLimitPaise: wantLimit, version });
                 if (applied) repaired++;
                 else logger.error({ accountId: account.id, alert: 'ACCOUNT_LEDGER_PUSH_REJECTED' }, 'Ledger refused the reconciliation push');

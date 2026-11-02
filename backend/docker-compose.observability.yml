@@ -1,0 +1,144 @@
+# Observability overlay (design section 13): Prometheus with the alert rules, Grafana with a provisioned
+# dashboard, and exporters for Postgres, the three Redis instances and Kafka consumer lag.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml -f docker-compose.observability.yml up -d
+#   (or, for the full stack with the web app, the root docker-compose.observability.yml)
+#
+# Grafana http://127.0.0.1:3000 and Prometheus http://127.0.0.1:9090, bound to loopback only: dev and staging,
+# unless you put Grafana behind your own sign-on. This file only ADDS services; the monitoring credentials are
+# passed to the base services as optional variables (empty = no monitoring principal is created):
+#   MONITORING_DB_PASSWORD        Postgres role metrics_reader (pg_monitor: statistics, never table data)
+#   REDIS_CACHE_MONITOR_PASSWORD  cache Redis ACL user `monitor` (INFO and friends, no keys)
+#   KAFKA_MONITOR_PASSWORD        Kafka SCRAM user monitor-svc (Describe only: offsets and lag, no messages)
+#   GRAFANA_ADMIN_PASSWORD        Grafana's admin account
+# node scripts/setup-dev-env.mjs generates all four.
+
+x-exporter: &exporter
+  restart: unless-stopped
+  read_only: true
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
+  mem_limit: 64m
+  networks: [backend, observability]
+
+networks:
+  # Prometheus and Grafana need a network with a route to the host for their loopback ports; the app networks
+  # stay internal, and Prometheus joins them only to scrape
+  observability: {}
+
+volumes:
+  prometheus_data:
+  grafana_data:
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    restart: unless-stopped
+    user: "65534:65534"
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    mem_limit: 512m
+    networks: [apps, backend, observability]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-7d}
+      - --web.enable-lifecycle=false
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./docker/observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./docker/observability/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9090/-/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    restart: unless-stopped
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    mem_limit: 256m
+    tmpfs: [/tmp]
+    networks: [observability]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env (node scripts/setup-dev-env.mjs)}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_SECURITY_COOKIE_SAMESITE: strict
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - ./docker/observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      prometheus: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  postgres-exporter:
+    <<: *exporter
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.15.0
+    environment:
+      # Straight to Postgres (not PgBouncer): pg_stat_* views are per server
+      DATA_SOURCE_URI: postgres:5432/${POSTGRES_DB:-banksphere}?sslmode=disable
+      DATA_SOURCE_USER: metrics_reader
+      DATA_SOURCE_PASS: ${MONITORING_DB_PASSWORD:?set MONITORING_DB_PASSWORD in .env (node scripts/setup-dev-env.mjs)}
+    depends_on:
+      db-bootstrap: { condition: service_completed_successfully }
+
+  # One exporter per Redis instance: security (AOF, never evicts), edge rate limits, application cache
+  redis-exporter-security:
+    <<: *exporter
+    image: oliver006/redis_exporter:v1.62.0
+    environment:
+      REDIS_ADDR: redis://redis:6379
+      # The read-only `reader` ACL user already has PING and INFO
+      REDIS_USER: reader
+      REDIS_PASSWORD: ${REDIS_READER_PASSWORD}
+      REDIS_EXPORTER_CHECK_KEYS: ""
+      REDIS_EXPORTER_SKIP_TLS_VERIFICATION: "false"
+
+  redis-exporter-ratelimit:
+    <<: *exporter
+    image: oliver006/redis_exporter:v1.62.0
+    networks: [apps, observability]
+    environment:
+      REDIS_ADDR: redis://redis-ratelimit:6379
+      REDIS_PASSWORD: ${RATE_LIMIT_REDIS_PASSWORD}
+
+  redis-exporter-cache:
+    <<: *exporter
+    image: oliver006/redis_exporter:v1.62.0
+    environment:
+      REDIS_ADDR: redis://redis-cache:6379
+      REDIS_USER: monitor
+      REDIS_PASSWORD: ${REDIS_CACHE_MONITOR_PASSWORD:?set REDIS_CACHE_MONITOR_PASSWORD in .env (node scripts/setup-dev-env.mjs)}
+
+  kafka-exporter:
+    <<: *exporter
+    image: danielqsj/kafka-exporter:v1.8.0
+    command:
+      - --kafka.server=kafka:29092
+      - --sasl.enabled
+      - --sasl.mechanism=scram-sha512
+      - --sasl.username=monitor-svc
+      - --sasl.password=${KAFKA_MONITOR_PASSWORD:?set KAFKA_MONITOR_PASSWORD in .env (node scripts/setup-dev-env.mjs)}
+      - --topic.filter=^[a-z].*
+      - --group.filter=.*
+    depends_on:
+      kafka-init: { condition: service_completed_successfully }

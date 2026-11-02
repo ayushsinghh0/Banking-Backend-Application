@@ -1,0 +1,7 @@
+# Horizontal-scale overlay: several replicas of every stateless service behind the gateway and the web container.
+#   docker compose -f docker-compose.yml -f docker-compose.scale.yml up -d --build
+# See backend/docker-compose.scale.yml for the replica counts and the constraints (no published ports on
+# replicated services; Compose's DNS round-robins between replicas).
+include:
+  - path: backend/docker-compose.scale.yml
+    env_file: backend/.env

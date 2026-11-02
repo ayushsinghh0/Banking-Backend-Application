@@ -8,6 +8,8 @@ import {
   UserRegisteredEvent,
   WithdrawalCodeCreatedEvent,
   BeneficiaryAddedEvent,
+  PaymentUpdatedEvent,
+  NewDeviceLoginEvent,
 } from '../types';
 
 export class KafkaNotificationConsumer {
@@ -26,6 +28,8 @@ export class KafkaNotificationConsumer {
       'fraud.alert.created.v1',
       'withdrawal.code.created.v1',
       'beneficiary.added.v1',
+      'payment.updated.v1',
+      'security.new_device_login.v1',
     ];
 
     this.kafkaService.subscribe(
@@ -72,6 +76,14 @@ export class KafkaNotificationConsumer {
 
           case 'beneficiary.added.v1':
             await this.notificationService.handleBeneficiaryAdded(payload as BeneficiaryAddedEvent);
+            break;
+
+          case 'payment.updated.v1':
+            await this.notificationService.handlePaymentUpdated(payload as PaymentUpdatedEvent);
+            break;
+
+          case 'security.new_device_login.v1':
+            await this.notificationService.handleNewDeviceLogin(payload as NewDeviceLoginEvent);
             break;
 
           default:

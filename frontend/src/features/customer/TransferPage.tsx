@@ -9,7 +9,7 @@ import type { BankAccount, Beneficiary, TransactionResult, TransferInput } from 
 import { describeError, isApiError } from '@/lib/api/errors';
 import { useAuth } from '@/lib/auth/AuthProvider';
 import { qk } from '@/lib/query';
-import { comparePaise, formatPaise, parseRupees } from '@/lib/money';
+import { comparePaise, formatPaise, paiseToInput, parseRupees } from '@/lib/money';
 import { newIdempotencyKey } from '@/lib/notify';
 import { formatAccountNumber, maskAccountNumber, rupeesSchema } from '@/lib/validation';
 import { cn } from '@/lib/cn';
@@ -174,6 +174,10 @@ export default function TransferPage() {
     );
   }
   const active = accountsQuery.data.filter((a) => a.status === 'ACTIVE');
+  const payees = payeesQuery.data ?? [];
+  // A transfer drafted by Sphere names the payee rather than identifying it: match the nickname exactly
+  const payeeName = params.get('payeeName')?.trim() ?? '';
+  const named = payeeName ? payees.find((p) => p.nickname.trim().toLowerCase() === payeeName.toLowerCase()) : undefined;
   if (active.length === 0) {
     return (
       <PageShell>
@@ -196,28 +200,43 @@ export default function TransferPage() {
     <PageShell>
       <TransferFlow
         accounts={active}
-        payees={payeesQuery.data ?? []}
+        payees={payees}
         payeesError={payeesQuery.error}
         onRetryPayees={() => void payeesQuery.refetch()}
         initialFrom={params.get('from')}
-        initialPayee={params.get('payee')}
+        initialPayee={params.get('payee') ?? named?.id ?? null}
+        unknownPayee={payeeName && !named ? payeeName : null}
+        initialAmount={params.get('amount')}
+        initialNote={params.get('note')}
       />
     </PageShell>
   );
 }
 
-function initialValues(accounts: BankAccount[], payees: Beneficiary[], from: string | null, payeeId: string | null): DetailsForm {
-  const source = accounts.find((a) => a.id === from) ?? accounts[0];
+/** What a link can prefill (a payee from the Payees page, or a transfer drafted by Sphere); never sent unreviewed */
+interface Prefill {
+  from: string | null;
+  payeeId: string | null;
+  /** A payee was asked for by name but isn't one of the customer's */
+  payeeWanted: boolean;
+  /** Paise */
+  amount: string | null;
+  note: string | null;
+}
+
+function initialValues(accounts: BankAccount[], payees: Beneficiary[], prefill: Prefill): DetailsForm {
+  const source = accounts.find((a) => a.id === prefill.from) ?? accounts[0];
   const others = accounts.filter((a) => a.id !== source?.id);
-  const payee = payees.find((p) => p.id === payeeId);
-  const mode: Mode = payee || others.length === 0 ? 'payee' : 'own';
+  const payee = payees.find((p) => p.id === prefill.payeeId);
+  const mode: Mode = payee || prefill.payeeWanted || others.length === 0 ? 'payee' : 'own';
+  const amount = prefill.amount && /^\d{1,18}$/.test(prefill.amount) && BigInt(prefill.amount) > 0n ? paiseToInput(prefill.amount) : '';
   return {
     sourceAccountId: source?.id ?? '',
     mode,
     destinationAccountId: others.length === 1 ? (others[0]?.id ?? '') : '',
     beneficiaryId: payee && isPayeeActive(payee, Date.now()) ? payee.id : '',
-    amount: '',
-    note: '',
+    amount,
+    note: (prefill.note ?? '').trim().slice(0, 255),
   };
 }
 
@@ -228,6 +247,9 @@ function TransferFlow({
   onRetryPayees,
   initialFrom,
   initialPayee,
+  unknownPayee = null,
+  initialAmount = null,
+  initialNote = null,
 }: {
   accounts: BankAccount[];
   payees: Beneficiary[];
@@ -235,6 +257,9 @@ function TransferFlow({
   onRetryPayees: () => void;
   initialFrom: string | null;
   initialPayee: string | null;
+  unknownPayee?: string | null;
+  initialAmount?: string | null;
+  initialNote?: string | null;
 }) {
   const { api, user } = useAuth();
   const { run } = useStepUp();
@@ -243,7 +268,15 @@ function TransferFlow({
   const balanceQueries = useBalances(accounts.map((a) => a.id));
   const balanceOf = (id: string) => balanceQueries[accounts.findIndex((a) => a.id === id)];
 
-  const [defaults] = useState(() => initialValues(accounts, payees, initialFrom, initialPayee));
+  const [defaults] = useState(() =>
+    initialValues(accounts, payees, {
+      from: initialFrom,
+      payeeId: initialPayee,
+      payeeWanted: Boolean(unknownPayee),
+      amount: initialAmount,
+      note: initialNote,
+    })
+  );
   const form = useForm<DetailsForm>({ resolver: zodResolver(detailsSchema), defaultValues: defaults });
   const [step, setStep] = useState<Step>('details');
   const [draft, setDraft] = useState<Draft | null>(null);
@@ -378,6 +411,7 @@ function TransferFlow({
           now={now}
           problem={detailsProblem}
           initialPayee={payees.find((p) => p.id === initialPayee) ?? null}
+          unknownPayee={unknownPayee}
           headingRef={headingRef}
           onSubmit={toReview}
         />
@@ -464,6 +498,7 @@ function DetailsStep({
   now,
   problem,
   initialPayee,
+  unknownPayee,
   headingRef,
   onSubmit,
 }: {
@@ -476,6 +511,7 @@ function DetailsStep({
   now: number;
   problem: Problem | null;
   initialPayee: Beneficiary | null;
+  unknownPayee: string | null;
   headingRef: React.RefObject<HTMLHeadingElement>;
   onSubmit: () => void;
 }) {
@@ -517,6 +553,11 @@ function DetailsStep({
             <Callout tone="danger" title={problem.title}>
               {problem.description}
               {problem.payeeLink ? <span className="mt-1 block">{addPayeeLink}</span> : null}
+            </Callout>
+          ) : null}
+          {unknownPayee && !beneficiaryId ? (
+            <Callout tone="warning" title={`We couldn’t find “${unknownPayee}” in your payees`}>
+              Choose who to pay below, or add them as a payee first.
             </Callout>
           ) : null}
           {waitingPayee ? (

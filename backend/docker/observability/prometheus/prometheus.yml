@@ -1,0 +1,73 @@
+# Prometheus for the Compose stack (docker-compose.observability.yml).
+#
+# Application targets are discovered through Docker's DNS: every service name resolves to one A record per
+# replica, so the scale overlay's replicas are all scraped (one target per container, `instance` = ip:9464).
+# `job` is set to the service name so `up{job="..."}` works per service; the series themselves already carry the
+# app's own `service` label (set by @banksphere/common), which dashboards and alerts group by.
+#
+# The metrics listener (METRICS_PORT 9464) is on the internal `apps`/`backend` networks only; the gateway and the
+# web nginx never route it. Exporters: postgres-exporter (direct to Postgres, monitoring role), one redis_exporter
+# per Redis instance (security, edge rate-limit, cache), kafka-exporter (consumer lag), and pgbouncer-exporter
+# when the `pgbouncer-stats` profile is enabled.
+
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 15s
+  external_labels:
+    deployment: compose
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: banksphere
+    dns_sd_configs:
+      - names:
+          - api-gateway
+          - auth-service
+          - customer-service
+          - account-service
+          - transaction-service
+          - notification-service
+          - fraud-service
+          - payment-service
+          - assistant-service
+          - realtime-service
+        type: A
+        port: 9464
+        refresh_interval: 15s
+    relabel_configs:
+      # One job per service, named after the Compose service (= the app's SERVICE / `service` label)
+      - source_labels: [__meta_dns_name]
+        target_label: job
+
+  - job_name: postgres
+    static_configs:
+      - targets: [postgres-exporter:9187]
+
+  # Only present with `--profile pgbouncer-stats` (needs a stats user in docker/pgbouncer/start.sh)
+  - job_name: pgbouncer
+    static_configs:
+      - targets: [pgbouncer-exporter:9127]
+
+  - job_name: redis
+    static_configs:
+      - targets: [redis-exporter-security:9121]
+        labels: { redis: security }
+      - targets: [redis-exporter-ratelimit:9121]
+        labels: { redis: ratelimit }
+      - targets: [redis-exporter-cache:9121]
+        labels: { redis: cache }
+
+  - job_name: kafka
+    static_configs:
+      - targets: [kafka-exporter:9308]
+
+  - job_name: prometheus
+    static_configs:
+      - targets: [localhost:9090]
+
+  - job_name: grafana
+    static_configs:
+      - targets: [grafana:3000]

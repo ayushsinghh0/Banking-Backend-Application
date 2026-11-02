@@ -1,5 +1,5 @@
 import { Beneficiary, PrismaClient, Prisma } from '../../generated/client';
-import { AuthenticatedUser, ConflictError, HttpError, acquireJobLease, isStaff, logger } from '@banksphere/common';
+import { AuthenticatedUser, ConflictError, HttpError, acquireJobLease, gauge, isStaff, logger } from '@banksphere/common';
 import {
   TransferDTO,
   TransactionResult,
@@ -17,6 +17,7 @@ import {
   CurrencyMismatchError,
 } from '../errors';
 import {
+  ASSET_KINDS,
   LedgerPolicy,
   TxClient,
   advisoryLock,
@@ -31,8 +32,16 @@ import {
   stageTransactionEvent,
   toResult,
 } from './ledger-core';
+import { LedgerCommits } from './ledger-commits';
+import { LedgerAccountMeta } from './ledger-cache';
 
 export { startOfIstDay } from './ledger-core';
+
+const reconciliationMismatches = gauge(
+  'ledger_reconciliation_mismatches',
+  'Ledger invariant violations found by the latest reconciliation (0 = balanced)',
+  ['check']
+);
 
 const beneficiaryRequired = () =>
   new HttpError(422, 'BENEFICIARY_REQUIRED', 'Add this account as a beneficiary before sending money to it');
@@ -44,16 +53,20 @@ const invalidDestination = () =>
 export class LedgerService {
   constructor(
     private readonly prisma: PrismaClient,
-    private readonly policy: LedgerPolicy = defaultLedgerPolicy()
+    private readonly policy: LedgerPolicy = defaultLedgerPolicy(),
+    private readonly commits: LedgerCommits = new LedgerCommits()
   ) {}
 
+  /** The caller's transaction, or a new one whose postings are applied to the cache once it commits */
   private inTransaction<T>(tx: TxClient | undefined, work: (tx: TxClient) => Promise<T>): Promise<T> {
     if (tx) return work(tx);
-    return this.prisma.$transaction(work, {
-      isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted,
-      maxWait: 10_000,
-      timeout: 15_000,
-    });
+    return this.commits.run(() =>
+      this.prisma.$transaction(work, {
+        isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted,
+        maxWait: 10_000,
+        timeout: 15_000,
+      })
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -170,9 +183,15 @@ export class LedgerService {
         },
       });
 
-      await postDoubleEntry(tx, { transactionId: transaction.id, debit: sourceAccount, credit: destAccount, amount: amountInPaise });
+      await postDoubleEntry(tx, {
+        transactionId: transaction.id,
+        type: TransactionType.TRANSFER,
+        debit: sourceAccount,
+        credit: destAccount,
+        amount: amountInPaise,
+      });
 
-      await stageTransactionEvent(tx, transaction.id, {
+      await stageTransactionEvent(tx, transaction.id, sourceAccountId, {
         referenceId: transaction.referenceId,
         type: transaction.type,
         amountInPaise: amountInPaise.toString(),
@@ -228,11 +247,17 @@ export class LedgerService {
   // ---------------------------------------------------------------------------
 
   /**
-   * Customer accounts: the owner or staff. Cash accounts (teller drawers, vault, suspense) only to a
-   * BANK_ADMIN: a teller must not learn their drawer's expected cash before the blind closing count.
+   * Customer accounts: the owner or staff. Cash and clearing accounts (teller drawers, vault, suspense,
+   * payment clearing) only to a BANK_ADMIN: a teller must not learn their drawer's expected cash before the
+   * blind closing count.
+   *
+   * Authorization always runs first, on the account's owner and kind (cached: they never change), and a
+   * staff read is recorded on every request, cache hit or not, before any data is returned.
    */
-  private async getReadableAccount(accountId: string, actor: AuthenticatedUser, action: string) {
-    const account = await this.prisma.ledgerAccount.findUnique({ where: { id: accountId } });
+  private async getReadableAccount(accountId: string, actor: AuthenticatedUser, action: string): Promise<LedgerAccountMeta> {
+    const account = await this.commits.readCache.account(accountId, () =>
+      this.prisma.ledgerAccount.findUnique({ where: { id: accountId }, select: { id: true, customerId: true, kind: true, currency: true } })
+    );
     const readable =
       account &&
       (account.kind === 'CUSTOMER' ? account.customerId === actor.id || isStaff(actor) : actor.role === 'BANK_ADMIN');
@@ -241,51 +266,60 @@ export class LedgerService {
     }
     if (account.customerId !== actor.id) {
       // Staff access to customer data is always recorded
-      await audit(this.prisma, actor.id, action, accountId, { role: actor.role });
+      await this.prisma.$transaction((tx) => audit(tx, actor.id, action, accountId, { role: actor.role }));
     }
     return account;
   }
 
   /**
-   * Retrieves an account balance authoritatively from the ledger (owner or staff)
+   * Retrieves an account balance authoritatively from the ledger (owner or staff). Cached for 30 s under the
+   * account's version, which every committed posting to the account bumps.
    */
   public async getAccountBalance(
     accountId: string,
     actor: AuthenticatedUser
   ): Promise<{ accountId: string; balanceInPaise: string; currency: string }> {
     const account = await this.getReadableAccount(accountId, actor, 'STAFF_VIEW_BALANCE');
+    const balance = await this.commits.readCache.balance(accountId, async () => {
+      const row = await this.prisma.ledgerAccount.findUnique({ where: { id: accountId }, select: { balance: true } });
+      return row?.balance ?? null;
+    });
+    if (balance === null) throw new NotFoundError('Account not found');
     return {
       accountId: account.id,
-      balanceInPaise: account.balance.toString(),
+      balanceInPaise: balance.toString(),
       currency: account.currency,
     };
   }
 
   /**
-   * Returns paginated transaction history for an account (owner or staff)
+   * Returns paginated transaction history for an account (owner or staff). The first pages are cached for
+   * 60 s under the account's version.
    */
   public async getTransactionHistory(accountId: string, actor: AuthenticatedUser, limit = 20, offset = 0) {
     await this.getReadableAccount(accountId, actor, 'STAFF_VIEW_HISTORY');
 
-    const entries = await this.prisma.ledgerEntry.findMany({
-      where: { accountId },
-      include: { transaction: true },
-      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-      take: limit,
-      skip: offset,
-    });
+    return this.commits.readCache.history(accountId, limit, offset, async () => {
+      const entries = await this.prisma.ledgerEntry.findMany({
+        where: { accountId },
+        include: { transaction: true },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        take: limit,
+        skip: offset,
+      });
 
-    return entries.map((entry) => ({
-      entryId: entry.id,
-      transactionId: entry.transactionId,
-      referenceId: entry.transaction.referenceId,
-      type: entry.transaction.type,
-      entryType: entry.entryType,
-      amountInPaise: entry.amount.toString(),
-      balanceAfterInPaise: entry.balanceAfter.toString(),
-      description: entry.transaction.description,
-      createdAt: entry.createdAt,
-    }));
+      return entries.map((entry) => ({
+        entryId: entry.id,
+        transactionId: entry.transactionId,
+        referenceId: entry.transaction.referenceId,
+        type: entry.transaction.type,
+        entryType: entry.entryType,
+        amountInPaise: entry.amount.toString(),
+        balanceAfterInPaise: entry.balanceAfter.toString(),
+        description: entry.transaction.description,
+        createdAt: entry.createdAt,
+      }));
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -352,6 +386,8 @@ export class LedgerService {
       }
       await tx.ledgerAccount.update({ where: { id: accountId }, data: { isActive: false, closedAt: new Date(), controlVersion: version } });
     });
+    // Committed: drop the cached account (spec: deleted on close) and anything versioned on it
+    await this.commits.readCache.accountClosed(accountId);
   }
 
   private snapshot(account: {
@@ -397,9 +433,11 @@ export class LedgerService {
 
   /**
    * Ledger invariants (any violation means tampering or a bug and is logged as an alert):
-   * 1. every account's balance equals its entries (credit-normal for customers, debit-normal for drawers);
+   * 1. every account's balance equals its entries (credit-normal for customers, debit-normal for the asset
+   *    accounts: drawers, vault, suspense and payment clearing); an account of any other kind is a mismatch;
    * 2. every transaction's debits equal its credits;
-   * 3. zero-sum: total owed to customers equals total cash recorded in teller drawers.
+   * 3. zero-sum: total owed to customers equals total held in the asset accounts.
+   * The result is also exported as the ledger_reconciliation_mismatches{check} gauge.
    */
   public async reconcileBalances(): Promise<{ checked: number; mismatches: string[]; unbalancedTransactions: number; zeroSumDelta: string }> {
     // One REPEATABLE READ snapshot, so all three checks see the same instant even while money moves
@@ -416,7 +454,10 @@ export class LedgerService {
                SUM(CASE WHEN entry_type = 'CREDIT' THEN amount ELSE -amount END) AS net_credit
         FROM ledger_entries GROUP BY account_id
       ) e ON e.account_id = a.id
-      WHERE a.balance <> CASE WHEN a.kind = 'CUSTOMER' THEN COALESCE(e.net_credit, 0) ELSE -COALESCE(e.net_credit, 0) END
+      WHERE a.balance IS DISTINCT FROM CASE
+        WHEN a.kind = 'CUSTOMER' THEN COALESCE(e.net_credit, 0)
+        WHEN a.kind::text IN (${Prisma.join([...ASSET_KINDS])}) THEN -COALESCE(e.net_credit, 0)
+      END
     `;
     const [{ unbalanced }] = await tx.$queryRaw<Array<{ unbalanced: bigint }>>`
       SELECT count(*)::bigint AS unbalanced FROM (
@@ -424,14 +465,17 @@ export class LedgerService {
         HAVING SUM(CASE WHEN entry_type = 'DEBIT' THEN amount ELSE 0 END) <> SUM(CASE WHEN entry_type = 'CREDIT' THEN amount ELSE 0 END)
       ) x
     `;
-    const [{ customers, drawers, count }] = await tx.$queryRaw<Array<{ customers: bigint | null; drawers: bigint | null; count: bigint }>>`
+    const [{ customers, assets, count }] = await tx.$queryRaw<Array<{ customers: bigint | null; assets: bigint | null; count: bigint }>>`
       SELECT SUM(CASE WHEN kind = 'CUSTOMER' THEN balance ELSE 0 END)::bigint AS customers,
-             SUM(CASE WHEN kind <> 'CUSTOMER' THEN balance ELSE 0 END)::bigint AS drawers,
+             SUM(CASE WHEN kind::text IN (${Prisma.join([...ASSET_KINDS])}) THEN balance ELSE 0 END)::bigint AS assets,
              count(*)::bigint AS count
       FROM ledger_accounts
     `;
     const mismatches = rows.map((r) => r.id);
-    const zeroSumDelta = (customers ?? 0n) - (drawers ?? 0n);
+    const zeroSumDelta = (customers ?? 0n) - (assets ?? 0n);
+    reconciliationMismatches.set({ check: 'account_balance' }, mismatches.length);
+    reconciliationMismatches.set({ check: 'unbalanced_transaction' }, Number(unbalanced));
+    reconciliationMismatches.set({ check: 'zero_sum' }, zeroSumDelta === 0n ? 0 : 1);
     if (mismatches.length || unbalanced > 0n || zeroSumDelta !== 0n) {
       logger.error(
         { mismatches, unbalancedTransactions: Number(unbalanced), zeroSumDelta: zeroSumDelta.toString(), alert: 'LEDGER_RECONCILIATION_FAILED' },

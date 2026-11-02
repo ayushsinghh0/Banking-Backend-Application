@@ -1,0 +1,66 @@
+# Internet egress, only for the four services that need it (the Compose `egress` network) and only on the
+# ports they use. Private, carrier-grade NAT and link-local ranges are excluded, so these rules can never be
+# used to reach the cluster, the VPC or the cloud metadata endpoint (169.254.169.254).
+# A NetworkPolicy cannot match host names: pin the destinations themselves (SMTP relay, api.razorpay.com, the
+# LLM endpoint) with an egress gateway or an FQDN-aware CNI policy where the platform offers one.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: smtp-egress
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values:
+          - auth-service
+          - notification-service
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 100.64.0.0/10
+              - 169.254.0.0/16
+              - 127.0.0.0/8
+      ports:
+        # Submission with STARTTLS (SMTP_REQUIRE_TLS) or implicit TLS; never plain port 25
+        - protocol: TCP
+          port: 587
+        - protocol: TCP
+          port: 465
+---
+# payment-service -> Razorpay API, assistant-service -> the OpenAI-compatible LLM API
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: https-provider-egress
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values:
+          - payment-service
+          - assistant-service
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 100.64.0.0/10
+              - 169.254.0.0/16
+              - 127.0.0.0/8
+      ports:
+        - protocol: TCP
+          port: 443

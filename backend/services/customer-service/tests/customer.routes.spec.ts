@@ -41,8 +41,7 @@ describe('Customer HTTP routes', () => {
       $queryRaw: jest.fn().mockResolvedValue([]),
     };
     prisma.$transaction = jest.fn((cb: any) => cb(prisma));
-    const redis: any = { get: jest.fn().mockResolvedValue(null), set: jest.fn().mockResolvedValue('OK'), del: jest.fn() };
-    app = createApp(prisma, redis, new InMemoryTokenStateStore()).app;
+    app = createApp(prisma, { tokenState: new InMemoryTokenStateStore() }).app;
   });
 
   const createMe = (body: Record<string, unknown>) =>
