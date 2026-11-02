@@ -64,11 +64,21 @@ export function totpAt(secret: string, step: number): string {
 }
 
 /** A code for a time step this secret has not used yet (waits for the next 30 s window if needed) */
+/** The API suites (backend/scripts) sign in as the same administrators; a code is single-use, so honour their steps too */
+const API_SUITE_STATE = path.resolve(here, '..', '..', '..', 'backend', 'scripts', '.e2e-state.json');
+function apiSuiteStep(secret: string): number {
+  try {
+    return (JSON.parse(fs.readFileSync(API_SUITE_STATE, 'utf8')) as { usedSteps?: Record<string, number> }).usedSteps?.[secret] ?? -1;
+  } catch {
+    return -1;
+  }
+}
+
 export async function freshTotp(secret: string): Promise<string> {
   for (;;) {
     const step = Math.floor(Date.now() / 30_000);
     const state = readState();
-    if ((state.usedSteps[secret] ?? -1) < step) {
+    if (Math.max(state.usedSteps[secret] ?? -1, apiSuiteStep(secret)) < step) {
       writeState({ usedSteps: { ...state.usedSteps, [secret]: step } });
       return totpAt(secret, step);
     }

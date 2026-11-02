@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import { PrismaClient, Prisma } from '../../generated/client';
 import { IdempotencyConflictError, IdempotencyKeyReuseError } from '../errors';
 import { envNumber } from './ledger-core';
+import { LedgerCommits } from './ledger-commits';
 
 export interface IdempotencyContext {
   userId: string;
@@ -29,7 +30,8 @@ type TxClient = Prisma.TransactionClient;
 export class IdempotencyService {
   constructor(
     private readonly prisma: PrismaClient,
-    private readonly ttlHours = envNumber('IDEMPOTENCY_TTL_HOURS', 24, 1)
+    private readonly ttlHours = envNumber('IDEMPOTENCY_TTL_HOURS', 24, 1),
+    private readonly commits: LedgerCommits = new LedgerCommits()
   ) {}
 
   /**
@@ -119,16 +121,19 @@ export class IdempotencyService {
     if (replay) return { ...replay, replayed: true };
 
     try {
-      const { statusCode, body: responseBody } = await this.prisma.$transaction(
-        async (tx) => {
-          await this.claim(tx, ctx);
-          const result = await work(tx);
-          // Normalise to plain JSON (Dates -> ISO strings) so the replayed body is byte-identical
-          const body = JSON.parse(JSON.stringify({ success: true, data: result.data }));
-          await this.complete(tx, ctx, result.statusCode, body);
-          return { statusCode: result.statusCode, body };
-        },
-        { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, maxWait: 10_000, timeout: 15_000 }
+      // Postings made by `work` are applied to the read cache only after this transaction commits
+      const { statusCode, body: responseBody } = await this.commits.run(() =>
+        this.prisma.$transaction(
+          async (tx) => {
+            await this.claim(tx, ctx);
+            const result = await work(tx);
+            // Normalise to plain JSON (Dates -> ISO strings) so the replayed body is byte-identical
+            const body = JSON.parse(JSON.stringify({ success: true, data: result.data }));
+            await this.complete(tx, ctx, result.statusCode, body);
+            return { statusCode: result.statusCode, body };
+          },
+          { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, maxWait: 10_000, timeout: 15_000 }
+        )
       );
       return { statusCode, responseBody, replayed: false };
     } catch (err: any) {

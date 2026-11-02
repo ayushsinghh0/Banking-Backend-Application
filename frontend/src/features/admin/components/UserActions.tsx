@@ -1,7 +1,7 @@
 import { Link } from 'react-router';
 import { useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
-import { ExternalLink, KeyRound, MoreHorizontal, UserCheck, UserX } from 'lucide-react';
+import { ExternalLink, KeyRound, MonitorSmartphone, MoreHorizontal, UserCheck, UserX } from 'lucide-react';
 import { useApi } from '@/lib/auth/AuthProvider';
 import { isApiError } from '@/lib/api/errors';
 import type { DirectoryUser } from '@/lib/api/types';
@@ -21,7 +21,16 @@ import {
 export type UserAction = { kind: 'status' | 'mfa'; user: DirectoryUser };
 
 /** Row menu for an administrator acting on someone else's sign-in */
-export function UserActionsMenu({ user, onAction }: { user: DirectoryUser; onAction: (action: UserAction) => void }) {
+export function UserActionsMenu({
+  user,
+  onAction,
+  onSessions,
+}: {
+  user: DirectoryUser;
+  onAction: (action: UserAction) => void;
+  /** Opens where they're signed in */
+  onSessions: (user: DirectoryUser) => void;
+}) {
   const customer = user.role === 'CUSTOMER';
   const nothingToReset = customer && !user.mfaEnabled;
   return (
@@ -44,6 +53,10 @@ export function UserActionsMenu({ user, onAction }: { user: DirectoryUser; onAct
           <KeyRound aria-hidden="true" />
           Reset authenticator
           {nothingToReset ? <span className="ml-auto pl-3 text-[11.5px] text-muted-foreground">Not set up</span> : null}
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => onSessions(user)}>
+          <MonitorSmartphone aria-hidden="true" />
+          Sessions and devices
         </DropdownMenuItem>
         {customer ? (
           <>

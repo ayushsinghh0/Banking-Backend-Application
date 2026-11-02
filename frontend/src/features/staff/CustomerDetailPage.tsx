@@ -8,6 +8,7 @@ import { UUID_PATTERN } from '@/lib/validation';
 import { cn } from '@/lib/cn';
 import { Button } from '@/components/ui/button';
 import { Card, EmptyState, PageHeader, Skeleton } from '@/components/ui/primitives';
+import { UserSessionsPanel } from '@/features/ops/UserSessionsPanel';
 import { AccountsSection } from './components/AccountsSection';
 import type { BackLink } from './components/CustomerTable';
 import { LoadingAnnouncement } from './components/LoadingAnnouncement';
@@ -119,6 +120,7 @@ export default function CustomerDetailPage() {
           <div className="min-w-0 space-y-5 lg:col-span-4 lg:row-span-2 lg:space-y-6 lg:self-start">
             {decides ? <KycDecisionPanel profile={decides} me={user.id} /> : null}
             {canSeeAccess ? <SignInAccessCard userId={userId} name={name} query={directoryQuery} canManage={isAdmin} me={user.id} /> : null}
+            {canSeeAccess ? <UserSessionsPanel userId={userId} name={name} canRevoke={isAdmin && userId !== user.id} /> : null}
             {showHistory ? <KycHistoryCard userId={userId} me={user.id} /> : null}
           </div>
         ) : null}

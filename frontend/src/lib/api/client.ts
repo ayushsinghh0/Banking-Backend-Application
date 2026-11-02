@@ -85,9 +85,20 @@ export class ApiClient {
   }
 
   async request<T = unknown>(path: string, options: RequestOptions = {}): Promise<T> {
-    const useAuth = options.auth ?? true;
-    if (!useAuth) return this.send<T>(path, options, null);
+    if (options.auth === false) return this.send<T>(path, options, null);
+    return this.authorized((token) => this.send<T>(path, options, token));
+  }
 
+  /**
+   * Opens a streaming response (server-sent events) with the same authentication, token renewal and error
+   * mapping as `request`, and returns it unread. The timeout covers connecting only: once the response has
+   * started, the stream stays open until the server ends it or the caller aborts.
+   */
+  stream(path: string, options: Omit<RequestOptions, 'auth' | 'idempotencyKey'> = {}): Promise<Response> {
+    return this.authorized((token) => this.open(path, options, token));
+  }
+
+  private async authorized<T>(attempt: (token: string) => Promise<T>): Promise<T> {
     let token = this.config.getAccessToken();
     if (!token) {
       token = await this.config.refreshAccessToken();
@@ -97,7 +108,7 @@ export class ApiClient {
       }
     }
     try {
-      return await this.send<T>(path, options, token);
+      return await attempt(token);
     } catch (error) {
       if (!(error instanceof ApiError) || error.status !== 401) throw error;
       // The access token expired or was revoked: renew once, then retry the same request (same idempotency key)
@@ -107,12 +118,45 @@ export class ApiClient {
         throw error;
       }
       try {
-        return await this.send<T>(path, options, renewed);
+        return await attempt(renewed);
       } catch (retryError) {
         if (retryError instanceof ApiError && retryError.status === 401) this.config.onSessionExpired();
         throw retryError;
       }
     }
+  }
+
+  private async open(path: string, options: RequestOptions, token: string): Promise<Response> {
+    const headers: Record<string, string> = {
+      Accept: 'text/event-stream',
+      [SESSION_TRANSPORT_HEADER]: 'cookie',
+      ...options.headers,
+      Authorization: `Bearer ${token}`,
+    };
+    if (options.body !== undefined) headers['Content-Type'] = 'application/json';
+
+    const connect = new AbortController();
+    const timer = setTimeout(() => connect.abort(), this.timeoutMs);
+    const signal = options.signal ? AbortSignal.any([options.signal, connect.signal]) : connect.signal;
+    let response: Response;
+    try {
+      response = await fetch(`${this.baseUrl}${path}${buildQuery(options.query)}`, {
+        method: options.method ?? 'GET',
+        headers,
+        body: options.body === undefined ? undefined : JSON.stringify(options.body),
+        credentials: 'same-origin',
+        cache: 'no-store',
+        signal,
+      });
+    } catch (error) {
+      if (options.signal?.aborted) throw error;
+      if (connect.signal.aborted) throw new ApiError({ status: 0, code: 'TIMEOUT', message: 'The request timed out' });
+      throw new ApiError({ status: 0, code: 'NETWORK_ERROR', message: 'Network request failed' });
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!response.ok) throw await toApiError(response);
+    return response;
   }
 
   private async send<T>(path: string, options: RequestOptions, token: string | null): Promise<T> {

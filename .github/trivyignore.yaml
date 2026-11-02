@@ -1,0 +1,25 @@
+# Reviewed Trivy exceptions, passed with --ignorefile by .github/workflows/security.yml.
+# Every entry is scoped to a path, says why, and an exception that waits on a fix expires so it cannot outlive it.
+
+misconfigurations:
+  # nginxinc/nginx-unprivileged already runs as uid 101, so the image is not root today; the Dockerfile should
+  # still say USER 101 so the guarantee does not depend on the base image. Expires: add the line before then.
+  - id: DS-0002
+    paths:
+      - frontend/Dockerfile
+    statement: Base image runs as uid 101; explicit USER pending in frontend/Dockerfile
+    expired_at: 2027-01-31
+
+  # Health is probed by the orchestrator per service (Compose healthcheck, Kubernetes probes on each service's
+  # port); one image-level HEALTHCHECK cannot fit every SERVICE build, and the migrate target is a one-shot job.
+  - id: DS-0026
+    paths:
+      - backend/Dockerfile
+    statement: Health checks are defined per service by Compose and Kubernetes
+
+secrets:
+  # A deliberately forged alg=none token: the e2e suite proves the services reject it
+  - id: jwt-token
+    paths:
+      - backend/scripts/e2e.mjs
+    statement: Forged unsigned token used as a negative test

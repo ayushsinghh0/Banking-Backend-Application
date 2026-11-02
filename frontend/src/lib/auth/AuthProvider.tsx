@@ -1,6 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useSyncExternalStore, type ReactNode } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import type { AppServices } from '@/lib/api';
+import type { ApiClient } from '@/lib/api/client';
 import type { Endpoints } from '@/lib/api/endpoints';
 import type { LoginResult, SessionTokens } from '@/lib/api/types';
 import { isMfaChallenge } from '@/lib/api/types';
@@ -10,6 +11,15 @@ interface AuthContextValue {
   status: SessionStatus;
   user: SessionUser | null;
   api: Endpoints;
+  /** The raw HTTP client, for feature modules that define their own endpoint functions */
+  client: ApiClient;
+  /** The current access token, for streaming requests made outside the client (server-sent events) */
+  getAccessToken: () => string | null;
+  /**
+   * Renews the access token through the session (cookie refresh, serialised across tabs). Resolves null when
+   * the session is over. Used when a long-lived stream is told to re-authenticate.
+   */
+  refreshAccessToken: () => Promise<string | null>;
   /** Adopt tokens from login, MFA, password change or step-up */
   applyTokens: (tokens: Pick<SessionTokens, 'accessToken'>) => void;
   /** Handles a login response: returns the MFA challenge if one is needed, otherwise signs in */
@@ -25,7 +35,7 @@ interface AuthContextValue {
 const AuthContext = createContext<AuthContextValue | null>(null);
 
 export function AuthProvider({ services, children }: { services: AppServices; children: ReactNode }) {
-  const { session, api } = services;
+  const { session, api, client } = services;
   const queryClient = useQueryClient();
   const snapshot = useSyncExternalStore(
     useCallback((cb) => session.subscribe(cb), [session]),
@@ -47,6 +57,9 @@ export function AuthProvider({ services, children }: { services: AppServices; ch
       status: session.status,
       user,
       api,
+      client,
+      getAccessToken: session.getAccessToken,
+      refreshAccessToken: () => session.refresh(),
       applyTokens: (tokens) => session.setAccessToken(tokens.accessToken),
       completeLogin: (result) => {
         if (isMfaChallenge(result)) return { challengeToken: result.challengeToken };
@@ -67,7 +80,7 @@ export function AuthProvider({ services, children }: { services: AppServices; ch
     };
     // snapshot changes whenever the session does
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [snapshot, session, api, queryClient]);
+  }, [snapshot, session, api, client, queryClient]);
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }
@@ -87,4 +100,8 @@ export function useUser(): SessionUser {
 
 export function useApi(): Endpoints {
   return useAuth().api;
+}
+
+export function useApiClient(): ApiClient {
+  return useAuth().client;
 }

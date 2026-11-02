@@ -2,6 +2,7 @@ import http from 'http';
 import { Express } from 'express';
 import Redis from 'ioredis';
 import { logger } from '../logger/logger';
+import { startMetricsServer } from '../observability/metrics';
 
 /**
  * Starts the HTTP server with production timeouts and graceful shutdown:
@@ -17,6 +18,8 @@ export function startHttpServer(
   const server = app.listen(Number(port), () => {
     logger.info({ port: Number(port) }, `${name} listening`);
   });
+  // Prometheus scrape endpoint on its own internal port (METRICS_PORT), never behind the gateway
+  const metricsServer = startMetricsServer();
 
   // Slow-loris protection and keep-alive tuned to sit behind a load balancer (LB idle timeout ~60s)
   server.requestTimeout = 30_000;
@@ -36,6 +39,7 @@ export function startHttpServer(
     force.unref();
 
     server.close(async () => {
+      metricsServer?.close();
       for (const fn of cleanup) {
         try {
           await fn();

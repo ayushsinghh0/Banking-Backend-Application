@@ -13,6 +13,8 @@ enum TransactionType {
   WITHDRAWAL
   TRANSFER
   CASH_TRANSFER // internal cash movement: vault <-> drawer floats, count differences to suspense
+  ONLINE_TOP_UP // money added online (Razorpay): debit PAYMENT_CLEARING, credit the customer (also a reversed refund)
+  TOP_UP_REFUND // a top-up returned to its payment method: debit the customer, credit PAYMENT_CLEARING
 }
 
 enum TransactionStatus {
@@ -44,6 +46,7 @@ enum LedgerAccountKind {
   TELLER_CASH   // a teller's cash drawer (an asset): every cash deposit/withdrawal is double-entry against it
   VAULT_CASH    // the branch vault (an asset): issues floats to drawers and receives them back
   CASH_SUSPENSE // counted shortages (debit) / overages (credit) awaiting investigation
+  PAYMENT_CLEARING // money receivable from the payment provider (an asset): online top-ups and their refunds
 }
 
 // Authoritative local account representation within the ledger service boundary
@@ -81,6 +84,10 @@ model Transaction {
   description           String?
   initiatedBy           String?           @map("initiated_by") // User ID that requested the movement (audit)
   failureReason         String?           @map("failure_reason")
+  // Online top-ups: the payment-service top-up a credit, refund or refund reversal belongs to (partial index in SQL)
+  topUpId               String?           @map("top_up_id")
+  // The payment provider's payment id of a top-up credit
+  externalReference     String?           @map("external_reference")
   createdAt             DateTime          @default(now()) @map("created_at")
   updatedAt             DateTime          @updatedAt @map("updated_at")
   entries               LedgerEntry[]
@@ -184,7 +191,9 @@ model CashOperation {
   @@map("cash_operations")
 }
 
-// Append-only audit trail of staff actions on the ledger (UPDATE/DELETE blocked by trigger)
+// Append-only audit trail of staff actions on the ledger (UPDATE/DELETE blocked by trigger). Rows are
+// hash-chained (seq, prev_hash, hash; see auditChained in services/audit-chain.ts); rows written before the
+// chain existed have NULL chain columns. seq is unique among chained rows (partial index in SQL).
 model AuditLog {
   id        String   @id @default(uuid())
   actorId   String   @map("actor_id")
@@ -192,6 +201,9 @@ model AuditLog {
   targetId  String?  @map("target_id")
   details   Json?
   createdAt DateTime @default(now()) @map("created_at")
+  seq       BigInt?
+  prevHash  String?  @map("prev_hash")
+  hash      String?
 
   @@index([actorId, createdAt])
   @@index([action, targetId, createdAt]) // failure counters, e.g. wrong withdrawal codes per account

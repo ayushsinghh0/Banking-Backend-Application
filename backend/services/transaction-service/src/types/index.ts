@@ -5,6 +5,10 @@ export enum TransactionType {
   WITHDRAWAL = 'WITHDRAWAL',
   TRANSFER = 'TRANSFER',
   CASH_TRANSFER = 'CASH_TRANSFER',
+  /** Money added online: debit PAYMENT_CLEARING, credit the customer (also used for a reversed refund) */
+  ONLINE_TOP_UP = 'ONLINE_TOP_UP',
+  /** A top-up returned to its payment method: debit the customer, credit PAYMENT_CLEARING */
+  TOP_UP_REFUND = 'TOP_UP_REFUND',
 }
 
 export enum TransactionStatus {

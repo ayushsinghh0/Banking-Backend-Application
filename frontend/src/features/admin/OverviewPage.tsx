@@ -4,6 +4,8 @@ import { useApi, useUser } from '@/lib/auth/AuthProvider';
 import { formatPaise } from '@/lib/money';
 import { qk } from '@/lib/query';
 import { humanize, PageHeader } from '@/components/ui/primitives';
+import { AuditBreachNotice, AuditIntegrityCard } from '@/features/ops/AuditIntegrityCard';
+import { useLiveFraudAlerts } from '@/features/ops/useLiveFraudAlerts';
 import { describeAlertReason, severityTone } from './components/alerts';
 import { AttentionList, type AttentionItem } from './components/AttentionList';
 import { CashStatusChart } from './components/CashStatusChart';
@@ -57,6 +59,8 @@ export default function OverviewPage() {
   const queuesId = useId();
   const now = Date.now();
   const name = nameFromEmail(me.email);
+  // A new fraud alert refreshes its queue figure at once (the toast is for analysts)
+  useLiveFraudAlerts({ notify: false });
 
   // Each queue is its own query, so one failing service never blanks the page. Keys extend the shared
   // families (qk.*) so any decision made elsewhere also refreshes these counts.
@@ -162,6 +166,7 @@ export default function OverviewPage() {
   return (
     <div className="space-y-6 lg:space-y-8">
       <PageHeader title={name ? `${greeting(new Date(now))}, ${name}` : greeting(new Date(now))} />
+      <AuditBreachNotice />
 
       <section aria-labelledby={queuesId}>
         <h2 id={queuesId} className="sr-only">
@@ -175,6 +180,7 @@ export default function OverviewPage() {
         <div className="min-w-0 space-y-5 lg:col-span-4 lg:space-y-6">
           <CashStatusChart />
           <RecentRequests now={now} />
+          <AuditIntegrityCard />
         </div>
       </div>
     </div>

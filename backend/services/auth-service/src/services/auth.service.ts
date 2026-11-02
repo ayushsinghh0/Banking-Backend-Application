@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import net from 'net';
-import { EnrolmentPurpose, Prisma, PrismaClient, Role, User } from '../../generated/client';
+import { EnrolmentPurpose, Prisma, PrismaClient, Role, SecurityEventType, User } from '../../generated/client';
 import {
   AuthenticatedUser,
   ConflictError,
@@ -11,6 +11,7 @@ import {
   RateLimitExceededError,
   TokenStateStore,
   UnauthorizedError,
+  counter,
   isAddressAllowed,
   isStaffRole,
   logger,
@@ -18,6 +19,11 @@ import {
   staffNetworksFromEnv,
 } from '@banksphere/common';
 import { PasswordService } from './password.service';
+import { writeAudit } from './audit';
+import { Cidr, cidrsOverlap, maskIp, parseCidr, parseCidrList } from './ip-address';
+import { EdgeSecurityStore, InMemoryEdgeSecurityStore } from './edge-security.store';
+import { SecurityEvents } from './security-events';
+import { ClientContext, describeClient, SessionService } from './sessions';
 import { TokenService, GeneratedTokens } from './token.service';
 import { AuthSecurityStore } from './auth-security.store';
 import {
@@ -43,10 +49,12 @@ export interface LoginDTO {
 }
 
 export interface LoginContext {
-  /** Normalised client network (IPv4 address or IPv6 /64) used for lockout keying */
+  /** Normalised client network (IPv4 address or IPv6 /64) used for lockout keying; also the edge ban key */
   network: string;
   /** Client address, checked against the staff network allowlist (unknown = outside it) */
   ip?: string;
+  /** User-Agent header: labels the session's device */
+  userAgent?: string;
 }
 
 export interface PublicUser {
@@ -88,6 +96,12 @@ export interface AuthServiceConfig {
   staffEmailDomain: string;
   /** STAFF_ALLOWED_CIDRS: staff may only sign in from these networks (null/absent = anywhere) */
   staffNetworks?: net.BlockList | null;
+  /** The same networks as exact CIDRs: addresses inside them are never banned automatically */
+  staffCidrs?: Cidr[];
+  /** Distinct accounts with failed sign-ins from one address in 10 minutes above which it is banned (20) */
+  credentialStuffingThreshold?: number;
+  /** Length of an automatic credential-stuffing ban (30 minutes) */
+  credentialStuffingBanMinutes?: number;
 }
 
 export const defaultAuthServiceConfig = (): AuthServiceConfig => ({
@@ -99,7 +113,18 @@ export const defaultAuthServiceConfig = (): AuthServiceConfig => ({
   enrolmentTtlHours: Number(process.env.STAFF_ENROLMENT_TTL_HOURS || 24),
   staffEmailDomain: (process.env.STAFF_EMAIL_DOMAIN || '').toLowerCase(),
   staffNetworks: staffNetworksFromEnv(),
+  staffCidrs: parseCidrList(process.env.STAFF_ALLOWED_CIDRS),
+  credentialStuffingThreshold: positiveInt('CREDENTIAL_STUFFING_THRESHOLD', 20),
+  credentialStuffingBanMinutes: positiveInt('CREDENTIAL_STUFFING_BAN_MINUTES', 30),
 });
+
+function positiveInt(name: string, fallback: number): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 1) throw new Error(`${name} must be a positive whole number`);
+  return value;
+}
 
 export interface AuthServiceDeps {
   prisma: PrismaClient;
@@ -108,6 +133,8 @@ export interface AuthServiceDeps {
   security: AuthSecurityStore;
   mailer: Mailer;
   config?: AuthServiceConfig;
+  /** Edge Redis: credential-stuffing counters and bans (in memory when omitted, e.g. unit tests) */
+  edge?: EdgeSecurityStore;
 }
 
 export const STAFF_ROLES: Role[] = [Role.SUPPORT, Role.TELLER, Role.KYC_OFFICER, Role.FRAUD_ANALYST, Role.BANK_ADMIN];
@@ -123,6 +150,9 @@ const ROTATION_GRACE_MS = 10_000;
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+const loginsTotal = counter('auth_logins_total', 'Sign-in attempts by outcome', ['result']);
+const ipBansTotal = counter('auth_ip_bans_total', 'Client addresses banned at the edge for credential stuffing');
+
 export const normaliseEmail = (email: string) => email.trim().toLowerCase();
 const newOneTimeToken = () => crypto.randomBytes(32).toString('base64url');
 const sha256 = (value: string) => crypto.createHash('sha256').update(value).digest('hex');
@@ -137,6 +167,9 @@ export class AuthService {
   private readonly security: AuthSecurityStore;
   private readonly mailer: Mailer;
   public readonly config: AuthServiceConfig;
+  public readonly events: SecurityEvents;
+  public readonly sessions: SessionService;
+  public readonly edge: EdgeSecurityStore;
   private dummyHashPromise: Promise<string> | null = null;
   private readonly background = new Set<Promise<void>>();
 
@@ -147,6 +180,15 @@ export class AuthService {
     this.security = deps.security;
     this.mailer = deps.mailer;
     this.config = deps.config ?? defaultAuthServiceConfig();
+    this.edge = deps.edge ?? new InMemoryEdgeSecurityStore();
+    this.events = new SecurityEvents(deps.prisma);
+    this.sessions = new SessionService({
+      prisma: deps.prisma,
+      tokenState: deps.tokenState,
+      events: this.events,
+      accessTokenTtlSeconds: deps.tokenService.accessTokenTtlSeconds,
+      refreshTokenTtlMs: deps.tokenService.refreshTokenTtlMs,
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -343,7 +385,11 @@ export class AuthService {
    * Staff activation: sets the password chosen by the staff member and returns an enrolment-only session
    * plus a one-time MFA enrolment token (the activation link proved control of the mailbox).
    */
-  public async activateStaff(rawToken: string, password: string): Promise<{ tokens: GeneratedTokens; enrolmentToken: string }> {
+  public async activateStaff(
+    rawToken: string,
+    password: string,
+    client?: ClientContext
+  ): Promise<{ tokens: GeneratedTokens; enrolmentToken: string }> {
     const passwordHash = await PasswordService.hash(password);
     const { user, enrolmentToken } = await this.prisma.$transaction(async (tx) => {
       const userId = await this.consumeEnrolmentToken(tx, rawToken, EnrolmentPurpose.ACTIVATE);
@@ -352,11 +398,13 @@ export class AuthService {
         data: { passwordHash, passwordChangedAt: new Date(), tokenVersion: { increment: 1 } },
       });
       await tx.refreshToken.updateMany({ where: { userId, isRevoked: false }, data: { isRevoked: true } });
+      await this.sessions.revokeAllInTx(tx, userId, 'STAFF_ACTIVATED');
+      const token = await this.createEnrolmentToken(tx, userId, EnrolmentPurpose.MFA_ENROL);
       await this.audit(tx, userId, 'STAFF_ACTIVATED', userId);
-      return { user: updated, enrolmentToken: await this.createEnrolmentToken(tx, userId, EnrolmentPurpose.MFA_ENROL) };
+      return { user: updated, enrolmentToken: token };
     });
     await this.publishTokenVersion(user.id, user.tokenVersion);
-    return { tokens: await this.startSession(user, false), enrolmentToken };
+    return { tokens: await this.startSession(user, false, undefined, false, { client }), enrolmentToken };
   }
 
   private async createEnrolmentToken(tx: Tx, userId: string, purpose: EnrolmentPurpose): Promise<string> {
@@ -392,7 +440,12 @@ export class AuthService {
 
   public async login(dto: LoginDTO, ctx: LoginContext): Promise<AuthResponse | MfaChallengeResponse> {
     const email = normaliseEmail(dto.email);
-    await this.beginPasswordAttempt(email, ctx.network);
+    try {
+      await this.beginPasswordAttempt(email, ctx.network);
+    } catch (err) {
+      loginsTotal.inc({ result: 'locked' });
+      throw err;
+    }
 
     const user = await this.prisma.user.findUnique({ where: { email } });
 
@@ -401,28 +454,101 @@ export class AuthService {
     const isPasswordValid = await PasswordService.verify(hashToCheck, dto.password);
 
     if (!user || !user.isActive || !isPasswordValid) {
+      loginsTotal.inc({ result: 'failure' });
+      // After the response, and the same work whether or not the account exists: no timing signal
+      this.runInBackground('record failed sign-in', () => this.afterFailedSignIn(email, ctx, user, isPasswordValid));
       throw new UnauthorizedError(INVALID_CREDENTIALS);
     }
 
     // Only revealed after a correct password, so it doesn't leak whether an email is a staff account.
     // Not a successful sign-in: the attempt isn't refunded and the network isn't remembered.
-    this.assertStaffNetwork(user, ctx);
+    try {
+      this.assertStaffNetwork(user, ctx);
+    } catch (err) {
+      loginsTotal.inc({ result: 'blocked' });
+      throw err;
+    }
 
     await this.security.loginSucceeded(email, ctx.network);
 
     if (!user.isEmailVerified) {
       // Only revealed after a correct password, so it doesn't leak account existence
+      loginsTotal.inc({ result: 'blocked' });
       throw new HttpError(403, 'EMAIL_NOT_VERIFIED', 'Please verify your email address before signing in');
     }
 
     if (user.mfaEnabled) {
       const challengeToken = await this.security.createMfaChallenge(user.id, user.tokenVersion, this.config.mfaChallengeTtlSeconds);
+      loginsTotal.inc({ result: 'mfa_challenge' });
       return { mfaRequired: true, challengeToken, expiresInSeconds: this.config.mfaChallengeTtlSeconds };
     }
 
     // tokenVersion as read BEFORE the password check: a reset committing meanwhile invalidates this login
-    const tokens = await this.startSession(user, false, user.tokenVersion);
+    const tokens = await this.startSession(user, false, user.tokenVersion, false, { client: ctx, signIn: true });
+    loginsTotal.inc({ result: 'success' });
     return { user: { id: user.id, email: user.email, role: user.role }, tokens };
+  }
+
+  /**
+   * After a wrong password (or a sign-in to a disabled account): counts the account towards the address's
+   * credential-stuffing window, bans the address at the edge once too many distinct accounts failed from it,
+   * and records the failure in the account's security history.
+   */
+  private async afterFailedSignIn(email: string, ctx: LoginContext, user: User | null, passwordValid: boolean): Promise<void> {
+    const ipKey = ctx.network;
+    try {
+      const distinct = await this.edge.recordFailedSignIn(ipKey, email);
+      if (distinct > (this.config.credentialStuffingThreshold ?? 20)) await this.banForCredentialStuffing(ipKey, ctx, distinct);
+    } catch (err) {
+      logger.warn({ err: (err as Error).message }, 'Credential-stuffing check failed');
+    }
+    if (user) {
+      const device = describeClient(ctx);
+      await this.events.recordSafely({
+        type: SecurityEventType.SIGN_IN_FAILED,
+        userId: user.id,
+        ip: device.ip,
+        deviceLabel: device.deviceLabel,
+        details: { reason: passwordValid ? 'ACCOUNT_DISABLED' : 'INVALID_PASSWORD' },
+      });
+    }
+  }
+
+  /** True for addresses that must never be banned automatically: unknown ones and the staff networks */
+  private isBanExempt(ipKey: string, ip: string | undefined): boolean {
+    if (ipKey === 'unknown') return true;
+    if (this.config.staffNetworks && isAddressAllowed(this.config.staffNetworks, ip)) return true;
+    const network = parseCidr(ipKey);
+    return Boolean(network && (this.config.staffCidrs ?? []).some((staff) => cidrsOverlap(staff, network)));
+  }
+
+  private async banForCredentialStuffing(ipKey: string, ctx: LoginContext, distinctAccounts: number): Promise<void> {
+    if (this.isBanExempt(ipKey, ctx.ip)) {
+      logger.warn(
+        { alert: 'CREDENTIAL_STUFFING_EXEMPT_NETWORK', ipMasked: maskIp(ctx.ip), distinctAccounts },
+        'Credential-stuffing pattern from a staff or unknown address; not banned'
+      );
+      return;
+    }
+    const minutes = this.config.credentialStuffingBanMinutes ?? 30;
+    const created = await this.edge.banIp(ipKey, minutes * 60, {
+      reason: 'CREDENTIAL_STUFFING',
+      bannedAt: new Date().toISOString(),
+      source: 'auth-service',
+      distinctAccounts,
+    });
+    if (!created) return; // already banned: recorded when the ban was created
+    ipBansTotal.inc();
+    logger.warn({ alert: 'CREDENTIAL_STUFFING_BAN', ipMasked: maskIp(ctx.ip), distinctAccounts, minutes }, 'Address banned at the edge for credential stuffing');
+    await this.prisma.$transaction(async (tx) => {
+      await this.events.record(tx, {
+        type: SecurityEventType.IP_AUTO_BANNED,
+        userId: null,
+        ip: describeClient(ctx).ip,
+        details: { reason: 'CREDENTIAL_STUFFING', distinctAccounts, banMinutes: minutes },
+      });
+      await this.audit(tx, null, 'IP_AUTO_BANNED', ipKey, { reason: 'CREDENTIAL_STUFFING', distinctAccounts, banMinutes: minutes });
+    });
   }
 
   /**
@@ -445,11 +571,22 @@ export class AuthService {
     this.assertStaffNetwork(user, ctx);
 
     const discardChallenge = () => this.security.deleteMfaChallenge(challengeToken);
-    if (!(await this.checkTotp(user, user.mfaSecretEnc, code, discardChallenge))) throw invalid();
+    let valid: boolean;
+    try {
+      valid = await this.checkTotp(user, user.mfaSecretEnc, code, discardChallenge, { context: 'SIGN_IN', client: ctx });
+    } catch (err) {
+      loginsTotal.inc({ result: 'locked' });
+      throw err;
+    }
+    if (!valid) {
+      loginsTotal.inc({ result: 'mfa_failure' });
+      throw invalid();
+    }
 
     await discardChallenge();
     // Bound to the token version at password time: a reset since then kills this half-finished login
-    const tokens = await this.startSession(user, true, challenge.tokenVersion, true);
+    const tokens = await this.startSession(user, true, challenge.tokenVersion, true, { client: ctx, signIn: true });
+    loginsTotal.inc({ result: 'success' });
     return { user: { id: user.id, email: user.email, role: user.role }, tokens };
   }
 
@@ -460,7 +597,13 @@ export class AuthService {
    * Returns false for a wrong code; throws 429 MFA_TEMPORARILY_LOCKED once the budget is spent.
    * `onLocked` runs when the budget is (or has just become) exhausted, e.g. to discard a login challenge.
    */
-  private async checkTotp(user: User, secretEnc: string, code: string, onLocked?: () => Promise<void>): Promise<boolean> {
+  private async checkTotp(
+    user: User,
+    secretEnc: string,
+    code: string,
+    onLocked?: () => Promise<void>,
+    attempt: { context: 'SIGN_IN' | 'STEP_UP' | 'DISABLE'; client?: ClientContext } = { context: 'STEP_UP' }
+  ): Promise<boolean> {
     const reservation = await this.security.reserveMfaAttempt(user.id);
     if (!reservation.allowed) {
       await onLocked?.();
@@ -476,6 +619,16 @@ export class AuthService {
       logger.warn({ userId: user.id, alert: 'MFA_BRUTE_FORCE' }, 'TOTP paused after repeated failures');
       this.runInBackground('send MFA locked email', () => this.mailer.send(mfaLockedEmail(user.email)).then(() => {}));
     }
+    const device = describeClient(attempt.client);
+    this.runInBackground('record MFA failure', () =>
+      this.events.recordSafely({
+        type: SecurityEventType.MFA_FAILED,
+        userId: user.id,
+        ip: device.ip,
+        deviceLabel: attempt.client ? device.deviceLabel : null,
+        details: { context: attempt.context, locked: reservation.last },
+      })
+    );
     return false;
   }
 
@@ -493,7 +646,7 @@ export class AuthService {
    * which serialises it with password changes/resets/disables. A token rotated a few seconds ago (two
    * tabs refreshing at once) gets a retryable 409 instead of nuking the session.
    */
-  public async refreshToken(rawRefreshToken: string): Promise<GeneratedTokens> {
+  public async refreshToken(rawRefreshToken: string, client?: ClientContext): Promise<GeneratedTokens> {
     const tokenHash = this.tokenService.hashRefreshToken(rawRefreshToken);
 
     type Outcome =
@@ -523,6 +676,13 @@ export class AuthService {
         familyExpiresAt: record.familyExpiresAt,
         mfaAuthenticated: record.mfaAuthenticated,
       });
+      await this.sessions.touch(tx, {
+        id: record.familyId,
+        userId: record.userId,
+        mfa: record.mfaAuthenticated,
+        expiresAt: record.familyExpiresAt,
+        device: describeClient(client),
+      });
       return { kind: 'ok', tokens };
     });
 
@@ -536,11 +696,12 @@ export class AuthService {
       case 'concurrent':
         throw new HttpError(409, 'REFRESH_IN_PROGRESS', 'This session was just refreshed by another request; use the newest tokens.');
       case 'disabled':
-        await this.revokeFamily(outcome.familyId);
+        await this.sessions.revokeFamily(outcome.familyId, 'ACCOUNT_DISABLED', { client });
         throw new UnauthorizedError('Account is disabled');
       case 'reuse':
         // Token theft: kill the whole session family
-        await this.revokeFamily(outcome.familyId);
+        logger.warn({ alert: 'REFRESH_TOKEN_REUSE', ipMasked: maskIp(client?.ip) }, 'A rotated refresh token was presented again; session revoked');
+        await this.sessions.revokeFamily(outcome.familyId, 'TOKEN_REUSE', { client });
         throw new UnauthorizedError(REUSE_MESSAGE);
     }
   }
@@ -549,12 +710,12 @@ export class AuthService {
    * Ends the session: revokes the refresh-token family and, if the caller presented a valid access
    * token, denylists it in Redis so it stops working immediately instead of at expiry.
    */
-  public async logout(rawRefreshToken: string, accessToken?: AuthenticatedUser | null): Promise<void> {
+  public async logout(rawRefreshToken: string, accessToken?: AuthenticatedUser | null, client?: ClientContext): Promise<void> {
     const tokenHash = this.tokenService.hashRefreshToken(rawRefreshToken);
     const record = await this.prisma.refreshToken.findUnique({ where: { tokenHash } });
 
     if (record && (!accessToken || record.userId === accessToken.id)) {
-      await this.revokeFamily(record.familyId);
+      await this.sessions.revokeFamily(record.familyId, 'LOGOUT', { client });
     }
 
     if (accessToken?.jti && accessToken.expiresAt) {
@@ -657,6 +818,8 @@ export class AuthService {
       // only through the new tokens issued here in the same family. Issued inside the transaction (under
       // the user row lock) so a password reset landing right after commit revokes them as well.
       await tx.refreshToken.updateMany({ where: { userId: user.id, isRevoked: false }, data: { isRevoked: true } });
+      await this.sessions.revokeAllInTx(tx, user.id, 'MFA_ENABLED', sessionId);
+      await this.sessions.markMfa(tx, sessionId);
       await this.audit(tx, user.id, 'MFA_ENABLED', user.id);
       // The code just verified is a fresh TOTP check; the factor-age rule still keeps a brand-new factor
       // from authorising high-risk actions in production
@@ -685,7 +848,7 @@ export class AuthService {
     if (!actor.mfa || !actor.sessionId || !user.mfaEnabled || !user.mfaSecretEnc) {
       throw new HttpError(403, 'MFA_REQUIRED', 'Sign in with two-factor authentication first');
     }
-    if (!(await this.checkTotp(user, user.mfaSecretEnc, code))) {
+    if (!(await this.checkTotp(user, user.mfaSecretEnc, code, undefined, { context: 'STEP_UP' }))) {
       throw new HttpError(400, 'INVALID_MFA_CODE', 'The verification code is not valid');
     }
     const session = await this.prisma.refreshToken.findFirst({ where: { userId: user.id, familyId: actor.sessionId, isRevoked: false } });
@@ -706,7 +869,7 @@ export class AuthService {
     if (!user.mfaEnabled || !user.mfaSecretEnc) throw new ConflictError('MFA is not enabled');
     await this.reauthenticate(user, password, ctx);
     // Same TOTP failure budget as sign-in and step-up
-    if (!(await this.checkTotp(user, user.mfaSecretEnc, code))) {
+    if (!(await this.checkTotp(user, user.mfaSecretEnc, code, undefined, { context: 'DISABLE', client: ctx }))) {
       throw new HttpError(400, 'INVALID_MFA_CODE', 'The verification code is not valid');
     }
     const updated = await this.prisma.$transaction(async (tx) => {
@@ -715,6 +878,7 @@ export class AuthService {
         data: { mfaEnabled: false, mfaEnabledAt: null, mfaSecretEnc: null, mfaPendingSecretEnc: null, tokenVersion: { increment: 1 } },
       });
       await tx.refreshToken.updateMany({ where: { userId: user.id, isRevoked: false }, data: { isRevoked: true } });
+      await this.sessions.revokeAllInTx(tx, user.id, 'MFA_DISABLED');
       await this.audit(tx, user.id, 'MFA_DISABLED', user.id);
       return result;
     });
@@ -736,6 +900,7 @@ export class AuthService {
       data: { mfaEnabled: false, mfaEnabledAt: null, mfaSecretEnc: null, mfaPendingSecretEnc: null, mfaLastUsedStep: null, tokenVersion: { increment: 1 } },
     });
     await tx.refreshToken.updateMany({ where: { userId, isRevoked: false }, data: { isRevoked: true } });
+    await this.sessions.revokeAllInTx(tx, userId, 'MFA_RESET');
     await this.audit(tx, actorId, 'MFA_RESET', userId);
     const enrolmentToken = isStaffRole(user.role) ? await this.createEnrolmentToken(tx, userId, EnrolmentPurpose.MFA_ENROL) : undefined;
     return { user: result, enrolmentToken };
@@ -805,7 +970,7 @@ export class AuthService {
    * (refresh tokens revoked + token version bumped so access tokens die immediately) and notifies them.
    * MFA, if enrolled, stays required at the next login.
    */
-  public async resetPassword(rawToken: string, newPassword: string): Promise<void> {
+  public async resetPassword(rawToken: string, newPassword: string, client?: ClientContext): Promise<void> {
     const now = new Date();
     const token = await this.prisma.passwordResetToken.findUnique({
       where: { tokenHash: sha256(rawToken) },
@@ -830,6 +995,7 @@ export class AuthService {
         // Receiving the reset link proves control of the inbox
         isEmailVerified: true,
       });
+      await this.recordPasswordChanged(tx, token.userId, 'RESET', client);
       await this.audit(tx, token.userId, 'PASSWORD_RESET', token.userId);
       return updated;
     });
@@ -859,11 +1025,23 @@ export class AuthService {
     const passwordHash = await PasswordService.hash(newPassword);
     const user = await this.prisma.$transaction(async (tx) => {
       const updated = await this.applyPasswordChange(tx, existing.id, passwordHash, {});
+      await this.recordPasswordChanged(tx, existing.id, 'CHANGE', ctx);
       await this.audit(tx, existing.id, 'PASSWORD_CHANGED', existing.id);
       return updated;
     });
     await this.afterPasswordChange(user);
-    return this.startSession(user, Boolean(actor.mfa), user.tokenVersion);
+    return this.startSession(user, Boolean(actor.mfa), user.tokenVersion, false, { client: ctx });
+  }
+
+  private async recordPasswordChanged(tx: Tx, userId: string, via: 'CHANGE' | 'RESET', client?: ClientContext): Promise<void> {
+    const device = describeClient(client);
+    await this.events.record(tx, {
+      type: SecurityEventType.PASSWORD_CHANGED,
+      userId,
+      ip: device.ip,
+      deviceLabel: client ? device.deviceLabel : null,
+      details: { via },
+    });
   }
 
   private async applyPasswordChange(
@@ -884,6 +1062,7 @@ export class AuthService {
       },
     });
     await tx.refreshToken.updateMany({ where: { userId, isRevoked: false }, data: { isRevoked: true } });
+    await this.sessions.revokeAllInTx(tx, userId, 'PASSWORD_CHANGED');
     await tx.passwordResetToken.updateMany({ where: { userId, usedAt: null }, data: { usedAt: new Date() } });
     return user;
   }
@@ -974,6 +1153,7 @@ export class AuthService {
     });
     if (!isActive) {
       await tx.refreshToken.updateMany({ where: { userId, isRevoked: false }, data: { isRevoked: true } });
+      await this.sessions.revokeAllInTx(tx, userId, 'ACCOUNT_DISABLED');
     }
     await this.audit(tx, actorId, isActive ? 'USER_ENABLED' : 'USER_DISABLED', userId);
     return result;
@@ -1136,6 +1316,7 @@ export class AuthService {
     void promise.finally(() => this.background.delete(promise));
   }
 
+  /** Appends to the hash-chained audit log, inside `tx` (or in a transaction of its own for the root client) */
   public async audit(
     tx: Client,
     actorId: string | null,
@@ -1143,9 +1324,7 @@ export class AuthService {
     targetId: string | null,
     details?: Record<string, unknown>
   ): Promise<void> {
-    await tx.auditLog.create({
-      data: { actorId, action, targetId, details: details as Prisma.InputJsonValue | undefined },
-    });
+    await writeAudit(tx, { actorId, action, targetId, details });
   }
 
   private async stageUserRegistered(tx: Tx, user: User): Promise<void> {
@@ -1166,20 +1345,6 @@ export class AuthService {
     });
   }
 
-  /** Ends a session: its refresh tokens AND every access token issued in it (via the session denylist) */
-  private async revokeFamily(familyId: string): Promise<void> {
-    await this.prisma.refreshToken.updateMany({
-      where: { familyId },
-      data: { isRevoked: true },
-    });
-    try {
-      await this.tokenState.revokeSession(familyId, this.tokenService.accessTokenTtlSeconds);
-    } catch (err) {
-      // The refresh tokens are dead; outstanding access tokens then expire on their own within minutes
-      logger.error({ err, alert: 'SESSION_DENYLIST_FAILED' }, 'Could not denylist the revoked session in Redis');
-    }
-  }
-
   private getDummyHash(): Promise<string> {
     if (!this.dummyHashPromise) {
       this.dummyHashPromise = PasswordService.hash(crypto.randomBytes(32).toString('hex'));
@@ -1192,23 +1357,65 @@ export class AuthService {
    * row lock and only if the user's token version still equals `expectedVersion` (read before the
    * credential check), so a password reset/disable committing in between can't be outlived by this login.
    */
-  private async startSession(user: User, mfaAuthenticated: boolean, expectedVersion?: number, stepUp = false): Promise<GeneratedTokens> {
+  private async startSession(
+    user: User,
+    mfaAuthenticated: boolean,
+    expectedVersion?: number,
+    stepUp = false,
+    options: { client?: ClientContext; signIn?: boolean } = {}
+  ): Promise<GeneratedTokens> {
     return this.prisma.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM users WHERE id = ${user.id} FOR UPDATE`;
       const fresh = await tx.user.findUniqueOrThrow({ where: { id: user.id } });
       if (!fresh.isActive || (expectedVersion !== undefined && fresh.tokenVersion !== expectedVersion)) {
         throw new UnauthorizedError('Your credentials changed while signing in. Please sign in again.');
       }
-      return this.createTokensInFamily(
-        tx,
-        fresh,
-        {
-          familyId: crypto.randomUUID(),
-          familyExpiresAt: new Date(Date.now() + this.config.sessionMaxDays * 86400_000),
-          mfaAuthenticated,
+      const family = {
+        familyId: crypto.randomUUID(),
+        familyExpiresAt: new Date(Date.now() + this.config.sessionMaxDays * 86400_000),
+        mfaAuthenticated,
+      };
+      const tokens = await this.createTokensInFamily(tx, fresh, family, stepUp);
+
+      const device = describeClient(options.client);
+      // The account's very first session is never a "new device" (nor is the first one after this feature
+      // shipped, for accounts that have no device history yet)
+      const firstSession = !fresh.firstSignInAt;
+      if (firstSession) await tx.user.updateMany({ where: { id: fresh.id, firstSignInAt: null }, data: { firstSignInAt: new Date() } });
+      const newDevice = Boolean(options.signIn) && !firstSession && !(await this.sessions.isKnownDevice(tx, fresh.id, device));
+      await this.sessions.create(tx, { id: family.familyId, userId: fresh.id, mfa: mfaAuthenticated, expiresAt: family.familyExpiresAt, device });
+
+      if (options.signIn) {
+        const event = { userId: fresh.id, ip: device.ip, deviceLabel: device.deviceLabel };
+        await this.events.record(tx, { ...event, type: SecurityEventType.SIGN_IN_SUCCEEDED, details: { mfa: mfaAuthenticated, newDevice } });
+        if (newDevice) {
+          await this.events.record(tx, { ...event, type: SecurityEventType.NEW_DEVICE, details: { sessionId: family.familyId } });
+          await this.stageNewDeviceLogin(tx, fresh, device.deviceLabel, maskIp(device.ip));
+        }
+      }
+      return tokens;
+    });
+  }
+
+  /** security.new_device_login.v1 (notification-service emails the account holder) */
+  private async stageNewDeviceLogin(tx: Tx, user: User, deviceLabel: string, ipMasked: string | null): Promise<void> {
+    const at = new Date().toISOString();
+    await tx.outboxEvent.create({
+      data: {
+        aggregateType: 'USER',
+        aggregateId: user.id,
+        eventType: 'security.new_device_login.v1',
+        payload: {
+          eventId: crypto.randomUUID(),
+          eventType: 'security.new_device_login.v1',
+          timestamp: at,
+          userId: user.id,
+          email: user.email,
+          deviceLabel,
+          ipMasked,
+          at,
         },
-        stepUp
-      );
+      },
     });
   }
 

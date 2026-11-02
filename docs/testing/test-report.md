@@ -1,3 +1,33 @@
+# Test report — 31 October 2026 (platform upgrade)
+
+Branch `feature/scale-payments-assistant`: payments with Razorpay (simulator in dev), the Sphere assistant,
+real-time updates, sessions and security events, PgBouncer, cache Redis, scale and observability overlays.
+Same environment as below; the full stack (19 containers, dev overlay) was restarted cold and run against the
+existing local database with real sign-ins (email verification through Mailpit, authenticator codes).
+
+| Suite | Result | Notes |
+|---|---|---|
+| Backend unit (Jest, 12 packages) and `tsc` | **passed** | Per package counts in `CONTINUE-HERE.md`, checkpoint 1 to 3 |
+| Frontend lint, typecheck, Vitest with coverage, build | **passed** | 904 tests at checkpoint 4; lint, typecheck and the Sphere suites re-run after the last fix |
+| API functional + security suite (`backend/scripts/e2e.mjs`) | **201 / 201 passed**, no 5xx | [Results](api-e2e-results.txt) |
+| Platform suite (`backend/scripts/e2e-platform.mjs`) | **63 / 63 passed** | Top-ups, webhooks, refunds, reconciler, Sphere, SSE, sessions, metrics exposure. [Results](platform-e2e-results.txt) |
+| Browser journeys (Playwright) | **14 / 14 passed** in 1.9 min | Now including Add money through the test checkout, Sphere, sessions, payments console and security centre. [Results](browser-journeys-results.txt) |
+
+All three live suites pass when run back to back against the same administrators.
+
+Defects found on 31 October and fixed:
+
+| Found by | Defect | Fix |
+|---|---|---|
+| Browser journeys | Run straight after the API suites, the administrators' sign-in failed: both harnesses picked the same single-use authenticator step (the server correctly refused the replay) | Each harness also honours the other's used steps |
+| Browser journeys | `getByLabel('Amount')` also matched the "Quick amounts" group on Add money | Exact label match |
+| Screenshot review | The Sphere message box drew two focus rings (the global `:focus-visible` ring inside the field's own ring) | The textarea opts out, like the money input |
+| Platform suite | The web origin served the SPA's `index.html` for `/metrics` | nginx answers 404 |
+
+Not yet done on this branch: k6 load tests (`loadtest/`), so the capacity plan has no measured numbers.
+
+---
+
 # Test report — 27 October 2026
 
 Branch `feature/fullstack-platform`. Environment: Windows 11; Docker 29.1.3 and Compose 2.40 in WSL2

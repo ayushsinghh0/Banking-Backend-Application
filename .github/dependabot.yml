@@ -1,0 +1,107 @@
+# Dependency updates. Minor and patch versions arrive as one grouped PR per area each week; majors arrive one
+# PR each, because they need reading. Security updates are not delayed by any of this (they bypass cooldown).
+# The cooldown waits out the first days of a release, when hijacked or broken versions are usually yanked.
+# Labels other than "dependencies" must exist in the repository, or Dependabot silently skips them.
+
+version: 2
+
+updates:
+  - package-ecosystem: npm
+    directory: /backend
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Asia/Kolkata
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 5
+      semver-major-days: 14
+    labels: [dependencies, backend]
+    commit-message:
+      prefix: "deps(backend)"
+      prefix-development: "deps-dev(backend)"
+    groups:
+      backend-production:
+        dependency-type: production
+        update-types: [minor, patch]
+      backend-development:
+        dependency-type: development
+        update-types: [minor, patch]
+
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Asia/Kolkata
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 5
+      semver-major-days: 14
+    labels: [dependencies, frontend]
+    commit-message:
+      prefix: "deps(frontend)"
+      prefix-development: "deps-dev(frontend)"
+    groups:
+      frontend-production:
+        dependency-type: production
+        update-types: [minor, patch]
+      frontend-development:
+        dependency-type: development
+        update-types: [minor, patch]
+
+  # Base images in the Dockerfiles: Dependabot updates the tag and the pinned digest together
+  - package-ecosystem: docker
+    directories: [/backend, /frontend]
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Asia/Kolkata
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 5
+    labels: [dependencies, docker]
+    commit-message:
+      prefix: "deps(docker)"
+    groups:
+      base-images:
+        update-types: [minor, patch]
+
+  # Infrastructure images pinned in the Compose files (Postgres, Redis, Kafka, Mailpit, observability stack)
+  - package-ecosystem: docker-compose
+    directories: [/, /backend]
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Asia/Kolkata
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 5
+    labels: [dependencies, docker]
+    commit-message:
+      prefix: "deps(compose)"
+    groups:
+      compose-images:
+        update-types: [minor, patch]
+
+  # Workflow actions are pinned by commit SHA; Dependabot bumps the SHA and the version comment together
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Asia/Kolkata
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+    labels: [dependencies, ci]
+    commit-message:
+      prefix: "deps(ci)"
+    groups:
+      actions:
+        update-types: [minor, patch]

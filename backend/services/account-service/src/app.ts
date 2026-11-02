@@ -5,7 +5,9 @@ import { PrismaClient } from '../generated/client';
 import {
   acquireJobLease,
   assertNoPlaceholders,
+  CacheLike,
   connectRedis,
+  createCache,
   createAuthenticate,
   createBaseApp,
   createEventPublisher,
@@ -27,12 +29,15 @@ import { AccountController } from './controllers/account.controller';
 import { createAccountRouter } from './routes/account.routes';
 import { HttpLedgerClient, LedgerClient } from './clients/ledger.client';
 import { CustomerClient, HttpCustomerClient } from './clients/customer.client';
+import { AccountListCache } from './services/account-cache';
 
 export interface AccountAppDeps {
   tokenState: TokenStateStore;
   ledgerClient?: LedgerClient;
   customerClient?: CustomerClient;
   redis?: Redis;
+  /** Account-list cache on the cache Redis (CACHE_REDIS_URL); none = every list read goes to the database */
+  cache?: CacheLike;
 }
 
 export function createApp(prisma: PrismaClient, deps: AccountAppDeps) {
@@ -44,7 +49,8 @@ export function createApp(prisma: PrismaClient, deps: AccountAppDeps) {
   const accountService = new AccountService(
     prisma,
     deps.ledgerClient ?? new HttpLedgerClient(),
-    deps.customerClient ?? new HttpCustomerClient()
+    deps.customerClient ?? new HttpCustomerClient(),
+    new AccountListCache(deps.cache)
   );
   const accountController = new AccountController(accountService);
 
@@ -100,10 +106,12 @@ export function createApp(prisma: PrismaClient, deps: AccountAppDeps) {
 }
 
 async function main(): Promise<void> {
-  assertNoPlaceholders(['DATABASE_URL', 'REDIS_URL', 'KAFKA_PASSWORD', 'JWT_VERIFY_KEYS', 'LEDGER_INTERNAL_TOKEN', 'CUSTOMER_INTERNAL_TOKEN']);
+  assertNoPlaceholders(['DATABASE_URL', 'REDIS_URL', 'KAFKA_PASSWORD', 'JWT_VERIFY_KEYS', 'LEDGER_INTERNAL_TOKEN', 'CUSTOMER_INTERNAL_TOKEN', 'CACHE_REDIS_URL']);
   const prisma = new PrismaClient(prismaClientOptions());
   const redis = await connectRedis();
-  const { app, accountService } = createApp(prisma, { tokenState: new RedisTokenStateStore(redis), redis });
+  // Cache Redis (evictable, never the security store); unset CACHE_REDIS_URL disables caching
+  const { cache, redis: cacheRedis } = createCache({ namespace: 'account' });
+  const { app, accountService } = createApp(prisma, { tokenState: new RedisTokenStateStore(redis), redis, cache });
   const reconcileIntervalMs = Number(process.env.RECONCILE_INTERVAL_MS || 5 * 60 * 1000);
   const reconcileTimer = setInterval(() => {
     // One replica at a time (lease), not every instance walking every account
@@ -122,6 +130,7 @@ async function main(): Promise<void> {
     () => kafka?.disconnect(),
     () => prisma.$disconnect(),
     () => redis.quit(),
+    () => cacheRedis?.quit(),
   ]);
 }
 

@@ -143,11 +143,20 @@ describe('AccountDetailPage', () => {
     expect(screen.queryByRole('button', { name: /freeze account/i })).not.toBeInTheDocument();
   });
 
+  it('offers transfers and adding money from an active account', async () => {
+    mockAccount(savings);
+    render();
+    const actions = await screen.findByRole('region', { name: 'Account actions' });
+    expect(within(actions).getByRole('link', { name: 'Transfer from this account' })).toHaveAttribute('href', `/transfer?from=${IDS.savings}`);
+    expect(within(actions).getByRole('link', { name: 'Add money to this account' })).toHaveAttribute('href', `/add-money?account=${IDS.savings}`);
+  });
+
   it('explains a closed account and offers no actions', async () => {
     mockAccount(anAccount({ status: 'CLOSED' }));
     render();
     expect(await screen.findByText('This account is closed')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /change daily limit/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /add money/i })).not.toBeInTheDocument();
   });
 
   it('explains a daily limit ceiling set by the bank', async () => {

@@ -1,6 +1,6 @@
 import { Request, Response, NextFunction, RequestHandler, Router } from 'express';
 import { z } from 'zod';
-import { requireInternalService, requireRoles } from '@banksphere/common';
+import { anyAuthenticated, requireInternalService, requireRoles } from '@banksphere/common';
 import { CustomerController } from '../controllers/customer.controller';
 import { CustomerService } from '../services/customer.service';
 
@@ -9,10 +9,11 @@ export function createCustomerRouter(controller: CustomerController, authenticat
 
   router.use(authenticate);
 
-  // Profile endpoints
-  router.get('/me', controller.getMe);
-  router.post('/me', controller.createMe);
-  router.patch('/me', controller.updateMe);
+  // The caller's own profile: the service only ever reads or writes the token subject's profile here
+  const own = anyAuthenticated("the caller's own profile only; enforced in CustomerService");
+  router.get('/me', own, controller.getMe);
+  router.post('/me', own, controller.createMe);
+  router.patch('/me', own, controller.updateMe);
 
   // Staff endpoints: profile search and lookup (logged) and KYC review (KYC officers only: separation of duties).
   // '/' matches only the bare path, so it can't capture '/me' or '/:userId'.

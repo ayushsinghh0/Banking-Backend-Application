@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import { EventPublisher } from '../kafka/event-publisher';
 import { logger } from '../logger/logger';
+import { counter, gauge } from '../observability/metrics';
 
 /**
  * Minimal shape of a Prisma client whose schema contains the standard `outbox_events` table:
@@ -38,6 +39,12 @@ export interface OutboxRelayOptions {
 }
 
 const MAX_BACKOFF_SECONDS = 300;
+
+const pendingGauge = gauge('outbox_pending_events', 'Outbox events waiting to be published');
+const lagGauge = gauge('outbox_oldest_pending_seconds', 'Age of the oldest unpublished outbox event');
+const parkedGauge = gauge('outbox_failed_events', 'Outbox events parked as FAILED (need a re-drive)');
+const published = counter('outbox_published_total', 'Outbox events published to Kafka', ['event_type']);
+const publishFailures = counter('outbox_publish_failures_total', 'Failed outbox publish attempts', ['event_type']);
 
 /**
  * Transactional-outbox relay. Rows are written in the same DB transaction as the business change;
@@ -100,9 +107,12 @@ export class OutboxRelay {
       while (!this.stopped && (await this.processPendingEvents()) > 0) {
         /* continue */
       }
-      const lag = await this.lagSeconds();
+      const { pending, lagSeconds: lag } = await this.backlog();
+      pendingGauge.set(pending);
+      lagGauge.set(lag);
       if (lag > 300) logger.error({ lagSeconds: lag, alert: 'OUTBOX_LAG' }, 'Outbox events are not being published');
       const parked = await this.failedCount();
+      parkedGauge.set(parked);
       if (parked > 0) logger.error({ parked, alert: 'OUTBOX_EVENTS_PARKED' }, 'Outbox events are parked as FAILED and need a re-drive');
     } catch (err) {
       logger.error({ err }, 'Outbox relay batch failed');
@@ -113,11 +123,16 @@ export class OutboxRelay {
 
   /** Age in seconds of the oldest unpublished event (0 when empty); exposed for health checks/alerting */
   public async lagSeconds(): Promise<number> {
-    const rows = await this.prisma.$queryRaw<Array<{ age: number | null }>>`
-      SELECT EXTRACT(EPOCH FROM (now() - min(created_at)))::float8 AS age
+    return (await this.backlog()).lagSeconds;
+  }
+
+  /** Unpublished events and the age of the oldest, in one statement */
+  public async backlog(): Promise<{ pending: number; lagSeconds: number }> {
+    const rows = await this.prisma.$queryRaw<Array<{ n: bigint | number | null; age: number | null }>>`
+      SELECT count(*)::bigint AS n, EXTRACT(EPOCH FROM (now() - min(created_at)))::float8 AS age
       FROM outbox_events WHERE status = 'PENDING'
     `;
-    return Math.max(0, Math.floor(rows[0]?.age ?? 0));
+    return { pending: Number(rows[0]?.n ?? 0), lagSeconds: Math.max(0, Math.floor(rows[0]?.age ?? 0)) };
   }
 
   public async processPendingEvents(): Promise<number> {
@@ -151,7 +166,9 @@ export class OutboxRelay {
           SET status = 'PUBLISHED', published_at = now(), last_error = NULL, locked_until = NULL, locked_by = NULL
           WHERE id = ${row.id} AND locked_by = ${claim}
         `;
+        published.inc({ event_type: row.event_type });
       } catch (err: any) {
+        publishFailures.inc({ event_type: row.event_type });
         const attempts = row.retry_count + 1;
         const message = String(err?.message || 'Unknown publish failure').slice(0, 500);
         // Only a message the broker will NEVER accept is parked; an unavailable broker (however long the

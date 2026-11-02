@@ -226,6 +226,7 @@ describe('DashboardPage', () => {
     render();
     const actions = await screen.findByRole('region', { name: 'Quick actions' });
     expect(within(actions).getByRole('link', { name: /transfer/i })).toHaveAttribute('href', '/transfer');
+    expect(within(actions).getByRole('link', { name: 'Add money' })).toHaveAttribute('href', '/add-money');
     expect(within(actions).getByRole('link', { name: /add payee/i })).toHaveAttribute('href', '/payees?add=1');
     expect(within(actions).getByRole('link', { name: /withdraw cash/i })).toHaveAttribute('href', '/cash-withdrawal');
     expect(within(actions).getByRole('button', { name: /new account/i })).toBeInTheDocument();

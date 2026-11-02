@@ -55,4 +55,14 @@ export const qk = {
   directory: (params: object) => ['admin', 'users', params] as const,
   directoryAll: ['admin', 'users'] as const,
   notificationLogs: (params: object) => ['notifications', params] as const,
+  /** Everything about the customer's own top-ups: config (today's usage), lists and single top-ups */
+  payments: ['payments'] as const,
+  paymentsConfig: ['payments', 'config'] as const,
+  topUps: ['payments', 'top-ups'] as const,
+  topUp: (id: string) => ['payments', 'top-up', id] as const,
+  assistantMeta: ['assistant', 'meta'] as const,
+  conversations: ['assistant', 'conversations'] as const,
+  conversation: (id: string) => ['assistant', 'conversation', id] as const,
+  deviceSessions: ['security', 'sessions'] as const,
+  securityEvents: ['security', 'events'] as const,
 };

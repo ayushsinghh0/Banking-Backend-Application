@@ -1,0 +1,152 @@
+# Managed data stores (not run in the cluster), reached by private address. The CIDRs here are TEST-NET-1
+# documentation ranges that route nowhere, so the base alone opens nothing; every overlay replaces them with
+# the real subnets (overlays/*/patches/datastore-cidrs.yaml). Who may reach which store mirrors the Compose
+# `backend` network and the per-service credentials (docs/architecture/2026-10-28-platform-scale-design.md §2).
+#
+# Postgres: services reach the transaction-mode pooler (PgBouncer-compatible, 6432 on most managed offerings,
+# 5432 on some); the migration Job connects directly on 5432.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-egress
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values:
+          - auth-service
+          - customer-service
+          - account-service
+          - transaction-service
+          - notification-service
+          - fraud-service
+          - payment-service
+          - assistant-service
+          - banksphere-migrate
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 192.0.2.0/27
+      ports:
+        - protocol: TCP
+          port: 5432
+        - protocol: TCP
+          port: 6432
+---
+# Kafka (SASL over TLS): producers through their outbox relays, and the consumer groups. Brokers listen on
+# 9092-9098 depending on the provider and auth mechanism.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kafka-egress
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values:
+          - auth-service
+          - account-service
+          - transaction-service
+          - notification-service
+          - fraud-service
+          - payment-service
+          - realtime-service
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 192.0.2.32/27
+      ports:
+        - protocol: TCP
+          port: 9092
+          endPort: 9098
+---
+# Security Redis (token versions, revocations, MFA state; AOF, noeviction): every service that authenticates
+# requests reads it, only auth-service writes. Not the gateway, which never decides authentication.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-security-egress
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values:
+          - auth-service
+          - customer-service
+          - account-service
+          - transaction-service
+          - notification-service
+          - fraud-service
+          - payment-service
+          - assistant-service
+          - realtime-service
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 192.0.2.64/27
+      ports:
+        - protocol: TCP
+          port: 6379
+          endPort: 6380
+---
+# Edge Redis (GCRA buckets, IP rules mirror, bans, login counters; evictable): the gateway, and auth-service,
+# which keeps its login counters and writes credential-stuffing bans there
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-edge-egress
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values:
+          - api-gateway
+          - auth-service
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 192.0.2.96/27
+      ports:
+        - protocol: TCP
+          port: 6379
+          endPort: 6380
+---
+# Cache Redis (read-through caches cache:<svc>:*, real-time pub/sub rt:* and replay streams; evictable)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-cache-egress
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values:
+          - customer-service
+          - account-service
+          - transaction-service
+          - payment-service
+          - assistant-service
+          - realtime-service
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 192.0.2.128/27
+      ports:
+        - protocol: TCP
+          port: 6379
+          endPort: 6380

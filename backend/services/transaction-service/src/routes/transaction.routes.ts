@@ -1,6 +1,9 @@
 import { RequestHandler, Router } from 'express';
-import { requireRoles } from '@banksphere/common';
+import { anyAuthenticated, authorize, requireRoles } from '@banksphere/common';
 import { TransactionController } from '../controllers/transaction.controller';
+
+// Every route carries exactly one explicit policy; src/routes/access.ts declares them and
+// tests/route-policies.spec.ts proves the two agree.
 
 export function createTransactionRouter(controller: TransactionController, authenticate: RequestHandler): Router {
   const router = Router();
@@ -31,9 +34,14 @@ export function createTransactionRouter(controller: TransactionController, authe
   router.post('/cash-operations/:cashOperationId/approve', requireRoles('BANK_ADMIN'), controller.approveCashOperation);
   router.post('/cash-operations/:cashOperationId/reject', requireRoles('BANK_ADMIN'), controller.rejectCashOperation);
 
-  // Read-only ledger queries (owner or staff; staff reads are audit-logged)
-  router.get('/accounts/:accountId/balance', controller.getBalance);
-  router.get('/accounts/:accountId/history', controller.getHistory);
+  // Integrity: re-walks the tamper-evident audit chain
+  router.get('/audit/verify', authorize('audit:verify'), controller.verifyAuditChain);
+
+  // Read-only ledger queries: every role may ask, the service answers only the owner or staff (staff reads
+  // are audit-logged) and shows cash and clearing accounts to BANK_ADMIN only
+  const ownerOrStaff = anyAuthenticated('owner of the account or staff (audit-logged); cash and clearing accounts BANK_ADMIN only; enforced in LedgerService');
+  router.get('/accounts/:accountId/balance', ownerOrStaff, controller.getBalance);
+  router.get('/accounts/:accountId/history', ownerOrStaff, controller.getHistory);
 
   return router;
 }

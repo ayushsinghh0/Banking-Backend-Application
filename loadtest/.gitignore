@@ -1,0 +1,3 @@
+# Seeded users (test passwords), staff TOTP secrets and run output: generated locally, never committed
+.data/
+results/

@@ -1,7 +1,7 @@
 import { useId, useState, type ReactNode } from 'react';
 import { Link, useParams } from 'react-router';
 import { keepPreviousData, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ArrowDownLeft, ArrowLeftRight, ArrowUpRight, ChevronLeft, Gauge, ReceiptText, SearchX, Snowflake } from 'lucide-react';
+import { ArrowDownLeft, ArrowLeftRight, ArrowUpRight, ChevronLeft, CirclePlus, Gauge, ReceiptText, SearchX, Snowflake } from 'lucide-react';
 import type { BankAccount, LedgerEntry } from '@/lib/api/types';
 import { useApi } from '@/lib/auth/AuthProvider';
 import { qk } from '@/lib/query';
@@ -273,7 +273,7 @@ function Fact({ label, value, children }: { label: string; value: ReactNode; chi
   );
 }
 
-const ACTION_GRID = ['grid-cols-1', 'grid-cols-1', 'grid-cols-2', 'grid-cols-3'];
+const ACTION_GRID = ['grid-cols-1', 'grid-cols-1', 'grid-cols-2', 'grid-cols-3', 'grid-cols-4'];
 
 /** Round actions, as on the dashboard: what you can do with this account right now */
 function AccountActions({
@@ -293,7 +293,7 @@ function AccountActions({
     'group flex flex-col items-center gap-2 whitespace-nowrap rounded-2xl py-1 text-center text-[12.5px] font-medium leading-4 tracking-[-0.01em] focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0 cursor-pointer';
   const circle =
     'flex size-[52px] items-center justify-center rounded-full bg-muted text-foreground transition-[transform,background-color] duration-200 group-hover:bg-secondary group-active:scale-95 group-focus-visible:ring-2 group-focus-visible:ring-ring group-focus-visible:ring-offset-2 group-focus-visible:ring-offset-card [&_svg]:size-[22px]';
-  const count = active ? 3 : 1;
+  const count = active ? 4 : 1;
   return (
     <Card role="region" aria-labelledby={id} className={cn('px-4 py-5 sm:px-6', className)}>
       <h2 id={id} className="sr-only">
@@ -306,6 +306,14 @@ function AccountActions({
               <ArrowLeftRight strokeWidth={1.8} aria-hidden="true" />
             </span>
             Transfer
+          </Link>
+        ) : null}
+        {active ? (
+          <Link to={`/add-money?account=${account.id}`} className={action} aria-label="Add money to this account">
+            <span className={circle}>
+              <CirclePlus strokeWidth={1.8} aria-hidden="true" />
+            </span>
+            Add money
           </Link>
         ) : null}
         <button type="button" className={action} aria-label="Change daily limit" onClick={onChangeLimit}>

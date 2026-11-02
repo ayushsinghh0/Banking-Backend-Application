@@ -4,7 +4,9 @@ import Redis from 'ioredis';
 import { PrismaClient } from '../generated/client';
 import {
   assertNoPlaceholders,
+  CacheLike,
   connectRedis,
+  createCache,
   createAuthenticate,
   createBaseApp,
   createEventPublisher,
@@ -19,6 +21,7 @@ import {
   setupSwagger,
   startHttpServer,
   TokenStateStore,
+  NoopCache,
   prismaClientOptions,
 } from '@banksphere/common';
 import { LedgerService } from './services/ledger.service';
@@ -29,26 +32,46 @@ import { defaultLedgerPolicy, envNumber } from './services/ledger-core';
 import { TransactionController } from './controllers/transaction.controller';
 import { createTransactionRouter } from './routes/transaction.routes';
 import { createInternalRouter } from './routes/internal.routes';
+import { createPaymentInternalRouter, PAYMENT_LEDGER_TOKEN_ENV } from './routes/payment-internal.routes';
+import { LedgerReadCache } from './services/ledger-cache';
+import { LedgerCommits } from './services/ledger-commits';
+import { PaymentLedgerService } from './services/payment-ledger.service';
+import { AuditChainService } from './services/audit-chain';
 
 export interface TransactionAppDeps {
   tokenState: TokenStateStore;
   redis?: Redis;
+  /** Read cache on the cache Redis (CACHE_REDIS_URL); none = every read goes to the database */
+  cache?: CacheLike;
 }
 
 export function createApp(prisma: PrismaClient, deps: TransactionAppDeps) {
   assertJwtVerificationConfigured(); // Fail fast on missing/invalid JWT public keys
   getInternalToken('LEDGER_INTERNAL_TOKEN');
+  getInternalToken(PAYMENT_LEDGER_TOKEN_ENV);
   const app = createBaseApp();
 
   // Services initialization (an invalid policy setting stops the service here, at startup)
   const policy = defaultLedgerPolicy();
-  const ledgerService = new LedgerService(prisma, policy);
-  const idempotencyService = new IdempotencyService(prisma);
+  // One commit tracker for every posting path: cache versions are bumped (and postings counted) after commit
+  const commits = new LedgerCommits(new LedgerReadCache(deps.cache ?? new NoopCache()));
+  const ledgerService = new LedgerService(prisma, policy, commits);
+  const idempotencyService = new IdempotencyService(prisma, undefined, commits);
+  const paymentLedgerService = new PaymentLedgerService(prisma, commits);
 
   // Controller & Router
-  const tellerService = new TellerService(prisma, policy);
-  const controller = new TransactionController(ledgerService, tellerService, new BeneficiaryService(prisma, policy), idempotencyService);
+  const tellerService = new TellerService(prisma, policy, commits);
+  const controller = new TransactionController(
+    ledgerService,
+    tellerService,
+    new BeneficiaryService(prisma, policy),
+    idempotencyService,
+    new AuditChainService(prisma)
+  );
   app.use('/api/v1/transactions', createTransactionRouter(controller, createAuthenticate(deps.tokenState)));
+  // The payments router is mounted first: the account-lifecycle router below guards everything under
+  // /internal/v1 with LEDGER_INTERNAL_TOKEN, and each caller holds only its own credential
+  app.use('/internal/v1/payments', createPaymentInternalRouter(paymentLedgerService));
   app.use('/internal/v1', createInternalRouter(ledgerService));
 
   // Health and readiness endpoints
@@ -103,17 +126,25 @@ export function createApp(prisma: PrismaClient, deps: TransactionAppDeps) {
   // Centralized Error Handling Middleware
   app.use(errorHandlerMiddleware);
 
-  return { app, idempotencyService, ledgerService, tellerService, prisma };
+  return { app, idempotencyService, ledgerService, tellerService, paymentLedgerService, prisma };
 }
 
 async function main(): Promise<void> {
-  assertNoPlaceholders(['DATABASE_URL', 'REDIS_URL', 'KAFKA_PASSWORD', 'JWT_VERIFY_KEYS', 'LEDGER_INTERNAL_TOKEN']);
+  assertNoPlaceholders(['DATABASE_URL', 'REDIS_URL', 'KAFKA_PASSWORD', 'JWT_VERIFY_KEYS', 'LEDGER_INTERNAL_TOKEN', PAYMENT_LEDGER_TOKEN_ENV, 'CACHE_REDIS_URL']);
   // Read (and validated) before anything starts: a NaN interval would make setInterval fire every millisecond
   const outboxPollMs = envNumber('OUTBOX_POLL_INTERVAL_MS', 2000, 100);
   const reconcileIntervalMs = envNumber('RECONCILE_INTERVAL_MS', 10 * 60 * 1000, 1000);
   const prisma = new PrismaClient(prismaClientOptions());
   const redis = await connectRedis();
-  const { app, idempotencyService, ledgerService, tellerService } = createApp(prisma, { tokenState: new RedisTokenStateStore(redis), redis });
+  // Cache Redis (evictable, never the security store); unset CACHE_REDIS_URL disables caching
+  const { cache, redis: cacheRedis } = createCache({ namespace: 'ledger' });
+  const { app, idempotencyService, ledgerService, tellerService, paymentLedgerService } = createApp(prisma, {
+    tokenState: new RedisTokenStateStore(redis),
+    redis,
+    cache,
+  });
+  // The migration creates PAYMENT_CLEARING; this makes sure (idempotently) before the first top-up
+  await paymentLedgerService.ensureClearingAccount();
 
   // The relay only runs with a real publisher. Without Kafka, events stay PENDING and are
   // delivered once Kafka is configured, instead of being marked PUBLISHED and lost.
@@ -138,6 +169,7 @@ async function main(): Promise<void> {
     () => kafka?.disconnect(),
     () => prisma.$disconnect(),
     () => redis.quit(),
+    () => cacheRedis?.quit(),
   ]);
 }
 

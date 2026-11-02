@@ -83,6 +83,8 @@ function buildPrisma(rows: any[], owners: Record<string, string>, drawerBalance 
       return Promise.resolve(all);
     }),
     $executeRaw: jest.fn(),
+    // Audit chain head (lockAuditChain and the seq lookup): an empty chain unless a test says otherwise
+    $queryRawUnsafe: jest.fn().mockResolvedValue([]),
     transaction: {
       create: jest.fn(({ data }: any) => ({ id: 'tx-1', createdAt: new Date(), ...data })),
       aggregate: jest.fn().mockResolvedValue({ _sum: { amount: 0n } }),
@@ -415,7 +417,7 @@ describe('TellerService: cash operations (drawer, session, maker-checker)', () =
     const issuedAt = new Date(Date.now() - 60_000);
     const prisma = buildPrisma([row(ACC, 1_000_000n, 'alice')], { [ACC]: 'alice' });
     prisma.withdrawalAuthorization.findFirst.mockResolvedValue({ id: 'auth-1', amount: 50_000n, codeHash: 'x'.repeat(64), createdAt: issuedAt });
-    prisma.auditLog.count.mockResolvedValue(5); // this failure is the fifth since the code was issued
+    prisma.auditLog.count.mockResolvedValue(4); // four earlier failures since the code was issued: this one is the fifth
     const db = transactional(prisma);
     const tellerService = new TellerService(prisma, policy);
     const controller = new TransactionController({} as any, tellerService, {} as any, new IdempotencyService(prisma));
@@ -849,7 +851,7 @@ describe('LedgerService: reads and reconciliation', () => {
     prisma.$queryRaw.mockImplementation((strings: TemplateStringsArray) => {
       const sql = strings.join('?');
       if (sql.includes('unbalanced')) return Promise.resolve([{ unbalanced: 0n }]);
-      if (sql.includes('AS customers')) return Promise.resolve([{ customers: 10n, drawers: 10n, count: 3n }]);
+      if (sql.includes('AS customers')) return Promise.resolve([{ customers: 10n, assets: 10n, count: 3n }]);
       return Promise.resolve([]);
     });
     const result = await new LedgerService(prisma, policy).reconcileBalances();

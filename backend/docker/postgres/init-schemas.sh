@@ -1,5 +1,7 @@
 #!/bin/sh
-# BankSphere database-per-service initialiser (runs once, on an empty data directory).
+# BankSphere database-per-service initialiser. Runs on an empty data directory (docker-entrypoint-initdb.d),
+# and again on every deployment from the one-shot `db-bootstrap` job (over TCP, PGHOST set), so services
+# added later get their schema and roles on existing databases too. Every statement is idempotent.
 #
 # For every service two roles are created:
 #   <svc>_owner  owns the schema; used ONLY by the migration job (DDL)
@@ -72,3 +74,22 @@ create_service_roles account_schema      account      "${ACCOUNT_DB_OWNER_PASSWO
 create_service_roles ledger_schema       ledger       "${LEDGER_DB_OWNER_PASSWORD:-}"       "${LEDGER_DB_APP_PASSWORD:-}"
 create_service_roles notification_schema notification "${NOTIFICATION_DB_OWNER_PASSWORD:-}" "${NOTIFICATION_DB_APP_PASSWORD:-}"
 create_service_roles fraud_schema        fraud        "${FRAUD_DB_OWNER_PASSWORD:-}"        "${FRAUD_DB_APP_PASSWORD:-}"
+create_service_roles payment_schema      payment      "${PAYMENT_DB_OWNER_PASSWORD:-}"      "${PAYMENT_DB_APP_PASSWORD:-}"
+create_service_roles assistant_schema    assistant    "${ASSISTANT_DB_OWNER_PASSWORD:-}"    "${ASSISTANT_DB_APP_PASSWORD:-}"
+
+# Optional monitoring role for postgres-exporter (observability overlay): pg_monitor reads statistics and
+# settings, never table data. Created only when MONITORING_DB_PASSWORD is set.
+if [ -n "${MONITORING_DB_PASSWORD:-}" ]; then
+  refuse_placeholder MONITORING_DB_PASSWORD "$MONITORING_DB_PASSWORD"
+  psql_admin -v password="$MONITORING_DB_PASSWORD" <<'SQL'
+SELECT 'CREATE ROLE metrics_reader LOGIN' WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'metrics_reader') \gexec
+SELECT format('ALTER ROLE metrics_reader WITH LOGIN PASSWORD %L NOSUPERUSER NOCREATEDB NOCREATEROLE CONNECTION LIMIT 5', :'password') \gexec
+SELECT format('GRANT CONNECT ON DATABASE %I TO metrics_reader', current_database()) \gexec
+GRANT pg_monitor TO metrics_reader;
+SQL
+  echo "Provisioned metrics_reader (pg_monitor) for postgres-exporter"
+fi
+
+# Query statistics for the slow-query dashboards (the library is preloaded by the server's command line).
+# Only the superuser and monitoring roles can read other roles' query texts.
+psql_admin -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements" || echo "pg_stat_statements not preloaded; skipping"

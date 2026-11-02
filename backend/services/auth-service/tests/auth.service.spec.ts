@@ -37,7 +37,7 @@ const NET = { network: '203.0.113.7', ip: '203.0.113.7' };
 // Re-authentication failures inside a session: never 401, which clients read as an expired session
 const WRONG_PASSWORD = { statusCode: 403, errorCode: 'INVALID_PASSWORD' };
 
-function buildMockPrisma() {
+export function buildMockPrisma() {
   const prisma: any = {
     user: {
       findUnique: jest.fn(),
@@ -85,8 +85,24 @@ function buildMockPrisma() {
       updateMany: jest.fn().mockResolvedValue({ count: 1 }),
     },
     outboxEvent: { create: jest.fn() },
-    auditLog: { create: jest.fn(), findFirst: jest.fn().mockResolvedValue(null) },
+    auditLog: { create: jest.fn(), findFirst: jest.fn().mockResolvedValue(null), findMany: jest.fn().mockResolvedValue([]) },
+    userSession: {
+      create: jest.fn(),
+      findUnique: jest.fn().mockResolvedValue(null),
+      findFirst: jest.fn().mockResolvedValue(null),
+      findMany: jest.fn().mockResolvedValue([]),
+      updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+    },
+    securityEvent: { create: jest.fn(), findMany: jest.fn().mockResolvedValue([]) },
+    ipRule: {
+      create: jest.fn(),
+      findMany: jest.fn().mockResolvedValue([]),
+      updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+    },
     $queryRaw: jest.fn().mockResolvedValue([{ id: 'locked' }]),
+    // Audit chain head (lockAuditChain): an empty chain by default
+    $queryRawUnsafe: jest.fn().mockResolvedValue([]),
+    $executeRaw: jest.fn().mockResolvedValue(0),
   };
   prisma.$transaction = jest.fn((arg: any) => (typeof arg === 'function' ? arg(prisma) : Promise.all(arg)));
   return prisma;
@@ -366,19 +382,21 @@ describe('AuthService', () => {
       prisma.user.findUnique.mockResolvedValue(activeUser({ mfaPendingSecretEnc: encryptSecret(secret, 'u1') }));
       prisma.user.update.mockImplementation(({ data }: any) => activeUser({ ...data, tokenVersion: 1 }));
       prisma.refreshToken.findFirst.mockResolvedValue({ id: 'rt-current', familyId: 'fam-1', familyExpiresAt: new Date(Date.now() + 86400_000) });
-      // Track whether each refresh token is written while the user row lock is held (inside the transaction)
-      let inTransaction = false;
+      // Track whether each refresh token is written while the user row lock is held (inside the transaction).
+      // A depth counter, not a flag: the mock hands the root client out as the transaction client, so the
+      // chained audit write inside the transaction opens a nested one that must not end the outer scope.
+      let depth = 0;
       const runTransaction = prisma.$transaction;
       prisma.$transaction = jest.fn(async (arg: any) => {
-        inTransaction = true;
+        depth += 1;
         try {
           return await runTransaction(arg);
         } finally {
-          inTransaction = false;
+          depth -= 1;
         }
       });
       const writtenInTransaction: boolean[] = [];
-      prisma.refreshToken.create.mockImplementation(() => writtenInTransaction.push(inTransaction));
+      prisma.refreshToken.create.mockImplementation(() => writtenInTransaction.push(depth > 0));
 
       await authService.enableMfa(customer, totpAt(secret, currentStep()));
       expect(writtenInTransaction).toEqual([true]);

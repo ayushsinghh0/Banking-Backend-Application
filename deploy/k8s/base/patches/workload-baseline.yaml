@@ -1,0 +1,71 @@
+# Security and rollout baseline applied to EVERY Deployment (kustomization.yaml targets them by the
+# banksphere.io/runtime label), so a new service cannot forget a field. policy/workloads.rego fails the build
+# if the rendered output still lacks any of it. Container "app" is the only container in every pod.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: workload-baseline # ignored: the patch target selects the Deployments
+spec:
+  revisionHistoryLimit: 5
+  progressDeadlineSeconds: 600
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Surge first, never go below the current count: capacity stays whole during a rollout
+      maxSurge: 25%
+      maxUnavailable: 0
+  template:
+    spec:
+      # No workload talks to the Kubernetes API, so no pod gets a token to steal
+      automountServiceAccountToken: false
+      # Service-link variables (AUTH_SERVICE_PORT=tcp://...) would leak into process.env next to the real config
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      # Spread each revision's pods across zones and nodes. ScheduleAnyway, not DoNotSchedule: when a zone is out
+      # of capacity (or lost) the HPA must still be able to add pods elsewhere; a pending scale-up during a
+      # traffic peak costs more than a temporary skew, and the PDB plus >= 3 production replicas keep a zone
+      # failure survivable. matchLabelKeys scopes the skew to this app and this rollout's ReplicaSet.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: banksphere
+          matchLabelKeys:
+            - app.kubernetes.io/name
+            - pod-template-hash
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: banksphere
+          matchLabelKeys:
+            - app.kubernetes.io/name
+            - pod-template-hash
+      containers:
+        - name: app
+          securityContext:
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          lifecycle:
+            # Keep serving while the endpoint removal propagates to kube-proxy, the ingress controller and the
+            # gateway's keep-alive pools; only then does SIGTERM start the app's own graceful shutdown
+            preStop:
+              sleep:
+                seconds: 10
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi

@@ -21,7 +21,10 @@ import {
   Tooltip,
 } from '@/components/ui/overlays';
 import { Button } from '@/components/ui/button';
+import { RealtimeProvider } from '@/lib/realtime';
+import { SphereLauncher, SphereProvider } from '@/features/assistant/Sphere';
 import { BrandLogo } from './Brand';
+import { ConnectionIndicator } from './ConnectionIndicator';
 
 const THEME_OPTIONS: Array<{ value: ThemePreference; label: string; icon: typeof Sun }> = [
   { value: 'light', label: 'Light', icon: Sun },
@@ -277,8 +280,22 @@ function SkipLink() {
  *  - Desktop staff: a quiet sidebar, like a professional tool.
  *  - Phones and tablets, everyone: a compact top bar and a bottom tab bar within thumb reach.
  * Only one navigation is mounted at a time, so there is always exactly one "Main" landmark.
+ *
+ * Everything signed in shares one real-time stream and one Sphere assistant. Sphere opens from a floating
+ * button on desktop (pages keep room for it at the bottom) and from the top bar on phones and tablets, so
+ * nothing ever sits over the tab bar.
  */
 export function AppShell() {
+  return (
+    <RealtimeProvider>
+      <SphereProvider>
+        <ShellFrame />
+      </SphereProvider>
+    </RealtimeProvider>
+  );
+}
+
+function ShellFrame() {
   const user = useUser();
   const location = useLocation();
   const desktop = useMediaQuery(DESKTOP_QUERY);
@@ -302,13 +319,15 @@ export function AppShell() {
             </Link>
           </div>
           <SidebarNav sections={sections} />
-          <div className="border-t border-border/70 p-3">
+          <div className="space-y-2 border-t border-border/70 p-3">
+            <ConnectionIndicator className="mx-2" />
             <UserMenu variant="sidebar" />
           </div>
         </aside>
         <main id="main" className="min-w-0 flex-1">
-          <div className="mx-auto w-full max-w-[1320px] px-10 pb-16 pt-10">{page}</div>
+          <div className="mx-auto w-full max-w-[1320px] px-10 pb-28 pt-10">{page}</div>
         </main>
+        <SphereLauncher variant="floating" />
       </div>
     );
   }
@@ -323,18 +342,20 @@ export function AppShell() {
             <BrandLogo />
           </Link>
           {desktop ? <TopNav items={sections.flatMap((s) => s.items)} /> : null}
-          <div className="justify-self-end">
+          <div className="flex items-center gap-1 justify-self-end">
+            <ConnectionIndicator className="mr-1" />
+            {desktop ? null : <SphereLauncher variant="header" />}
             <UserMenu variant="avatar" />
           </div>
         </div>
       </header>
       <main
         id="main"
-        className={cn('mx-auto w-full px-4 pt-6 sm:px-6 lg:px-10 lg:pb-16 lg:pt-10', container, !desktop && 'pb-[calc(6.5rem+env(safe-area-inset-bottom))]')}
+        className={cn('mx-auto w-full px-4 pt-6 sm:px-6 lg:px-10 lg:pb-28 lg:pt-10', container, !desktop && 'pb-[calc(6.5rem+env(safe-area-inset-bottom))]')}
       >
         {page}
       </main>
-      {desktop ? null : <TabBar sections={sections} />}
+      {desktop ? <SphereLauncher variant="floating" /> : <TabBar sections={sections} />}
     </div>
   );
 }

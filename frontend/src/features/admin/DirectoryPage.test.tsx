@@ -7,6 +7,7 @@ import { apiUrl, fail, ok, renderWithApp } from '@/test/render';
 import { aDirectoryUser, IDS } from '@/test/fixtures';
 import type { DirectoryUser } from '@/lib/api/types';
 import { asAdmin, asSupport, ME, PEOPLE } from './testData';
+import { aSession, sessionsHandler } from '@/features/ops/test/handlers';
 import DirectoryPage from './DirectoryPage';
 
 // sonner replays still-active toasts to every new Toaster, so clear them between tests
@@ -348,5 +349,36 @@ describe('DirectoryPage', () => {
     await user.click(within(dialog).getByRole('button', { name: 'Disable sign-in' }));
     expect(await screen.findByText('You appear to be offline')).toBeInTheDocument();
     expect(screen.getByRole('alertdialog')).toBeInTheDocument();
+  });
+
+  it('shows administrators where someone is signed in, with sign-out', async () => {
+    const seen: string[] = [];
+    const { user } = setup();
+    server.use(
+      sessionsHandler((request) => {
+        seen.push(new URL(request.url).pathname);
+        return [aSession({ deviceLabel: 'Edge on Windows' })];
+      })
+    );
+    const menu = await openActions(user, 'meera.teller@banksphere.local');
+    await user.click(within(menu).getByRole('menuitem', { name: 'Sessions and devices' }));
+    const sheet = await screen.findByRole('dialog', { name: 'Sessions for meera.teller@banksphere.local' });
+    expect(await within(sheet).findByText('Edge on Windows')).toBeInTheDocument();
+    expect(within(sheet).getByText(/Teller/)).toBeInTheDocument();
+    expect(within(sheet).getByRole('button', { name: /^sign out edge on windows/i })).toBeInTheDocument();
+    expect(within(sheet).queryByRole('link', { name: 'Open customer profile' })).not.toBeInTheDocument();
+    expect(seen).toEqual([`/api/v1/auth/admin/users/${IDS.teller}/sessions`]);
+  });
+
+  it('lets support see sessions, read-only, and reach the customer’s profile', async () => {
+    const { user } = setup({ as: asSupport });
+    server.use(sessionsHandler([aSession()]));
+    await user.click(await screen.findByRole('button', { name: 'Sessions and devices for asha@example.in' }));
+    const sheet = await screen.findByRole('dialog', { name: 'Sessions for asha@example.in' });
+    expect(await within(sheet).findByText('Chrome on Windows')).toBeInTheDocument();
+    expect(within(sheet).queryByRole('button', { name: /sign out/i })).not.toBeInTheDocument();
+    expect(within(sheet).getByRole('link', { name: 'Open customer profile' })).toHaveAttribute('href', `/customers/${IDS.customer}`);
+    await user.click(within(sheet).getByRole('button', { name: 'Close panel' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
   });
 });

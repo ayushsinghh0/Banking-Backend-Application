@@ -13,7 +13,9 @@
     "db:migrate": "npm run prisma:deploy --workspaces --if-present",
     "docker:up": "docker compose up -d --build",
     "docker:down": "docker compose down",
-    "docker:logs": "docker compose logs -f"
+    "docker:logs": "docker compose logs -f",
+    "access-matrix": "node scripts/access-matrix.mjs",
+    "access-matrix:check": "node scripts/access-matrix.mjs --check"
   },
   "devDependencies": {
     "typescript": "^5.4.5"

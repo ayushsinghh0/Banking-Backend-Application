@@ -1,5 +1,8 @@
 import { Kafka, Producer, Consumer, EachMessagePayload, logLevel, Partitioners, LogEntry } from 'kafkajs';
 import { logger, redactEmails, redactErrorForLog } from '../logger/logger';
+import { counter } from '../observability/metrics';
+
+const consumed = counter('kafka_consumer_messages_total', 'Consumed Kafka messages by outcome', ['topic', 'result']);
 
 export interface KafkaConfig {
   clientId: string;
@@ -395,6 +398,7 @@ export class KafkaService {
             await handle();
             circuitOpenUntil = 0;
             await commit();
+            consumed.inc({ topic: originalTopic, result: 'ok' });
             return;
           } catch (error) {
             lastError = error;
@@ -430,6 +434,7 @@ export class KafkaService {
                 await this.publishEvent(retryTopicFor(options.retryNamespace, originalTopic), key || 'unknown', envelope);
                 logger.warn({ topic: originalTopic, hop: hop + 1 }, 'Message moved to retry topic after transient failures');
                 await commit();
+                consumed.inc({ topic: originalTopic, result: 'retry' });
                 return;
               }
               break; // retry hops exhausted: dead-letter
@@ -462,6 +467,7 @@ export class KafkaService {
       failedAt: new Date().toISOString(),
       rawValue,
     });
+    consumed.inc({ topic, result: 'dlq' });
     logger.error({ topic, reason: failureReason }, 'Message routed to dead-letter topic');
   }
 

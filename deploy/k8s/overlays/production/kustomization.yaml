@@ -1,0 +1,138 @@
+# Production. Every value marked "placeholder" is environment data the platform team fills in (network ranges,
+# host names, broker addresses, registry); none of it is secret. Secrets come from the "banksphere"
+# ClusterSecretStore of the production cluster (components/external-secrets).
+#   kustomize build deploy/k8s/overlays/production
+# Release pipeline, before applying: pin every image by digest, e.g.
+#   (cd deploy/k8s/overlays/production && kustomize edit set image \
+#     banksphere/api-gateway=registry.example.com/banksphere/api-gateway@sha256:<digest> ...)
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: banksphere
+
+resources:
+  - ../../base
+
+components:
+  - ../../components/external-secrets
+  - ../../components/prometheus-operator
+
+labels:
+  - pairs:
+      banksphere.io/environment: production
+    includeSelectors: false
+    includeTemplates: true
+
+configMapGenerator:
+  - name: banksphere-common
+    behavior: merge
+    literals:
+      - STAFF_ALLOWED_CIDRS=10.9.0.0/16 # placeholder: the staff VPN / ZTNA egress range
+      - KAFKA_BROKERS=kafka-1.prod.banksphere.internal:9096,kafka-2.prod.banksphere.internal:9096,kafka-3.prod.banksphere.internal:9096 # placeholder
+  - name: web-config
+    behavior: merge
+    literals:
+      - TRUSTED_PROXY_CIDR=10.52.0.0/16 # placeholder: the ingress controller pods' CIDR
+      - RAZORPAY_CHECKOUT=on
+  - name: auth-service-config
+    behavior: merge
+    literals:
+      - STAFF_EMAIL_DOMAIN=banksphere.example.com # placeholder
+      - APP_BASE_URL=https://app.banksphere.example.com # placeholder
+      - SMTP_HOST=smtp.banksphere.example.com # placeholder
+      - MAIL_FROM=BankSphere <no-reply@banksphere.example.com>
+  - name: notification-service-config
+    behavior: merge
+    literals:
+      - SECURITY_ALERT_EMAIL=security-team@banksphere.example.com # placeholder
+      - SMTP_HOST=smtp.banksphere.example.com # placeholder
+      - MAIL_FROM=BankSphere <no-reply@banksphere.example.com>
+
+patches:
+  - path: patches/autoscaling.yaml
+  - path: patches/resources.yaml
+  # Public host name (placeholder) on both Ingresses
+  - target:
+      kind: Ingress
+    patch: |-
+      - op: replace
+        path: /spec/tls/0/hosts/0
+        value: app.banksphere.example.com
+      - op: replace
+        path: /spec/rules/0/host
+        value: app.banksphere.example.com
+  # Managed data stores' private subnets (placeholders; base uses TEST-NET ranges that route nowhere)
+  - target:
+      kind: NetworkPolicy
+      name: postgres-egress
+    patch: |-
+      - op: replace
+        path: /spec/egress/0/to/0/ipBlock/cidr
+        value: 10.50.0.0/24
+  - target:
+      kind: NetworkPolicy
+      name: kafka-egress
+    patch: |-
+      - op: replace
+        path: /spec/egress/0/to/0/ipBlock/cidr
+        value: 10.50.1.0/24
+  - target:
+      kind: NetworkPolicy
+      name: redis-security-egress
+    patch: |-
+      - op: replace
+        path: /spec/egress/0/to/0/ipBlock/cidr
+        value: 10.50.2.0/27
+  - target:
+      kind: NetworkPolicy
+      name: redis-edge-egress
+    patch: |-
+      - op: replace
+        path: /spec/egress/0/to/0/ipBlock/cidr
+        value: 10.50.2.32/27
+  - target:
+      kind: NetworkPolicy
+      name: redis-cache-egress
+    patch: |-
+      - op: replace
+        path: /spec/egress/0/to/0/ipBlock/cidr
+        value: 10.50.2.64/27
+
+# Placeholder registry and tag: the release pipeline replaces both with registry/name@sha256:<digest>
+images:
+  - name: banksphere/web
+    newName: registry.example.com/banksphere/web
+    newTag: set-by-release-pipeline
+  - name: banksphere/api-gateway
+    newName: registry.example.com/banksphere/api-gateway
+    newTag: set-by-release-pipeline
+  - name: banksphere/auth-service
+    newName: registry.example.com/banksphere/auth-service
+    newTag: set-by-release-pipeline
+  - name: banksphere/customer-service
+    newName: registry.example.com/banksphere/customer-service
+    newTag: set-by-release-pipeline
+  - name: banksphere/account-service
+    newName: registry.example.com/banksphere/account-service
+    newTag: set-by-release-pipeline
+  - name: banksphere/transaction-service
+    newName: registry.example.com/banksphere/transaction-service
+    newTag: set-by-release-pipeline
+  - name: banksphere/notification-service
+    newName: registry.example.com/banksphere/notification-service
+    newTag: set-by-release-pipeline
+  - name: banksphere/fraud-service
+    newName: registry.example.com/banksphere/fraud-service
+    newTag: set-by-release-pipeline
+  - name: banksphere/payment-service
+    newName: registry.example.com/banksphere/payment-service
+    newTag: set-by-release-pipeline
+  - name: banksphere/assistant-service
+    newName: registry.example.com/banksphere/assistant-service
+    newTag: set-by-release-pipeline
+  - name: banksphere/realtime-service
+    newName: registry.example.com/banksphere/realtime-service
+    newTag: set-by-release-pipeline
+  - name: banksphere/migrate
+    newName: registry.example.com/banksphere/migrate
+    newTag: set-by-release-pipeline

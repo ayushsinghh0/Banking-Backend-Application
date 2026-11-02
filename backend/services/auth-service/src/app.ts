@@ -31,6 +31,11 @@ import { AdminRequestService } from './services/admin-requests.service';
 import { createAuthRouter, AuthRateLimiters } from './routes/auth.routes';
 import { AuthSecurityStore, RedisAuthSecurityStore } from './services/auth-security.store';
 import { assertMfaEncryptionConfigured } from './services/totp';
+import { EdgeSecurityStore, InMemoryEdgeSecurityStore, RedisEdgeSecurityStore } from './services/edge-security.store';
+import { IpRuleService } from './services/ip-rules.service';
+import { AccountSecurityService } from './services/account-security.service';
+import { SecurityController } from './controllers/security.controller';
+import { startSecurityJobs } from './jobs';
 
 export interface AuthAppDeps {
   tokenState: TokenStateStore;
@@ -40,6 +45,8 @@ export interface AuthAppDeps {
   redis?: Redis;
   /** Evictable Redis for per-IP rate limits (omitted in unit tests) */
   rateLimitRedis?: Redis;
+  /** Edge Redis store shared with the gateway: bans, credential-stuffing counters, IP rules mirror (in memory when omitted) */
+  edge?: EdgeSecurityStore;
 }
 
 export function createApp(prisma: PrismaClient, deps: AuthAppDeps) {
@@ -48,14 +55,18 @@ export function createApp(prisma: PrismaClient, deps: AuthAppDeps) {
   const app = createBaseApp();
 
   const tokenService = new TokenService();
+  const edge = deps.edge ?? new InMemoryEdgeSecurityStore();
   const authService = new AuthService({
     prisma,
     tokenService,
     tokenState: deps.tokenState,
     security: deps.security,
     mailer: deps.mailer,
+    edge,
   });
   const authController = new AuthController(authService, new AdminRequestService(prisma, authService));
+  const ipRules = new IpRuleService(prisma, edge);
+  const securityController = new SecurityController(new AccountSecurityService(prisma, authService, ipRules));
   const auth = {
     authenticate: createAuthenticate(deps.tokenState),
     authenticateForEnrolment: createAuthenticate(deps.tokenState, { allowStaffWithoutMfa: true }),
@@ -78,7 +89,7 @@ export function createApp(prisma: PrismaClient, deps: AuthAppDeps) {
       }
     : undefined;
 
-  app.use('/api/v1/auth', createAuthRouter(authController, auth, limiters));
+  app.use('/api/v1/auth', createAuthRouter(authController, securityController, auth, limiters));
 
   if (isSwaggerEnabled()) {
     setupSwagger(app, {
@@ -104,6 +115,21 @@ export function createApp(prisma: PrismaClient, deps: AuthAppDeps) {
         '/api/v1/auth/me': { get: { summary: 'Current authenticated user' } },
         '/api/v1/auth/admin/users': { post: { summary: 'BANK_ADMIN only: create a user with an explicit role' } },
         '/api/v1/auth/admin/users/{userId}/status': { patch: { summary: 'BANK_ADMIN only: enable or disable a user' } },
+        '/api/v1/auth/sessions': { get: { summary: 'Own active sessions (devices), the current one first' } },
+        '/api/v1/auth/sessions/{sessionId}': { delete: { summary: 'Sign one of your sessions out (refresh and access tokens)' } },
+        '/api/v1/auth/sessions/revoke-others': { post: { summary: 'Sign out every session except this one' } },
+        '/api/v1/auth/security-events': { get: { summary: 'Own recent sign-in and security activity (?limit, max 50)' } },
+        '/api/v1/auth/admin/users/{userId}/sessions': { get: { summary: 'security:sessions:read:any - a user\'s active sessions (audited)' } },
+        '/api/v1/auth/admin/users/{userId}/sessions/{sessionId}': { delete: { summary: 'security:sessions:revoke:any - sign a user\'s session out (audited)' } },
+        '/api/v1/auth/admin/security-events': { get: { summary: 'security:events:read:any - ?type&userId&limit&cursor (audited)' } },
+        '/api/v1/auth/admin/ip-rules': {
+          get: { summary: 'security:ip-rules:read - active edge deny rules' },
+          post: { summary: 'security:ip-rules:write - {cidr, reason, expiresInMinutes?} (audited)' },
+        },
+        '/api/v1/auth/admin/ip-rules/{ruleId}': { delete: { summary: 'security:ip-rules:write - remove a rule (audited)' } },
+        '/api/v1/auth/admin/ip-bans': { get: { summary: 'security:ip-rules:read - active automatic bans' } },
+        '/api/v1/auth/admin/ip-bans/{ipKey}': { delete: { summary: 'security:ip-rules:write - lift a ban (audited)' } },
+        '/api/v1/auth/admin/audit/verify': { get: { summary: 'audit:verify - re-walk the audit hash chain' } },
       },
     });
   }
@@ -122,7 +148,7 @@ export function createApp(prisma: PrismaClient, deps: AuthAppDeps) {
   app.use(notFoundHandler);
   app.use(errorHandlerMiddleware);
 
-  return { app, prisma, authService };
+  return { app, prisma, authService, ipRules };
 }
 
 async function main(): Promise<void> {
@@ -135,13 +161,15 @@ async function main(): Promise<void> {
   const rateLimitRedis = await connectRedis(process.env.RATE_LIMIT_REDIS_URL || process.env.REDIS_URL);
   const mailer = createMailerFromEnv();
   const tokenState = new RedisTokenStateStore(redis);
-  const { app, authService } = createApp(prisma, {
+  const { app, authService, ipRules } = createApp(prisma, {
     tokenState,
     security: new RedisAuthSecurityStore(rateLimitRedis, redis),
     mailer,
     redis,
     rateLimitRedis,
+    edge: new RedisEdgeSecurityStore(rateLimitRedis),
   });
+  const stopSecurityJobs = startSecurityJobs(prisma, authService, ipRules);
 
   const { publisher, kafka } = createEventPublisher(process.env.KAFKA_CLIENT_ID || 'auth-service');
   const relay = publisher ? new OutboxRelay(prisma, publisher) : null;
@@ -153,6 +181,7 @@ async function main(): Promise<void> {
 
   startHttpServer(app, process.env.PORT || 8001, 'auth-service', [
     () => clearInterval(housekeeping),
+    () => stopSecurityJobs(),
     () => stopVersionSync(),
     () => relay?.stop(),
     () => authService.drainBackgroundTasks(),

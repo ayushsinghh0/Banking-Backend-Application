@@ -36,6 +36,8 @@ const TYPE_LABEL: Record<TransactionType, string> = {
   WITHDRAWAL: 'Cash withdrawal',
   TRANSFER: 'Transfer',
   CASH_TRANSFER: 'Cash transfer',
+  ONLINE_TOP_UP: 'Money added',
+  TOP_UP_REFUND: 'Top-up refunded',
 };
 
 /** What a statement line says: the description if there is one, otherwise the kind of transaction */

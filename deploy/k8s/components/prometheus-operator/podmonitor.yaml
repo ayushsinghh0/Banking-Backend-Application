@@ -1,0 +1,21 @@
+# Scrapes every Node service's metrics listener (container port "metrics", 9464) when Prometheus is run by the
+# prometheus-operator. A PodMonitor, not a ServiceMonitor: the metrics port is deliberately not on the Services,
+# and a ServiceMonitor would add a target label "service" that collides with the label every BankSphere series
+# already carries (the app's own `service`, which dashboards and alerts group by). The operator adds
+# namespace, pod and container target labels itself.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: banksphere
+  labels:
+    # The default podMonitorSelector of kube-prometheus-stack; change it to match your Prometheus
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      banksphere.io/runtime: node
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s
