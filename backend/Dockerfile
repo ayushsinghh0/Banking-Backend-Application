@@ -1,8 +1,11 @@
 # One Dockerfile for every service:  docker build --build-arg SERVICE=auth-service .
-# The "build" stage keeps dev tooling (Prisma CLI) and doubles as the migration runner image.
+# The "migrate" target keeps the dev tooling (Prisma CLI) and is the migration job image.
+# No shipped stage carries npm, npx, yarn or corepack: nothing needs a package manager at run time, and the
+# packages bundled inside npm (undici, brace-expansion, ...) are a recurring source of advisories.
 
-FROM node:24-alpine@sha256:44fce696f38ba8c987c4db89954051000bbd05ffd8d8659ba15ed4a8602e937f AS build
-RUN apk add --no-cache openssl
+FROM node:24-alpine@sha256:8a32c8cf649a49915a66e81e7a609223c708d0adabf288ee3f4077d765542f85 AS build
+# Alpine publishes fixes more often than the base image is rebuilt: upgrade its packages at build time
+RUN apk upgrade --no-cache && apk add --no-cache openssl
 WORKDIR /app
 ENV CI=true
 COPY package.json package-lock.json tsconfig.json ./
@@ -26,8 +29,15 @@ RUN npm run build
 FROM build AS prune
 RUN npm prune --omit=dev --no-audit --no-fund
 
-FROM node:24-alpine@sha256:44fce696f38ba8c987c4db89954051000bbd05ffd8d8659ba15ed4a8602e937f AS runtime
-RUN apk add --no-cache openssl
+# Migration job: the build stage without the package manager (the job runs node_modules/.bin/prisma directly)
+FROM build AS migrate
+RUN rm -rf /usr/local/lib/node_modules /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack \
+    /usr/local/bin/yarn /usr/local/bin/yarnpkg /opt/yarn*
+
+FROM node:24-alpine@sha256:8a32c8cf649a49915a66e81e7a609223c708d0adabf288ee3f4077d765542f85 AS runtime
+RUN apk upgrade --no-cache && apk add --no-cache openssl \
+    && rm -rf /usr/local/lib/node_modules /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack \
+       /usr/local/bin/yarn /usr/local/bin/yarnpkg /opt/yarn*
 ENV NODE_ENV=production
 WORKDIR /app
 COPY --from=prune --chown=root:root /app/node_modules ./node_modules

@@ -129,8 +129,8 @@ jobs:
           - { image: realtime-service, context: backend, service: realtime-service }
           # Development and e2e only; built so it cannot rot, never deployed to production
           - { image: razorpay-simulator, context: backend, service: razorpay-simulator }
-          # The build stage keeps the Prisma CLI and doubles as the migration job image
-          - { image: migrate, context: backend, target: build }
+          # Migration job image: the build stage (Prisma CLI) without the package manager
+          - { image: migrate, context: backend, target: migrate }
           - { image: web, context: frontend }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

@@ -56,7 +56,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: migrate
-          # backend/Dockerfile target "build" (it keeps the Prisma CLI); the release pipeline pins it by digest
+          # backend/Dockerfile target "migrate" (the Prisma CLI, no package manager); the release pipeline pins it by digest
           image: banksphere/migrate
           imagePullPolicy: IfNotPresent
           workingDir: /app

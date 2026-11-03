@@ -343,7 +343,7 @@ services:
 
   # One-shot job: applies every service's migrations as that schema's OWNER role
   migrate:
-    build: { context: ., target: build }
+    build: { context: ., target: migrate }
     networks: [backend]
     environment:
       AUTH_URL: postgresql://auth_owner:${AUTH_DB_OWNER_PASSWORD}@postgres:5432/${POSTGRES_DB:-banksphere}?schema=auth_schema
@@ -364,7 +364,7 @@ services:
           echo "Migrating $$svc-service"
           # A few retries ride out a database that is still starting or restarting
           n=1
-          until (cd services/$$svc-service && DATABASE_URL="$$(printenv $$var)" npx prisma migrate deploy); do
+          until (cd services/$$svc-service && DATABASE_URL="$$(printenv $$var)" /app/node_modules/.bin/prisma migrate deploy); do
             if [ $$n -ge 5 ]; then echo "Migrating $$svc-service failed after $$n attempts" >&2; exit 1; fi
             echo "Migrating $$svc-service failed (attempt $$n), retrying in 5s" >&2
             n=$$((n + 1)); sleep 5

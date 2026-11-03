@@ -1,7 +1,7 @@
 # BankSphere web app: static build served by an unprivileged nginx that also proxies /api to the gateway.
 #   docker build -t banksphere-web ./frontend
 
-FROM node:24-alpine@sha256:44fce696f38ba8c987c4db89954051000bbd05ffd8d8659ba15ed4a8602e937f AS build
+FROM node:24-alpine@sha256:8a32c8cf649a49915a66e81e7a609223c708d0adabf288ee3f4077d765542f85 AS build
 WORKDIR /app
 ENV CI=true
 COPY package.json package-lock.json ./
@@ -9,7 +9,14 @@ RUN npm ci --no-audit --no-fund
 COPY . .
 RUN npm run build
 
-FROM nginxinc/nginx-unprivileged:1.27-alpine@sha256:65e3e85dbaed8ba248841d9d58a899b6197106c23cb0ff1a132b7bfe0547e4c0 AS runtime
+# The slim variant: no curl and none of the geoip, image-filter, xslt and njs modules. The configuration loads
+# no module, and those packages carried most of the image's advisories.
+FROM nginxinc/nginx-unprivileged:1.31-alpine-slim@sha256:a8cb0f33d51fa107c96fd2bd3a71aaf564ec131e9d2bdf8700944f0ed8b170d7 AS runtime
+# Alpine publishes fixes more often than the base image is rebuilt: upgrade its packages (apk needs root)
+USER root
+RUN apk upgrade --no-cache
+# nginx runs as the unprivileged uid 101; stated here so the guarantee does not depend on the base image
+USER 101
 # Templates are rendered into conf.d at start-up (mounted as tmpfs when the filesystem is read-only)
 COPY nginx/default.conf.template /etc/nginx/templates/default.conf.template
 COPY nginx/security-headers.conf /etc/nginx/snippets/security-headers.conf
