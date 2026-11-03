@@ -1,0 +1,133 @@
+# Web app: the SPA plus the same-origin /api proxy (frontend/Dockerfile, unprivileged nginx, uid 101).
+# The only workload the ingress controller may reach. It has no metrics listener: request metrics come from the
+# gateway and the ingress controller.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: web
+  labels:
+    app.kubernetes.io/name: web
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  labels:
+    app.kubernetes.io/name: web
+    app.kubernetes.io/component: web
+    banksphere.io/runtime: nginx
+spec:
+  # No spec.replicas: the HorizontalPodAutoscaler owns the count, and a value here would reset it on every apply
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: web
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: web
+        app.kubernetes.io/component: web
+        banksphere.io/runtime: nginx
+    spec:
+      serviceAccountName: web
+      # nginx closes idle keep-alive connections on SIGQUIT (the image's stop signal) and waits for requests in
+      # flight; SSE streams it proxies are cut at the end of the grace period and the browser reconnects
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsUser: 101
+        runAsGroup: 101
+      containers:
+        - name: app
+          image: banksphere/web
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: web-config
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 2
+            failureThreshold: 15
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2
+          volumeMounts:
+            # The image renders its config template into conf.d at start-up and caches upstream responses
+            - name: nginx-cache
+              mountPath: /var/cache/nginx
+            - name: nginx-conf
+              mountPath: /etc/nginx/conf.d
+      volumes:
+        - name: nginx-cache
+          emptyDir:
+            sizeLimit: 64Mi
+        - name: nginx-conf
+          emptyDir:
+            sizeLimit: 1Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  labels:
+    app.kubernetes.io/name: web
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: web
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web
+  labels:
+    app.kubernetes.io/name: web
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web
+  minReplicas: 2
+  maxReplicas: 3
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: web
+  labels:
+    app.kubernetes.io/name: web
+spec:
+  maxUnavailable: 1
+  # A crash-looping pod must never block a node drain
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: web

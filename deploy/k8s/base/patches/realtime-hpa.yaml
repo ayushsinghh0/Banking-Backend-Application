@@ -1,0 +1,15 @@
+# Removing a realtime pod drops every stream it holds and all those browsers reconnect at once (to the
+# remaining pods, through the gateway and auth checks). Scale down one pod at a time, after 15 calm minutes.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: realtime-service
+spec:
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 900
+      selectPolicy: Min
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 180

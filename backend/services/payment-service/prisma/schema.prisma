@@ -1,0 +1,171 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../generated/client"
+}
+
+// Closed state machine; the allowed transitions live in src/domain/status.ts
+enum PaymentStatus {
+  CREATED
+  PENDING
+  CAPTURED
+  CREDITED
+  CREDIT_BLOCKED
+  REFUND_PENDING
+  REFUNDED
+  CANCELLED
+  FAILED
+  EXPIRED
+}
+
+enum OutboxStatus {
+  PENDING
+  PUBLISHED
+  FAILED
+}
+
+enum WebhookStatus {
+  RECEIVED
+  PROCESSED
+  IGNORED
+  FAILED
+}
+
+// One customer top-up = one Razorpay order. Every status change is a compare-and-set on (status, version)
+// that also appends to payment_status_history and writes a payment.updated.v1 outbox event.
+model PaymentOrder {
+  id                        String        @id @default(uuid()) // the top-up id; also the Razorpay receipt
+  customerId                String        @map("customer_id")
+  accountId                 String        @map("account_id")
+  accountNumberLast4        String        @map("account_number_last4")
+  amountPaise               BigInt        @map("amount_paise")
+  currency                  String        @default("INR")
+  status                    PaymentStatus @default(CREATED)
+  version                   Int           @default(0)
+  // Idempotency-Key of the create request, unique per customer, and a hash of the request it belongs to
+  idempotencyKey            String        @map("idempotency_key")
+  requestHash               String        @map("request_hash")
+  method                    String?
+  providerOrderId           String        @unique @map("provider_order_id")
+  providerPaymentId         String?       @unique @map("provider_payment_id")
+  // What Razorpay actually captured: the credit is refused unless it equals amount/currency above
+  capturedAmountPaise       BigInt?       @map("captured_amount_paise")
+  capturedCurrency          String?       @map("captured_currency")
+  failureReason             String?       @map("failure_reason")
+  ledgerTransactionId       String?       @map("ledger_transaction_id")
+  // Refund saga (bank-initiated): a new refund id per attempt keys the ledger debit and the Razorpay refund
+  refundId                  String?       @unique @map("refund_id")
+  refundReason              String?       @map("refund_reason")
+  refundRequestedBy         String?       @map("refund_requested_by")
+  refundRequestKey          String?       @map("refund_request_key")
+  refundRequestedAt         DateTime?     @map("refund_requested_at")
+  refundLedgerTransactionId String?       @map("refund_ledger_transaction_id")
+  providerRefundId          String?       @unique @map("provider_refund_id")
+  refundFailureReason       String?       @map("refund_failure_reason")
+  expiresAt                 DateTime      @map("expires_at")
+  capturedAt                DateTime?     @map("captured_at")
+  creditedAt                DateTime?     @map("credited_at")
+  refundedAt                DateTime?     @map("refunded_at")
+  // Last time the reconciler asked Razorpay about this order (bookkeeping only)
+  reconciledAt              DateTime?     @map("reconciled_at")
+  createdAt                 DateTime      @default(now()) @map("created_at")
+  updatedAt                 DateTime      @updatedAt @map("updated_at")
+
+  history PaymentStatusHistory[]
+
+  @@unique([customerId, idempotencyKey])
+  @@index([customerId, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([status, createdAt])
+  @@index([status, updatedAt])
+  @@index([createdAt])
+  @@map("payment_orders")
+}
+
+// Append-only (UPDATE/DELETE/TRUNCATE refused by trigger and REVOKE)
+model PaymentStatusHistory {
+  id         String         @id @default(uuid())
+  topUpId    String         @map("top_up_id")
+  fromStatus PaymentStatus? @map("from_status")
+  toStatus   PaymentStatus  @map("to_status")
+  // customer | confirm | webhook | reconciler | admin | system
+  source     String
+  actorId    String?        @map("actor_id")
+  reason     String?
+  createdAt  DateTime       @default(now()) @map("created_at")
+
+  order PaymentOrder @relation(fields: [topUpId], references: [id], onDelete: Restrict)
+
+  @@index([topUpId, createdAt])
+  @@map("payment_status_history")
+}
+
+// Razorpay webhook inbox: the event id is the dedupe key, so a redelivered or replayed event is applied once
+model WebhookEvent {
+  id          String        @id // X-Razorpay-Event-Id
+  eventType   String        @map("event_type")
+  payloadHash String        @map("payload_hash")
+  status      WebhookStatus @default(RECEIVED)
+  attempts    Int           @default(1)
+  lastError   String?       @map("last_error")
+  receivedAt  DateTime      @default(now()) @map("received_at")
+  processedAt DateTime?     @map("processed_at")
+
+  @@index([status, receivedAt])
+  @@map("webhook_events")
+}
+
+// Transactional Outbox for reliable Kafka event publishing (same shape as every other service)
+model OutboxEvent {
+  id            String       @id @default(uuid())
+  seq           BigInt       @default(autoincrement())
+  aggregateType String       @map("aggregate_type")
+  aggregateId   String       @map("aggregate_id")
+  eventType     String       @map("event_type")
+  payload       Json
+  status        OutboxStatus @default(PENDING)
+  retryCount    Int          @default(0) @map("retry_count")
+  lastError     String?      @map("last_error")
+  nextAttemptAt DateTime?    @map("next_attempt_at")
+  lockedUntil   DateTime?    @map("locked_until")
+  lockedBy      String?      @map("locked_by")
+  createdAt     DateTime     @default(now()) @map("created_at")
+  publishedAt   DateTime?    @map("published_at")
+
+  @@unique([seq])
+  @@index([status, nextAttemptAt, createdAt])
+  @@index([aggregateId, status, seq])
+  @@map("outbox_events")
+}
+
+// Leader election for periodic jobs across replicas (see acquireJobLease in @banksphere/common)
+model JobLease {
+  name      String   @id
+  holder    String
+  expiresAt DateTime @map("expires_at")
+
+  @@map("job_leases")
+}
+
+// Tamper-evident, append-only audit trail: refunds, reconciliations, blocked credits.
+// hash = sha256(prev_hash || canonical JSON of the record), appended under an advisory lock.
+model AuditLog {
+  id        String   @id @default(uuid())
+  seq       BigInt   @default(autoincrement())
+  actorId   String   @map("actor_id")
+  action    String
+  targetId  String?  @map("target_id")
+  details   Json?
+  createdAt DateTime @default(now()) @map("created_at")
+  prevHash  String   @map("prev_hash")
+  hash      String
+
+  @@unique([seq])
+  @@unique([hash])
+  @@index([actorId, createdAt])
+  @@index([action, targetId, createdAt])
+  @@map("audit_log")
+}

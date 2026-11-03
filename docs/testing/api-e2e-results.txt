@@ -1,0 +1,231 @@
+BankSphere E2E against http://localhost:8080 (run 1fccd936)
+
+Administrators: MFA & four-eyes staff onboarding
+  ✔ MFA: with MFA enrolled, the password alone only returns a challenge (no tokens)
+  ✔ MFA: a wrong code is rejected
+  ✔ staff creation never accepts an administrator-chosen password (400)
+  ✔ staff accounts must use the bank email domain (400 STAFF_EMAIL_DOMAIN)
+  ✔ creating a staff user only records a PENDING request (202)
+  ✔ ...no account exists yet
+  ✔ FOUR-EYES: the requesting administrator cannot approve their own request (403)
+  ✔ a second administrator can reject it
+  ✔ a rejected request can never be approved (409)
+  ✔ FOUR-EYES: the administrator a request is about cannot reject it (403)
+  ✔ ...the requester can withdraw it
+  ✔ approved by a second admin -> activation email -> staff sets own password -> MFA enrolled
+  ✔ activation link is single-use
+  ✔ KYC officer and two fraud analysts onboarded the same way
+  ✔ DIRECTORY: administrators find staff by email, with no secrets in the response
+  ✔ ...and by id, filtered by role
+  ✔ ...tellers cannot list users (403)
+  ✔ MFA REPLAY: an already-used TOTP code cannot be used again
+
+Registration & email verification
+  ✔ self-registration with role=BANK_ADMIN is rejected (400)
+  ✔ weak password is rejected (400)
+  ✔ registration answers 202 without issuing tokens
+  ✔ login before verifying email is refused (403 EMAIL_NOT_VERIFIED)
+  ✔ ENUMERATION: registering an existing email gives the identical 202 response
+  ✔ STAFF DOMAIN: public sign-up with a staff address answers the same 202 but creates nothing
+  ✔ ...so a real staff request for that address is not blocked (202)
+  ✔ ...and the owner gets a "sign-up attempt" notice instead
+  ✔ verification email delivered over SMTP (text + HTML) with a #token= link
+  ✔ forged verification token is rejected (400)
+  ✔ valid verification token verifies the email
+  ✔ verification token is single-use
+
+Sessions, revocation & brute force
+  ✔ spoofed x-user-id/x-user-role headers without a token are rejected (401)
+  ✔ alg=none forged JWT is rejected (401)
+  ✔ GET /auth/me returns the caller
+  ✔ refresh rotates the refresh token
+  ✔ a second tab refreshing the just-rotated token gets a retryable 409 (session survives)
+  ✔ replaying a rotated refresh token later is token theft (401)
+  ✔ reuse detection revoked the whole family
+  ✔ ...and every access token of that session stopped working at once
+  ✔ 5 concurrent refreshes of one token: exactly one succeeds, the rest get 409
+  ✔ REVOCATION: the access token is rejected right after logout (on another service)
+  ✔ refresh token is dead after logout
+  ✔ LOCKOUT: after 5 wrong passwords even the right one is refused (429), spoofed X-Forwarded-For does not help
+  ✔ ENUMERATION: unknown emails lock out identically
+
+Forgot / reset / change password, customer MFA
+  ✔ ENUMERATION: forgot-password answers identically for known and unknown emails
+  ✔ reset email delivered with a #token= link
+  ✔ reset with a weak password is rejected (400)
+  ✔ reset with a valid token succeeds
+  ✔ reset token is single-use
+  ✔ REVOCATION: access tokens issued before the reset are rejected
+  ✔ refresh tokens issued before the reset are rejected
+  ✔ old password no longer works; new one does (and the lockout was cleared)
+  ✔ "password changed" security notice emailed
+  ✔ change-password requires the current password (403 INVALID_PASSWORD, never 401)
+  ✔ ...and a mistyped password does not end the session
+  ✔ change-password succeeds and returns fresh tokens
+  ✔ ...the previous access token is revoked
+  ✔ MFA setup requires re-entering the password (403 INVALID_PASSWORD)
+  ✔ customer can opt in to MFA (no enrolment token needed for customers)
+  ✔ customer with MFA: password alone is not enough
+  ✔ "two-factor enabled" notice emailed
+
+Browser sessions (HttpOnly refresh cookie)
+  ✔ COOKIE SESSION: login sets an HttpOnly, Secure, SameSite=Strict refresh cookie scoped to /api/v1/auth
+  ✔ ...and the refresh token is never in the response body
+  ✔ COOKIE SESSION: refreshing with the cookie returns only {accessToken, expiresInSeconds} and rotates the cookie
+  ✔ COOKIE SESSION: the header without a cookie means no session (401)
+  ✔ COOKIE SESSION: logout clears the cookie
+  ✔ ...and the cookie can no longer refresh (401)
+
+Customer profiles & KYC (KYC officers only)
+  ✔ customer can create own profile
+  ✔ KYC: account opening is refused until KYC is verified (403 KYC_NOT_VERIFIED)
+  ✔ customer cannot self-verify KYC (403)
+  ✔ SEPARATION OF DUTIES: an administrator cannot decide KYC (403)
+  ✔ PROFILE: a future date of birth is refused (400)
+  ✔ PROFILE: names with hidden direction-override characters are refused (400)
+  ✔ KYC QUEUE: officers list pending customers, including the new profile
+  ✔ ...tellers and customers cannot list customers (403)
+  ✔ ...customers still read their own profile at /customers/me
+  ✔ STALE REVIEW: a decision on a profile changed after it was reviewed is refused (409 PROFILE_CHANGED)
+  ✔ KYC officer verifies KYC on the current version
+  ✔ profile read reflects KYC update (cache invalidated)
+  ✔ KYC BYPASS: changing the name after verification sends KYC back to PENDING
+  ✔ KYC history records the approval and the identity change
+
+Accounts & ledger provisioning
+  ✔ customer cannot open an account with an excessive daily limit
+  ✔ accounts created with 12-digit numbers
+  ✔ ledger account provisioned and active (balance 0)
+  ✔ IDOR: bob cannot read alice's account (404)
+  ✔ ACCOUNT LOOKUP: a teller finds an account by number (id, number, owner, type and status only)
+  ✔ ...customers cannot use the lookup (403)
+  ✔ ...an unknown number is 404 and a malformed one 400
+  ✔ IDOR: bob cannot read alice's balance (404)
+  ✔ KAFKA: account.created.v1 -> welcome email to the real owner, account number masked
+
+Teller cash (sessions, drawer, customer withdrawal codes, maker-checker)
+  ✔ customer cannot deposit (mint money) (403)
+  ✔ SEPARATION OF DUTIES: an administrator cannot handle cash (403, tellers only)
+  ✔ a teller without an open session cannot handle cash (409 NO_TELLER_SESSION)
+  ✔ a teller cannot issue their own float (403)
+  ✔ DUAL CONTROL: a supervisor issues the opening float (ISSUED, nothing booked yet)
+  ✔ ...no cash can be handled before the teller accepts it (409)
+  ✔ BLIND FLOAT: the teller sees the ISSUED session without the issued amount or the drawer account
+  ✔ ...the current-session endpoint is for tellers only (403)
+  ✔ ...the teller must count exactly the issued float (409 FLOAT_MISMATCH)
+  ✔ the teller counts and accepts the float: booked vault -> drawer, session OPEN
+  ✔ only one session per teller per day (409)
+  ✔ ...after accepting, the teller sees the float they counted
+  ✔ DRAWER PRIVACY: a teller cannot read their own drawer balance (404)
+  ✔ ...a supervisor can
+  ✔ teller deposit within the single-approval limit executes immediately (201)
+  ✔ alice balance = 100000
+  ✔ KAFKA: transaction.completed.v1 -> credit alert email to alice
+  ✔ customer cannot use the teller withdrawal (403)
+  ✔ a teller withdrawal without the customer code is rejected (400)
+  ✔ a guessed code is rejected (403 WITHDRAWAL_NOT_AUTHORISED)
+  ✔ only the account owner can authorise a withdrawal (bob on alice's account: 404)
+  ✔ customer generates a one-time 8-digit withdrawal code for an exact amount
+  ✔ ...and is told by email that a cash withdrawal code was created
+  ✔ a large withdrawal code needs a recent TOTP check (403 STEP_UP_REQUIRED)
+  ✔ the code is bound to the amount (403 for a different amount)
+  ✔ teller withdrawal with the customer code executes (201)
+  ✔ the withdrawal code is single-use (403)
+  ✔ alice balance = 80000
+  ✔ MINTING: a deposit above Rs 2 lakh is only recorded as PENDING_APPROVAL (202)
+  ✔ ...and has not moved any money yet
+  ✔ MAKER-CHECKER: the teller cannot approve (403)
+  ✔ supervisor sees the pending request
+  ✔ a session with unresolved approvals cannot be closed (409)
+  ✔ a supervisor approves -> executed against the teller drawer (201)
+  ✔ ...now the money arrived
+  ✔ an executed request cannot be approved twice (409)
+
+Transfers: beneficiaries, step-up, races
+  ✔ THEFT: bob cannot transfer out of alice's account
+  ✔ STAFF THEFT: an administrator cannot transfer out of a customer's account (403)
+  ✔ transfer without Idempotency-Key is rejected (400)
+  ✔ insufficient funds is checked first, before anything about the payee (422 INSUFFICIENT_FUNDS)
+  ✔ ENUMERATION: an unregistered destination gets BENEFICIARY_REQUIRED whether or not it exists
+  ✔ ORACLE: probing with an account you do not own reveals nothing (404)
+  ✔ PAYEE CONTROL: money can only go to a registered beneficiary (422 BENEFICIARY_REQUIRED)
+  ✔ ...but moving money between the customer's own accounts needs no beneficiary
+  ✔ a beneficiary added without MFA only activates after a cooling-off period
+  ✔ alice enrols MFA
+  ✔ ...a beneficiary added from an MFA session is active immediately
+  ✔ PAYEE NOTICE: the customer is emailed whenever a payee is added (account number masked)
+  ✔ DOUBLE SPEND: 10 concurrent requests with one Idempotency-Key move money once
+  ✔ reusing a key with a different payload is rejected (422)
+  ✔ keys are per-user: bob's identical key is evaluated on its own (alice is still cooling off: 422)
+  ✔ STEP-UP: a transfer of Rs 1 lakh or more needs an MFA session (403 STEP_UP_REQUIRED)
+  ✔ NEW PAYEE CAP: at most Rs 50,000 to a new beneficiary in its first 24h (422)
+  ✔ OVERDRAFT RACE: every losing request gets a clean 422 (no 5xx under contention)
+  ✔ OVERDRAFT RACE: 30 concurrent transfers -> 10 succeeded (expected 10), balance never negative
+  ✔ money is conserved (alice + bob = deposits - withdrawals)
+  ✔ history pagination is clamped (limit 100, offset capped)
+
+Daily limit, freeze, fraud (four-eyes triage)
+  ✔ customer can lower their own daily limit
+  ✔ teller withdrawal over the daily limit is rejected (422 DAILY_LIMIT_EXCEEDED)
+  ✔ BANK CEILING: a limit set by an administrator becomes a ceiling
+  ✔ ...the owner cannot raise the limit back above it (403)
+  ✔ ...but can still lower it
+  ✔ customer can freeze own account
+  ✔ frozen account cannot send money (ledger enforced)
+  ✔ a frozen account cannot receive either (generic INVALID_DESTINATION)
+  ✔ customer cannot unfreeze (403)
+  ✔ BANK HOLD: an administrator can place a hold on an account its owner already froze
+  ✔ ...and cannot lift that hold themselves (403)
+  ✔ admin can unfreeze
+  ✔ KAFKA: account.status.changed.v1 -> freeze notice email
+  ✔ account with balance cannot be closed (409, decided by the ledger)
+  ✔ STEP-UP: a wrong code is refused (400)
+  ✔ STEP-UP: re-verifying TOTP returns a short-lived step-up token for the same session
+  ✔ high-value transfer (Rs 2.5 lakh, fresh step-up) succeeds within the raised limit
+  ✔ per-customer daily outflow cap (Rs 5 lakh across accounts) is enforced
+  ✔ KAFKA: fraud-service flagged BOTH sides of the high-value transfer (outbound + inbound)
+  ✔ a teller cannot read fraud alerts (403)
+  ✔ TRIAGE: administrators can read alerts but only fraud analysts can change them (403)
+  ✔ FOUR-EYES: one analyst can only PROPOSE closing a HIGH alert
+  ✔ ...the same analyst cannot confirm their own proposal (409)
+  ✔ ...a second analyst confirms and the alert is closed
+  ✔ alert triage is attributed to both analysts in the history
+  ✔ KAFKA: the fraud alert reached the security team by email (via outbox)
+
+Teller close-out & supervisor sign-off
+  ✔ BLIND COUNT: the teller closes without ever seeing the expected figure
+  ✔ a closed session handles no more cash (409)
+  ✔ the teller cannot sign off their own session (403)
+  ✔ RECOUNT: until sign-off the teller may correct their declared count
+  ✔ BLIND SIGN-OFF: the supervisor's list hides the teller's declared and expected figures until reconciliation
+  ✔ BLIND COUNT: the supervisor's own count must match the teller's (409 COUNT_MISMATCH)
+  ✔ sign-off returns the cash to the vault and posts the Rs 5 shortage to suspense (RECONCILED)
+  ✔ the drawer is back to zero: a new float can be issued tomorrow
+
+Staff-only data, admin controls & internal API
+  ✔ customer cannot read fraud alerts (403)
+  ✔ customer cannot read notification logs (403)
+  ✔ admin can audit notification logs
+  ✔ an administrator cannot disable themselves (403)
+  ✔ admin freezes a suspicious account
+  ✔ DUAL CONTROL: the admin who froze it cannot unfreeze it (403)
+  ✔ ...a different admin can
+  ✔ removing a customer's MFA is only a four-eyes request (202)
+  ✔ admin can suspend a customer directly
+  ✔ REVOCATION: a disabled user is locked out immediately
+  ✔ disabled user cannot log in
+  ✔ DUAL CONTROL: the admin who disabled a customer cannot re-enable them (403)
+  ✔ ...a different admin can
+  ✔ disabling a STAFF account only creates a four-eyes request (202)
+  ✔ ...the teller still works until it is approved
+  ✔ ...a second administrator approves
+  ✔ REVOCATION: the disabled teller is locked out immediately
+  ✔ internal API is not reachable through the gateway (404)
+  ✔ public gateway health does not reveal the internal service map
+  ✔ gateway liveness endpoint
+
+Global
+  ✔ no request in the whole run returned a 5xx
+
+201 passed, 0 failed
+

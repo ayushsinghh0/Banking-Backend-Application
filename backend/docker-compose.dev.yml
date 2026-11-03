@@ -1,0 +1,132 @@
+# Local development overlay:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+# - publishes Postgres, Redis and Kafka on 127.0.0.1 so services can also run natively (npm start)
+#   (they join an extra non-internal `devhost` network, because the production `backend` network is
+#   internal-only and cannot publish ports)
+# - adds Mailpit, a local SMTP server that captures every email (web UI: http://localhost:8025)
+# - relaxes the gateway and auth per-IP limits so the e2e suite can be re-run
+# Never use this overlay in production.
+
+networks:
+  devhost: {}
+
+# Hardened runtime for dev-only helper containers built from the backend image
+x-dev-app: &dev-app
+  restart: unless-stopped
+  init: true
+  read_only: true
+  tmpfs: [/tmp]
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
+  mem_limit: 192m
+
+services:
+  postgres:
+    networks: [backend, devhost]
+    ports: ["127.0.0.1:5432:5432"]
+
+  redis:
+    networks: [backend, devhost]
+    # 6380 on the host so it does not clash with a locally installed Redis
+    ports: ["127.0.0.1:${DEV_REDIS_PORT:-6380}:6379"]
+
+  redis-ratelimit:
+    networks: [apps, devhost]
+    ports: ["127.0.0.1:${DEV_RATE_LIMIT_REDIS_PORT:-6381}:6379"]
+
+  redis-cache:
+    networks: [backend, devhost]
+    ports: ["127.0.0.1:${DEV_CACHE_REDIS_PORT:-6382}:6379"]
+
+  pgbouncer:
+    networks: [backend, devhost]
+    ports: ["127.0.0.1:${DEV_PGBOUNCER_PORT:-6432}:6432"]
+
+  # Razorpay stand-in so top-ups work end to end without a Razorpay account or the internet. payment-service
+  # reports mode "simulator" and the web app shows a clearly labelled test checkout. Never deployed.
+  razorpay-simulator:
+    <<: *dev-app
+    build: { context: ., args: { SERVICE: razorpay-simulator } }
+    networks: [backend]
+    environment:
+      NODE_ENV: development
+      PORT: 8010
+      RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID}
+      RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET}
+      RAZORPAY_WEBHOOK_SECRET: ${RAZORPAY_WEBHOOK_SECRET}
+      SIM_WEBHOOK_URL: http://payment-service:8007/api/v1/payments/webhooks/razorpay
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8010/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  payment-service:
+    environment:
+      RAZORPAY_API_BASE: http://razorpay-simulator:8010
+      # Simulator mode exists only outside production; JSON logs like every other container
+      NODE_ENV: development
+      LOG_PRETTY: "false"
+    depends_on:
+      razorpay-simulator: { condition: service_healthy }
+
+  kafka:
+    networks: [backend, devhost]
+    ports: ["127.0.0.1:9092:9092"]
+    environment:
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://127.0.0.1:9092
+
+  mailpit:
+    image: axllent/mailpit:v1.21@sha256:81370195cd4a0eab9604d17c2617a7525b0486f9365555253b6c5376c6350f1a
+    restart: unless-stopped
+    networks: [backend, devhost]
+    ports:
+      - "127.0.0.1:1025:1025"
+      - "127.0.0.1:8025:8025"
+    environment:
+      MP_MAX_MESSAGES: 5000
+
+  api-gateway:
+    environment:
+      # Relaxed so the e2e and load suites can be re-run back to back from one address (production defaults:
+      # 600/min per IP, 300/min per user, 30/min money writes, 20/min assistant messages)
+      GATEWAY_RATE_LIMIT_PER_MINUTE: "5000"
+      GATEWAY_RATE_IP: "100000/min"
+      GATEWAY_BURST_IP: "20000"
+      GATEWAY_RATE_USER: "20000/min"
+      GATEWAY_BURST_USER: "5000"
+      GATEWAY_RATE_MONEY_WRITE: "2000/min"
+      GATEWAY_BURST_MONEY_WRITE: "500"
+      GATEWAY_RATE_ASSISTANT: "600/min"
+      GATEWAY_BURST_ASSISTANT: "100"
+
+  assistant-service:
+    environment:
+      ASSISTANT_MESSAGES_PER_MINUTE: "600"
+
+  auth-service:
+    environment:
+      # Relaxed per-IP limits so the e2e suite can be re-run locally (production: 30 / 10 per 15 min)
+      AUTH_RATE_LIMIT_MAX: "500"
+      AUTH_RECOVERY_RATE_LIMIT_MAX: "500"
+      SMTP_HOST: mailpit
+      SMTP_PORT: 1025
+      SMTP_SECURE: "false"
+      SMTP_REQUIRE_TLS: "false"
+    depends_on:
+      mailpit: { condition: service_started }
+
+  transaction-service:
+    environment:
+      # Lets a just-enrolled authenticator count for step-up so the e2e suite can test instant flows
+      # (production: a factor must be 24h old before it can authorise large transfers or instant payees)
+      MFA_FACTOR_MIN_AGE_HOURS: "0"
+
+  notification-service:
+    environment:
+      SMTP_HOST: mailpit
+      SMTP_PORT: 1025
+      SMTP_SECURE: "false"
+      SMTP_REQUIRE_TLS: "false"
+    depends_on:
+      mailpit: { condition: service_started }

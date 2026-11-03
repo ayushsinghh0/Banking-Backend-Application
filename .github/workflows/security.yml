@@ -1,0 +1,230 @@
+# Security gates: static analysis, dependency advisories, committed secrets, and vulnerabilities and
+# misconfigurations in the repository, the rendered Kubernetes manifests and the shipped images.
+# Runs on every change and weekly, so new advisories against unchanged code surface without a commit.
+# Findings are uploaded to code scanning (SARIF), one category per tool and image.
+#
+# Gate policy: HIGH and CRITICAL findings fail the run when a fix exists (--ignore-unfixed for
+# vulnerabilities): they are actionable now, and a bank should not ship a known, fixable high-severity flaw.
+# Unfixed and lower-severity findings are still reported to code scanning for triage. Reviewed exceptions
+# live in .github/trivyignore.yaml and .github/gitleaks.toml, each scoped to a path and justified.
+
+name: Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "23 2 * * 1" # Mondays 02:23 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "24"
+  # Tools run from their official images, pinned by digest (no third-party action wrappers)
+  GITLEAKS_IMAGE: ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+  TRIVY_IMAGE: aquasec/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c
+  KUSTOMIZE_IMAGE: registry.k8s.io/kustomize/kustomize:v5.8.3@sha256:429eda4a1c76a7de458d0c4ca3ded9b5d764899ff6bdaeccc1d98b1b6ee873e4
+
+jobs:
+  codeql:
+    name: CodeQL (JavaScript and TypeScript)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+      actions: read # workflow run metadata, needed by CodeQL in private repositories
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          languages: javascript-typescript
+          build-mode: none
+          queries: security-extended
+          # Test code deliberately contains hard-coded credentials, forged tokens and hostile input
+          config: |
+            paths-ignore:
+              - "**/tests/**"
+              - "**/*.test.ts"
+              - "**/*.test.tsx"
+              - frontend/e2e
+              - loadtest
+      - uses: github/codeql-action/analyze@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          category: /language:javascript-typescript
+
+  dependency-audit:
+    name: npm audit (${{ matrix.project }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        project: [backend, frontend]
+    defaults:
+      run:
+        working-directory: ${{ matrix.project }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      # Reads the lockfile only (nothing is installed): any advisory against a dependency that ships fails
+      - name: Production dependencies (gate)
+        run: npm audit --omit=dev
+      # Build and test tooling never ships: reported for triage (Dependabot raises the fixes), never blocking
+      - name: All dependencies (report only)
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: npm audit --audit-level=high
+
+  secrets:
+    name: Secret scan (gitleaks, full history)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      # Full history: a secret removed in a later commit is still leaked
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # --redact keeps secret values out of the logs and the uploaded SARIF
+      - name: gitleaks
+        id: gitleaks
+        run: |
+          mkdir -p "$RUNNER_TEMP/gitleaks"
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -v "$GITHUB_WORKSPACE:/repo:ro" -v "$RUNNER_TEMP/gitleaks:/out" \
+            "$GITLEAKS_IMAGE" git /repo \
+            --config /repo/.github/gitleaks.toml --redact --no-banner \
+            --report-format sarif --report-path /out/gitleaks.sarif
+      - name: Upload results
+        # The report is written whether or not leaks were found (hashFiles cannot see outside the workspace)
+        if: ${{ !cancelled() && steps.gitleaks.outcome != 'skipped' }}
+        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          sarif_file: ${{ runner.temp }}/gitleaks/gitleaks.sarif
+          category: gitleaks
+
+  trivy-repository:
+    name: Trivy (repository and Kubernetes manifests)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Prepare
+        run: mkdir -p "$RUNNER_TEMP/trivy-cache" "$RUNNER_TEMP/trivy-out" "$RUNNER_TEMP/rendered"
+      # Lockfiles (production dependencies), Dockerfiles and committed secrets. The Kubernetes base is skipped
+      # here because its hardening is applied by kustomize patches: it is scanned rendered, below.
+      - name: Scan repository (all severities, for code scanning)
+        id: repository-report
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -v "$GITHUB_WORKSPACE:/src:ro" -v "$RUNNER_TEMP/trivy-cache:/cache" -v "$RUNNER_TEMP/trivy-out:/out" \
+            "$TRIVY_IMAGE" fs --cache-dir /cache --quiet \
+            --scanners vuln,secret,misconfig --skip-dirs deploy/k8s \
+            --ignorefile /src/.github/trivyignore.yaml \
+            --format sarif --output /out/trivy-fs.sarif /src
+      - name: Upload results
+        if: ${{ !cancelled() && steps.repository-report.outcome == 'success' }}
+        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          sarif_file: ${{ runner.temp }}/trivy-out/trivy-fs.sarif
+          category: trivy-repository
+      - name: Gate repository (high and critical with a fix)
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -v "$GITHUB_WORKSPACE:/src:ro" -v "$RUNNER_TEMP/trivy-cache:/cache" \
+            "$TRIVY_IMAGE" fs --cache-dir /cache --quiet --skip-db-update --skip-check-update \
+            --scanners vuln,secret,misconfig --skip-dirs deploy/k8s \
+            --ignorefile /src/.github/trivyignore.yaml \
+            --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --format table /src
+      - name: Render Kubernetes overlays
+        run: |
+          for dir in deploy/k8s/overlays/*/; do
+            [ -f "$dir/kustomization.yaml" ] || continue
+            name=$(basename "$dir")
+            docker run --rm -v "$GITHUB_WORKSPACE/deploy/k8s:/k8s:ro" "$KUSTOMIZE_IMAGE" \
+              build "/k8s/overlays/$name" > "$RUNNER_TEMP/rendered/$name.yaml"
+            echo "Rendered $name"
+          done
+      - name: Gate rendered manifests (high and critical)
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -v "$RUNNER_TEMP/rendered:/rendered:ro" -v "$RUNNER_TEMP/trivy-cache:/cache" \
+            "$TRIVY_IMAGE" config --cache-dir /cache --quiet --skip-check-update \
+            --severity HIGH,CRITICAL --exit-code 1 --format table /rendered
+
+  trivy-images:
+    name: Trivy image ${{ matrix.image }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Every backend service image has the same layers (one node_modules with every workspace's production
+          # dependencies, all packages and services; only ENV SERVICE differs), so one service stands for all
+          - { image: api-gateway, context: backend, service: api-gateway }
+          # Build stage with dev tooling: runs as the migration job with schema-owner credentials
+          - { image: migrate, context: backend, target: build }
+          - { image: web, context: frontend }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # Reuses the layer cache written by ci.yml (read only: CI owns the cache) and exports a tarball to scan
+      - name: Build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ matrix.context }}
+          target: ${{ matrix.target }}
+          build-args: ${{ matrix.service && format('SERVICE={0}', matrix.service) || '' }}
+          tags: banksphere/${{ matrix.image }}:scan-${{ github.sha }}
+          outputs: type=docker,dest=${{ runner.temp }}/image.tar
+          cache-from: type=gha,scope=${{ matrix.image }}
+      - name: Scan image (all severities, for code scanning)
+        id: image-report
+        run: |
+          mkdir -p "$RUNNER_TEMP/trivy-cache" "$RUNNER_TEMP/trivy-out"
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -v "$RUNNER_TEMP:/work" -v "$GITHUB_WORKSPACE/.github/trivyignore.yaml:/trivyignore.yaml:ro" \
+            "$TRIVY_IMAGE" image --cache-dir /work/trivy-cache --quiet \
+            --input /work/image.tar --scanners vuln,secret --ignorefile /trivyignore.yaml \
+            --format sarif --output /work/trivy-out/image.sarif
+      - name: Upload results
+        if: ${{ !cancelled() && steps.image-report.outcome == 'success' }}
+        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          sarif_file: ${{ runner.temp }}/trivy-out/image.sarif
+          category: trivy-image-${{ matrix.image }}
+      - name: Gate image (high and critical with a fix)
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -v "$RUNNER_TEMP:/work" -v "$GITHUB_WORKSPACE/.github/trivyignore.yaml:/trivyignore.yaml:ro" \
+            "$TRIVY_IMAGE" image --cache-dir /work/trivy-cache --quiet --skip-db-update \
+            --input /work/image.tar --scanners vuln,secret --ignorefile /trivyignore.yaml \
+            --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --format table

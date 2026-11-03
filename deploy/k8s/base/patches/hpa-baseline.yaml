@@ -1,0 +1,42 @@
+# Scaling signals and behaviour for every HorizontalPodAutoscaler; overlays only set the bounds.
+# Utilisation is measured against the container's REQUESTS, so requests must reflect real steady-state use
+# (docs/operations/capacity-plan.md). Node's heap rarely shrinks after a burst, so the memory signal mostly
+# scales out; CPU is what normally brings the count back down.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: hpa-baseline # ignored: the patch target selects the HPAs
+spec:
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    # React to a surge within one metrics period: double, or add 4 pods, whichever is more
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      selectPolicy: Max
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+        - type: Pods
+          value: 4
+          periodSeconds: 30
+    # Shed capacity slowly: wait 5 minutes of lower demand, then remove at most 20 % a minute
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      selectPolicy: Min
+      policies:
+        - type: Percent
+          value: 20
+          periodSeconds: 60

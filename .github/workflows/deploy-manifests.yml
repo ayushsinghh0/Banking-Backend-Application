@@ -1,0 +1,48 @@
+# Kubernetes manifests: render every kustomization (base, staging, production) and validate the output against
+# the Kubernetes and CRD schemas (kubeconform -strict) and the hardening policy (conftest), exactly as
+# `bash deploy/k8s/validate.sh` does locally. The rendered YAML is kept as an artifact for review.
+name: deploy-manifests
+
+on:
+  pull_request:
+    paths:
+      - deploy/**
+      - .github/workflows/deploy-manifests.yml
+  push:
+    branches: [main]
+    paths:
+      - deploy/**
+      - .github/workflows/deploy-manifests.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-manifests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: kustomize build + kubeconform + policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Render and validate every target
+        env:
+          RENDER_DIR: ${{ runner.temp }}/rendered
+        run: bash deploy/k8s/validate.sh
+
+      - name: Keep the rendered manifests
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rendered-manifests
+          path: ${{ runner.temp }}/rendered
+          if-no-files-found: ignore
+          retention-days: 7

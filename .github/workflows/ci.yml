@@ -1,0 +1,174 @@
+# Continuous integration: every push to main and every pull request must build, pass the tests and produce
+# every container image. Security scanning lives in security.yml, Kubernetes manifests in deploy-manifests.yml.
+# Branch protection should require the single "CI passed" check, so adding an image to the matrix never
+# needs a settings change.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# One run per PR or branch: a new push to a PR cancels the superseded run; runs on main always finish
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  # Same major as the node:24-alpine base images, so CI and the containers run the same runtime
+  NODE_VERSION: "24"
+
+jobs:
+  backend:
+    name: Backend build and tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      # Scratch Redis for the GCRA rate-limiter tests: the algorithm is a Lua script, so it is only meaningful
+      # against a real server (the suite skips it when REDIS_TEST_URL is unset). Same image as the stack.
+      redis:
+        image: redis:7.4-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      REDIS_TEST_URL: redis://localhost:6379
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Verify registry signatures of installed packages
+        run: npm audit signatures
+      - name: Build (Prisma clients and TypeScript, every workspace)
+        run: npm run build
+      - name: Unit tests
+        run: npm test
+      # Generated documents must match their sources: the access matrix (route tables) and the Kubernetes
+      # PrometheusRule (the Compose alert rules)
+      - name: Access matrix is up to date
+        run: npm run access-matrix:check
+      - name: PrometheusRule is up to date
+        run: node scripts/prometheus-rule.mjs --check
+
+  frontend:
+    name: Frontend lint, typecheck, tests and build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Verify registry signatures of installed packages
+        run: npm audit signatures
+      - name: Lint
+        run: npm run lint
+      - name: Typecheck
+        run: npm run typecheck
+      # Coverage thresholds are enforced by vite.config.ts: falling below them fails this step
+      - name: Unit and component tests with coverage
+        run: npm run test:coverage
+      - name: Upload coverage report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: frontend-coverage
+          path: frontend/coverage/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Production build
+        run: npm run build
+
+  images:
+    name: Image ${{ matrix.image }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      # One broken image must not hide the state of the others
+      fail-fast: false
+      matrix:
+        include:
+          # One Dockerfile for every backend service (SERVICE build argument)
+          - { image: api-gateway, context: backend, service: api-gateway }
+          - { image: auth-service, context: backend, service: auth-service }
+          - { image: customer-service, context: backend, service: customer-service }
+          - { image: account-service, context: backend, service: account-service }
+          - { image: transaction-service, context: backend, service: transaction-service }
+          - { image: notification-service, context: backend, service: notification-service }
+          - { image: fraud-service, context: backend, service: fraud-service }
+          - { image: payment-service, context: backend, service: payment-service }
+          - { image: assistant-service, context: backend, service: assistant-service }
+          - { image: realtime-service, context: backend, service: realtime-service }
+          # Development and e2e only; built so it cannot rot, never deployed to production
+          - { image: razorpay-simulator, context: backend, service: razorpay-simulator }
+          # The build stage keeps the Prisma CLI and doubles as the migration job image
+          - { image: migrate, context: backend, target: build }
+          - { image: web, context: frontend }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # Build only: proves every image builds from a clean checkout and warms the layer cache. A release
+      # workflow would log in to the registry (packages: write, id-token: write), set push: true with
+      # provenance: mode=max and sbom: true, sign the pushed digest, and pin the Kubernetes overlays to
+      # steps.build.outputs.digest (kustomize edit set image <name>=<registry>/<image>@<digest>), never a tag.
+      - name: Build
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ matrix.context }}
+          target: ${{ matrix.target }}
+          build-args: ${{ matrix.service && format('SERVICE={0}', matrix.service) || '' }}
+          tags: banksphere/${{ matrix.image }}:ci-${{ github.sha }}
+          push: false
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,scope=${{ matrix.image }},mode=max
+
+  # Single required check for branch protection (matrix job names change whenever an image is added)
+  ci-passed:
+    name: CI passed
+    if: ${{ always() }}
+    needs: [backend, frontend, images]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Every required job succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "Job results: $RESULTS"
+          for result in $RESULTS; do
+            if [ "$result" != "success" ]; then
+              echo "::error::A required job did not succeed ($result)"
+              exit 1
+            fi
+          done

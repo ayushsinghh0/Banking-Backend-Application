@@ -1,0 +1,20 @@
+[
+  {
+    "email": "lt.example.1@loadtest.test",
+    "password": "not-a-real-password",
+    "userId": "00000000-0000-4000-8000-000000000001",
+    "accounts": [
+      { "id": "00000000-0000-4000-8000-0000000000a1", "accountNumber": "100000000001", "accountType": "SAVINGS" },
+      { "id": "00000000-0000-4000-8000-0000000000b1", "accountNumber": "100000000002", "accountType": "CURRENT" }
+    ]
+  },
+  {
+    "email": "lt.example.2@loadtest.test",
+    "password": "not-a-real-password",
+    "userId": "00000000-0000-4000-8000-000000000002",
+    "accounts": [
+      { "id": "00000000-0000-4000-8000-0000000000a2", "accountNumber": "100000000003", "accountType": "SAVINGS" },
+      { "id": "00000000-0000-4000-8000-0000000000b2", "accountNumber": "100000000004", "accountType": "CURRENT" }
+    ]
+  }
+]

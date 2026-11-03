@@ -1,0 +1,26 @@
+{
+  "name": "banksphere-monorepo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "BankSphere — Production-Style Banking Backend Using Microservices",
+  "workspaces": [
+    "packages/*",
+    "services/*"
+  ],
+  "scripts": {
+    "build": "npm run build -w @banksphere/common && npm run build --workspaces --if-present",
+    "test": "npm run build -w @banksphere/common && npm run test --workspaces --if-present",
+    "db:migrate": "npm run prisma:deploy --workspaces --if-present",
+    "docker:up": "docker compose up -d --build",
+    "docker:down": "docker compose down",
+    "docker:logs": "docker compose logs -f",
+    "access-matrix": "node scripts/access-matrix.mjs",
+    "access-matrix:check": "node scripts/access-matrix.mjs --check"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

@@ -1,0 +1,116 @@
+# Pre-deploy schema migrations: every service's Prisma migrations, each applied as that schema's OWNER role
+# (the runtime APP roles cannot run DDL). Same loop as the `migrate` service in backend/docker-compose.yml.
+#
+# Runs BEFORE the new Deployments roll out, so migrations must stay backwards compatible with the version still
+# running (expand/contract, docs/operations/kubernetes.md). Connects straight to Postgres, never through the
+# transaction-mode pooler: Prisma's migration advisory lock and DDL need a session. Prisma's own lock also makes a
+# second concurrent run wait instead of racing.
+#
+# Argo CD runs it as a PreSync hook. With plain kubectl (the pod template of a Job is immutable, so the previous
+# run is deleted first; everything except the app Deployments goes first, so config, secrets and network policy
+# exist before the Job and the new pods):
+#   kubectl -n banksphere delete job banksphere-migrate --ignore-not-found
+#   kubectl apply -k deploy/k8s/overlays/<env> -l 'app.kubernetes.io/component notin (web,gateway,service)'
+#   kubectl -n banksphere wait --for=condition=complete job/banksphere-migrate --timeout=15m
+#   kubectl apply -k deploy/k8s/overlays/<env>
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: banksphere-migrate
+  labels:
+    app.kubernetes.io/name: banksphere-migrate
+    app.kubernetes.io/component: migration
+automountServiceAccountToken: false
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: banksphere-migrate
+  labels:
+    app.kubernetes.io/name: banksphere-migrate
+    app.kubernetes.io/component: migration
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  # The script already retries a database that is restarting; a second pod covers a lost node
+  backoffLimit: 1
+  activeDeadlineSeconds: 900
+  # Keep the finished pod (and its logs) for a day, then let the cluster clean up
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: banksphere-migrate
+        app.kubernetes.io/component: migration
+    spec:
+      serviceAccountName: banksphere-migrate
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          # backend/Dockerfile target "build" (it keeps the Prisma CLI); the release pipeline pins it by digest
+          image: banksphere/migrate
+          imagePullPolicy: IfNotPresent
+          workingDir: /app
+          envFrom:
+            # AUTH_URL, CUSTOMER_URL, ... : owner-role URLs pointing DIRECTLY at Postgres (sslmode=verify-full)
+            - secretRef:
+                name: banksphere-migrate-secrets
+          env:
+            # Read-only root filesystem: anything Prisma or npm wants to write goes to the scratch volume
+            - name: HOME
+              value: /tmp
+            - name: npm_config_cache
+              value: /tmp/.npm
+            # No update check or telemetry (and no internet route to make one)
+            - name: CHECKPOINT_DISABLE
+              value: "1"
+            - name: MIGRATIONS
+              value: AUTH:auth CUSTOMER:customer ACCOUNT:account TRANSACTION:transaction NOTIFICATION:notification FRAUD:fraud PAYMENT:payment ASSISTANT:assistant
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              for s in $MIGRATIONS; do
+                var="${s%%:*}_URL"; svc="${s##*:}"
+                url="$(printenv "$var" || true)"
+                if [ -z "$url" ]; then echo "$var is not set: refusing to skip $svc-service" >&2; exit 1; fi
+                echo "Migrating $svc-service"
+                n=1
+                until (cd "services/$svc-service" && DATABASE_URL="$url" /app/node_modules/.bin/prisma migrate deploy); do
+                  if [ "$n" -ge 5 ]; then echo "Migrating $svc-service failed after $n attempts" >&2; exit 1; fi
+                  echo "Migrating $svc-service failed (attempt $n), retrying in 10s" >&2
+                  n=$((n + 1)); sleep 10
+                done
+              done
+              echo "All migrations applied"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi

@@ -1,0 +1,16 @@
+# Overlay used by the repository-root docker-compose.yml when the web app fronts the API.
+# - The gateway is reachable only through the web container (no published port), so nobody can talk to it
+#   directly with a forged X-Forwarded-For.
+# - TRUST_PROXY=1: exactly one trusted hop (the web container's nginx overwrites X-Forwarded-For).
+# - Email links point at the web app.
+
+services:
+  api-gateway:
+    ports: !reset []
+    environment:
+      TRUST_PROXY: "1"
+      CORS_ORIGINS: ""
+
+  auth-service:
+    environment:
+      APP_BASE_URL: ${WEB_BASE_URL:-http://localhost:8080}

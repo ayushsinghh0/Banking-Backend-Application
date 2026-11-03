@@ -1,0 +1,8 @@
+# Optional: needs the prometheus-operator CRDs (kube-prometheus-stack). Without them, rely on the pods'
+# prometheus.io/* annotations instead and leave this component out of the overlay.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+resources:
+  - podmonitor.yaml
+  # Generated from the Compose alert rules: node backend/scripts/prometheus-rule.mjs
+  - prometheusrule.yaml

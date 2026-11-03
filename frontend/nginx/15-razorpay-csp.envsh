@@ -1,0 +1,18 @@
+#!/bin/sh
+# Sourced by the nginx image's entrypoint before the templates are rendered: sets the Content Security Policy
+# fragments for Razorpay Checkout. Off (the default) keeps the strict same-origin policy; on admits exactly the
+# hosts Razorpay Checkout loads from, and lets its payment pop-ups (some banks' net banking pages) keep their
+# opener so the checkout can learn the result.
+if [ "${RAZORPAY_CHECKOUT:-off}" = "on" ]; then
+  export CSP_SCRIPT_SRC_EXTRA=" https://checkout.razorpay.com"
+  export CSP_FRAME_SRC="https://api.razorpay.com https://checkout.razorpay.com"
+  export CSP_CONNECT_SRC_EXTRA=" https://api.razorpay.com https://lumberjack.razorpay.com"
+  export CSP_IMG_SRC_EXTRA=" https://cdn.razorpay.com"
+  export COOP_POLICY="same-origin-allow-popups"
+else
+  export CSP_SCRIPT_SRC_EXTRA=""
+  export CSP_FRAME_SRC="'none'"
+  export CSP_CONNECT_SRC_EXTRA=""
+  export CSP_IMG_SRC_EXTRA=""
+  export COOP_POLICY="same-origin"
+fi

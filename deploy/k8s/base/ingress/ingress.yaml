@@ -1,0 +1,81 @@
+# Public entry: everything goes to the web pods, whose nginx serves the SPA and proxies /api to the gateway on
+# the same origin (frontend/nginx/default.conf.template). The gateway itself is never exposed.
+# Annotations are for ingress-nginx; the host and TLS secret are set per overlay. HSTS is a controller-wide
+# setting (ConfigMap: hsts "true", hsts-max-age "63072000", hsts-include-subdomains "true"), see
+# docs/operations/kubernetes.md. The TLS secret is provisioned by cert-manager or External Secrets by name.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web
+  labels:
+    app.kubernetes.io/name: web
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    # Matches client_max_body_size in the web nginx and the services' JSON limits: refuse big bodies at the edge
+    nginx.ingress.kubernetes.io/proxy-body-size: 64k
+    nginx.ingress.kubernetes.io/client-body-buffer-size: 64k
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "5"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "30"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "30"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - app.banksphere.invalid
+      secretName: banksphere-web-tls
+  rules:
+    - host: app.banksphere.invalid
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web
+                port:
+                  name: http
+---
+# Long-lived Server-Sent Events: the real-time stream and assistant answers. Never buffered, and read timeouts
+# long enough for a stream to live until its access token expires (the server then sends `reauth` and closes).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web-streams
+  labels:
+    app.kubernetes.io/name: web
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: 64k
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "5"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - app.banksphere.invalid
+      secretName: banksphere-web-tls
+  rules:
+    - host: app.banksphere.invalid
+      http:
+        paths:
+          - path: /api/v1/realtime/
+            pathType: Prefix
+            backend:
+              service:
+                name: web
+                port:
+                  name: http
+          # POST /api/v1/assistant/conversations/:id/messages streams; the other assistant routes are short
+          # requests and tolerate the longer timeout
+          - path: /api/v1/assistant/conversations
+            pathType: Prefix
+            backend:
+              service:
+                name: web
+                port:
+                  name: http

@@ -1,0 +1,85 @@
+BankSphere platform E2E against http://localhost:8080 (run 0781aebc)
+
+Setup
+  ✔ a verified customer opens an account
+
+Real-time stream
+  ✔ a customer opens a real-time stream (200)
+  ✔ ...and is told it is ready
+  ✔ no stream without a token (401)
+
+Add money: Razorpay top-ups through the simulator
+  ✔ payment config: simulator mode with limits
+  ✔ staff cannot create top-ups (403)
+  ✔ top-up without Idempotency-Key is refused (400)
+  ✔ THEFT: a customer cannot top up into someone else's account
+  ✔ amounts below the minimum are refused (422 AMOUNT_TOO_SMALL)
+  ✔ creates a top-up and a Razorpay order (201)
+  ✔ IDEMPOTENCY: the same request replays the same top-up
+  ✔ IDEMPOTENCY: the same key with a different amount is refused (409)
+  ✔ the simulated checkout pays the order
+  ✔ SIGNATURE: a forged payment signature is refused
+  ✔ no money moved on the forged confirmation
+  ✔ a genuine confirmation credits the account
+  ✔ ...the top-up ends CREDITED
+  ✔ ...and the balance grows by exactly ₹500
+  ✔ EXACTLY ONCE: a second confirmation and the webhook do not credit again
+  ✔ the ledger shows an ONLINE_TOP_UP credit
+  ✔ REAL-TIME: the customer is told about the top-up on the open stream
+  ✔ REAL-TIME: ...and about the ledger posting
+  ✔ WEBHOOK: an unsigned webhook is refused (400) and changes nothing
+  ✔ a declined payment ends FAILED without touching the balance
+  ✔ LIMITS: a top-up beyond today's remaining limit is refused
+
+Payments: operations
+  ✔ customers cannot use the payments console (403)
+  ✔ support can read top-ups in the console
+  ✔ the console summarises today's top-ups
+  ✔ support cannot refund (403)
+  ✔ STEP-UP: a refund needs a fresh authenticator code
+  ✔ an administrator refunds a credited top-up
+  ✔ ...it ends REFUNDED and the money leaves the account
+  ✔ an administrator can reconcile with Razorpay on demand
+
+Sphere assistant
+  ✔ assistant meta (built-in engine without an LLM key)
+  ✔ starts a conversation
+  ✔ streams the answer as server-sent events
+  ✔ ...after consulting the accounts tool
+  ✔ NEVER MOVES MONEY: a transfer request becomes a draft card only
+  ✔ ...and the balance is unchanged
+  ✔ PRIVACY: another customer cannot read the conversation (404)
+  ✔ staff get procedures, never customer data tools
+  ✔ the same answer is available as plain JSON
+  ✔ messages are length-limited (400)
+
+Sessions and devices
+  ✔ a customer sees their sessions, the current one marked
+  ✔ ...with masked addresses only
+  ✔ signs out every other device
+  ✔ REVOCATION: the other device is locked out at once
+  ✔ ...while this session keeps working
+  ✔ sign-in activity is listed
+  ✔ support can see a customer’s sessions
+  ✔ customers cannot see other users' sessions (403)
+
+IP rules and edge protection
+  ✔ a rule wider than /8 is refused (400)
+  ✔ a rule overlapping the staff networks is refused (400)
+  ✔ an administrator blocks a network
+  ✔ support can read the rules but not change them
+  ✔ the rule is removed again
+  ✔ rate-limit headers are present at the edge
+  ✔ metrics are never reachable from outside (404)
+  ✔ unauthenticated calls to new services are refused (401)
+
+Tamper-evident audit
+  ✔ the ledger audit chain verifies
+  ✔ the identity audit chain verifies
+  ✔ only administrators may verify audit chains (403)
+
+Global
+  ✔ no request in the whole run returned a 5xx
+
+63 passed, 0 failed
+

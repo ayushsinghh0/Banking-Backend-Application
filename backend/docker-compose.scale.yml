@@ -1,0 +1,40 @@
+# Horizontal-scale overlay (design section 13): several replicas of every stateless service.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.scale.yml up -d --build          (from backend/)
+#   docker compose -f docker-compose.yml -f docker-compose.scale.yml up -d --build          (repository root, with the web app)
+#
+# Why this works without code changes:
+# - Every service is stateless: sessions live in the security Redis, rate limits in the edge Redis, caches and
+#   real-time fan-out in the cache Redis, and money in Postgres.
+# - Jobs that must run once (payment reconciliation, account/ledger reconciliation, retention purges, IP-rule
+#   mirroring) take a job lease in Postgres, so only one replica does each run.
+# - Kafka consumers share a consumer group per service; topics have 12 partitions, so up to 12 replicas of a
+#   consumer can work in parallel.
+# - Real-time: each replica subscribes only to the Redis channels of its own connections, and a reconnect may land
+#   on any replica (Last-Event-ID replays from the shared Redis stream).
+# - Compose's DNS answers a service name with one address per replica. nginx (web) resolves api-gateway when it
+#   starts and balances across every address; after changing the gateway's replica count, restart `web`. The
+#   gateway's keep-alive agents spread their connections over the service replicas as they open them.
+#
+# Constraints: a replicated service can't publish a host port, so this overlay removes the gateway's published
+# port (the root stack publishes only `web` anyway). Replica counts here are for a laptop-sized smoke test of the
+# topology; production sizes come from docs/operations/capacity-plan.md and the Kubernetes HPA settings.
+
+x-replicas: &replicas
+  deploy:
+    replicas: ${SCALE_REPLICAS:-2}
+
+services:
+  api-gateway:
+    <<: *replicas
+    ports: !reset []
+  auth-service: *replicas
+  customer-service: *replicas
+  account-service: *replicas
+  transaction-service: *replicas
+  payment-service: *replicas
+  assistant-service: *replicas
+  realtime-service: *replicas
+  # Kafka consumers: replicas share the work through their consumer group
+  notification-service: *replicas
+  fraud-service: *replicas

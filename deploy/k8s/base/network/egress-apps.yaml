@@ -1,0 +1,186 @@
+# Who may call whom (egress side). Every edge also needs the matching ingress rule in ingress-apps.yaml.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: web-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: web
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: api-gateway
+      ports:
+        - protocol: TCP
+          port: 8000
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-gateway-egress-apps
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: api-gateway
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: auth-service
+      ports:
+        - protocol: TCP
+          port: 8001
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: customer-service
+      ports:
+        - protocol: TCP
+          port: 8002
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: account-service
+      ports:
+        - protocol: TCP
+          port: 8003
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: transaction-service
+      ports:
+        - protocol: TCP
+          port: 8004
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: notification-service
+      ports:
+        - protocol: TCP
+          port: 8005
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: fraud-service
+      ports:
+        - protocol: TCP
+          port: 8006
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: payment-service
+      ports:
+        - protocol: TCP
+          port: 8007
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: assistant-service
+      ports:
+        - protocol: TCP
+          port: 8008
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: realtime-service
+      ports:
+        - protocol: TCP
+          port: 8009
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: account-service-egress-apps
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: account-service
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: customer-service
+      ports:
+        - protocol: TCP
+          port: 8002
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: transaction-service
+      ports:
+        - protocol: TCP
+          port: 8004
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: payment-service-egress-apps
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: payment-service
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: customer-service
+      ports:
+        - protocol: TCP
+          port: 8002
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: transaction-service
+      ports:
+        - protocol: TCP
+          port: 8004
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: assistant-service-egress-apps
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: assistant-service
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: customer-service
+      ports:
+        - protocol: TCP
+          port: 8002
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: account-service
+      ports:
+        - protocol: TCP
+          port: 8003
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: transaction-service
+      ports:
+        - protocol: TCP
+          port: 8004
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: payment-service
+      ports:
+        - protocol: TCP
+          port: 8007

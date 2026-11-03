@@ -1,0 +1,278 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider      = "prisma-client-js"
+  output        = "../generated/client"
+}
+
+enum Role {
+  CUSTOMER
+  SUPPORT
+  TELLER
+  KYC_OFFICER
+  FRAUD_ANALYST
+  BANK_ADMIN
+}
+
+enum AdminRequestType {
+  CREATE_STAFF
+  SET_USER_ACTIVE
+  RESET_MFA
+}
+
+enum AdminRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum EnrolmentPurpose {
+  ACTIVATE  // staff sets their own password (admins never choose staff passwords)
+  MFA_ENROL // allows TOTP enrolment for a staff account
+}
+
+enum OutboxStatus {
+  PENDING
+  PUBLISHED
+  FAILED
+}
+
+model User {
+  id                String                   @id @default(uuid())
+  email             String                   @unique
+  passwordHash      String                   @map("password_hash")
+  role              Role                     @default(CUSTOMER)
+  isEmailVerified   Boolean                  @default(false) @map("is_email_verified")
+  isActive          Boolean                  @default(true) @map("is_active")
+  // Bumped on password change/reset and on disable: every access token carrying an older version is revoked
+  tokenVersion      Int                      @default(0) @map("token_version")
+  passwordChangedAt DateTime?                @map("password_changed_at")
+  // TOTP second factor. Secrets are AES-256-GCM encrypted with MFA_ENCRYPTION_KEY, never stored in clear
+  mfaEnabled        Boolean                  @default(false) @map("mfa_enabled")
+  mfaEnabledAt         DateTime? @map("mfa_enabled_at") // a new factor is not trusted for step-up at first
+  mfaSecretEnc      String?                  @map("mfa_secret_enc")
+  mfaPendingSecretEnc String?                @map("mfa_pending_secret_enc")
+  mfaLastUsedStep   Int?                     @map("mfa_last_used_step") // replay protection: a code works once
+  createdBy         String?                  @map("created_by") // admin request that created a staff user
+  // Set by the first session ever started: that sign-in is never reported as a new device
+  firstSignInAt     DateTime?                @map("first_sign_in_at")
+  createdAt         DateTime                 @default(now()) @map("created_at")
+  updatedAt         DateTime                 @updatedAt @map("updated_at")
+  refreshTokens     RefreshToken[]
+  sessions          UserSession[]
+  resetTokens       PasswordResetToken[]
+  verifyTokens      EmailVerificationToken[]
+  enrolmentTokens   EnrolmentToken[]
+
+  @@index([createdAt]) // staff user directory, newest first
+  @@map("users")
+}
+
+model RefreshToken {
+  id          String   @id @default(uuid())
+  tokenHash   String   @unique @map("token_hash") // SHA-256 hash of the cryptographically random token
+  userId      String   @map("user_id")
+  familyId    String   @map("family_id")          // Token family UUID to track rotation chains
+  isRevoked   Boolean  @default(false) @map("is_revoked")
+  expiresAt   DateTime @map("expires_at")
+  // Absolute session lifetime: rotation never extends a session past this instant
+  familyExpiresAt  DateTime @map("family_expires_at")
+  // Set when the token was revoked by normal rotation (vs. logout/theft): enables a short grace window
+  rotatedAt        DateTime? @map("rotated_at")
+  mfaAuthenticated Boolean  @default(false) @map("mfa_authenticated")
+  createdAt   DateTime @default(now()) @map("created_at")
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, familyId])
+  @@index([familyId])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+
+// Single-use password reset tokens. Only the SHA-256 hash is stored; the raw token exists only in the email.
+model PasswordResetToken {
+  id          String    @id @default(uuid())
+  tokenHash   String    @unique @map("token_hash")
+  userId      String    @map("user_id")
+  expiresAt   DateTime  @map("expires_at")
+  usedAt      DateTime? @map("used_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("password_reset_tokens")
+}
+
+model EmailVerificationToken {
+  id          String    @id @default(uuid())
+  tokenHash   String    @unique @map("token_hash")
+  userId      String    @map("user_id")
+  expiresAt   DateTime  @map("expires_at")
+  usedAt      DateTime? @map("used_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("email_verification_tokens")
+}
+
+// Transactional outbox: domain events written atomically with the change that caused them
+model OutboxEvent {
+  id            String       @id @default(uuid())
+  seq           BigInt       @default(autoincrement()) // per-aggregate publish order
+  aggregateType String       @map("aggregate_type")
+  aggregateId   String       @map("aggregate_id")
+  eventType     String       @map("event_type")
+  payload       Json
+  status        OutboxStatus @default(PENDING)
+  retryCount    Int          @default(0) @map("retry_count")
+  lastError     String?      @map("last_error")
+  nextAttemptAt DateTime?    @map("next_attempt_at")
+  lockedUntil   DateTime?    @map("locked_until") // relay lease: a crashed relay's claim expires
+  lockedBy      String?      @map("locked_by") // fencing token of the relay holding the lease
+  createdAt     DateTime     @default(now()) @map("created_at")
+  publishedAt   DateTime?    @map("published_at")
+
+  @@index([status, nextAttemptAt, createdAt])
+  @@index([aggregateId, status, seq])
+  @@unique([seq])
+  @@map("outbox_events")
+}
+
+// Append-only audit trail of security-relevant and staff actions (UPDATE/DELETE blocked by trigger).
+// Tamper-evident: every row written since the hash chain was introduced carries seq (chain order), the hash of
+// the previous chained row and its own hash (see src/services/audit.ts). Rows from before have seq/hash NULL.
+model AuditLog {
+  id        String   @id @default(uuid())
+  seq       BigInt?  @default(dbgenerated("nextval('audit_log_seq_seq'::regclass)"))
+  actorId   String?  @map("actor_id")
+  action    String
+  targetId  String?  @map("target_id")
+  details   Json?
+  prevHash  String?  @map("prev_hash")
+  hash      String?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([actorId, createdAt])
+  @@index([targetId, createdAt])
+  @@map("audit_log")
+}
+
+// One row per session, i.e. per refresh-token family (id = family id): what "Devices" shows the user
+model UserSession {
+  id            String    @id // refresh-token family id
+  userId        String    @map("user_id")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  lastSeenAt    DateTime  @default(now()) @map("last_seen_at") // updated on refresh, at most once a minute
+  expiresAt     DateTime  @map("expires_at") // absolute session lifetime (the family's)
+  firstIp       String?   @map("first_ip")
+  lastIp        String?   @map("last_ip")
+  userAgent     String?   @map("user_agent") // truncated
+  deviceLabel   String    @map("device_label") // "Chrome on Windows"
+  browser       String    // family, for the new-device rule
+  os            String    // family, for the new-device rule
+  network       String?   // first IP's network (/24 IPv4, /48 IPv6), for the new-device rule
+  mfa           Boolean   @default(false)
+  revokedAt     DateTime? @map("revoked_at")
+  revokedReason String?   @map("revoked_reason")
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, lastSeenAt])
+  @@index([expiresAt]) // retention purge (never updated, so it costs nothing on the refresh path)
+  @@map("user_sessions")
+}
+
+enum SecurityEventType {
+  SIGN_IN_SUCCEEDED
+  SIGN_IN_FAILED
+  MFA_FAILED
+  NEW_DEVICE
+  SESSION_REVOKED
+  PASSWORD_CHANGED
+  IP_AUTO_BANNED
+}
+
+// Account security history (sign-ins, devices, revocations, bans). Append-only; rows older than 180 days are
+// the only ones that may be deleted (retention purge), enforced by trigger.
+model SecurityEvent {
+  id          String            @id @default(uuid())
+  userId      String?           @map("user_id") // null for address-level events (IP_AUTO_BANNED)
+  type        SecurityEventType
+  ip          String? // full address; only ever returned masked
+  deviceLabel String?           @map("device_label")
+  details     Json?
+  createdAt   DateTime          @default(now()) @map("created_at")
+
+  @@index([userId, createdAt])
+  @@index([type, createdAt])
+  @@index([createdAt])
+  @@map("security_events")
+}
+
+enum IpRuleAction {
+  DENY
+}
+
+// Edge deny rules (source of truth; mirrored to the edge Redis for the gateway). Removal is a soft delete so
+// the history of who blocked what stays.
+model IpRule {
+  id        String       @id @default(uuid())
+  cidr      String // canonical network form, e.g. 203.0.113.0/24
+  action    IpRuleAction @default(DENY)
+  reason    String
+  expiresAt DateTime?    @map("expires_at")
+  createdBy String       @map("created_by")
+  createdAt DateTime     @default(now()) @map("created_at")
+  removedAt DateTime?    @map("removed_at")
+  removedBy String?      @map("removed_by")
+
+  @@index([removedAt, expiresAt])
+  @@map("ip_rules")
+}
+
+// Leader election for periodic jobs across replicas (see acquireJobLease in @banksphere/common)
+model JobLease {
+  name      String   @id
+  holder    String
+  expiresAt DateTime @map("expires_at")
+
+  @@map("job_leases")
+}
+
+// One-time, emailed tokens for staff onboarding and MFA (re-)enrolment. Only the SHA-256 is stored.
+model EnrolmentToken {
+  id        String           @id @default(uuid())
+  tokenHash String           @unique @map("token_hash")
+  userId    String           @map("user_id")
+  purpose   EnrolmentPurpose
+  expiresAt DateTime         @map("expires_at")
+  usedAt    DateTime?        @map("used_at")
+  createdAt DateTime         @default(now()) @map("created_at")
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, purpose])
+  @@map("enrolment_tokens")
+}
+
+// Four-eyes administration: privileged changes are requested by one BANK_ADMIN and executed only when a
+// different BANK_ADMIN approves them.
+model AdminRequest {
+  id           String             @id @default(uuid())
+  type         AdminRequestType
+  status       AdminRequestStatus @default(PENDING)
+  payload      Json
+  targetUserId String?            @map("target_user_id")
+  requestedBy  String             @map("requested_by")
+  decidedBy    String?            @map("decided_by")
+  decidedAt    DateTime?          @map("decided_at")
+  expiresAt    DateTime           @map("expires_at")
+  createdAt    DateTime           @default(now()) @map("created_at")
+
+  @@index([status, createdAt])
+  @@map("admin_requests")
+}

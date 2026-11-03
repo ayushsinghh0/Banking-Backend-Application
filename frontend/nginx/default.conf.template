@@ -1,0 +1,166 @@
+# BankSphere web: serves the single-page app and proxies /api/ to the API gateway on the same origin, so the
+# browser never makes a cross-origin call and the SameSite=Strict session cookie just works.
+# Rendered at container start from environment variables (nginx image templating):
+#   API_UPSTREAM         host:port of the API gateway (default api-gateway:8000)
+#   TRUSTED_PROXY_CIDR   a load balancer in front of this container whose X-Forwarded-For is trusted
+#                        (default 127.0.0.1/32 = nobody; nginx is then the edge and uses the TCP peer address)
+
+upstream banksphere_api {
+    server ${API_UPSTREAM};
+    keepalive 32;
+}
+
+# Recover the real client address only from a trusted load balancer
+set_real_ip_from ${TRUSTED_PROXY_CIDR};
+real_ip_header X-Forwarded-For;
+real_ip_recursive on;
+
+map $sent_http_content_type $asset_expires {
+    default off;
+}
+
+# Content Security Policy (used by snippets/security-headers.conf). Scripts and frames are this origin only,
+# unless RAZORPAY_CHECKOUT=on, which admits exactly Razorpay Checkout's script, frames and API
+# (see 15-razorpay-csp.envsh).
+map $request_method $banksphere_csp {
+    default "default-src 'self'; script-src 'self'${CSP_SCRIPT_SRC_EXTRA}; style-src 'self' 'unsafe-inline'; img-src 'self' data:${CSP_IMG_SRC_EXTRA}; font-src 'self'; connect-src 'self'${CSP_CONNECT_SRC_EXTRA}; frame-src ${CSP_FRAME_SRC}; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+}
+map $request_method $banksphere_coop {
+    default "${COOP_POLICY}";
+}
+
+server {
+    listen 8080;
+    listen [::]:8080;
+    server_name _;
+    server_tokens off;
+    root /usr/share/nginx/html;
+    index index.html;
+    charset utf-8;
+
+    client_max_body_size 64k;
+    client_body_timeout 15s;
+    client_header_timeout 15s;
+    keepalive_timeout 30s;
+    send_timeout 30s;
+
+    gzip on;
+    gzip_vary on;
+    gzip_min_length 1024;
+    gzip_proxied any;
+    gzip_types text/plain text/css application/javascript application/json image/svg+xml;
+
+    # Liveness for the container and load balancer (never cached, no body worth caching)
+    location = /healthz {
+        access_log off;
+        default_type text/plain;
+        add_header Cache-Control "no-store" always;
+        return 200 "ok\n";
+    }
+
+    # API readiness/liveness (the gateway answers only UP/DEGRADED, cached), for load balancers and monitoring
+    location ~ ^/health(/live)?$ {
+        proxy_pass http://banksphere_api;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        add_header Cache-Control "no-store" always;
+        include /etc/nginx/snippets/security-headers.conf;
+    }
+
+    # Service-to-service APIs are never reachable from outside, whatever the method
+    location ^~ /internal/ {
+        default_type application/json;
+        add_header Cache-Control "no-store" always;
+        return 404 '{"error":{"code":"NOT_FOUND","message":"Not found"}}';
+    }
+
+    # Prometheus scrapes each service on the internal network; the edge never answers for metrics (without this
+    # block the SPA fallback would serve index.html with a 200)
+    location ~ ^/metrics/?$ {
+        default_type application/json;
+        add_header Cache-Control "no-store" always;
+        return 404 '{"error":{"code":"NOT_FOUND","message":"Not found"}}';
+    }
+
+    # Server-Sent Events: real-time updates. Never buffered (each event must reach the browser at once) and
+    # held open far longer than ordinary API calls; the service sends a heartbeat every 20 seconds.
+    location ^~ /api/v1/realtime/ {
+        proxy_pass http://banksphere_api;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Real-IP "";
+        proxy_set_header Forwarded "";
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 1h;
+        proxy_send_timeout 1h;
+        proxy_hide_header X-Powered-By;
+        add_header Cache-Control "no-store" always;
+        include /etc/nginx/snippets/security-headers.conf;
+    }
+
+    # The assistant streams its answers (Server-Sent Events) while it consults tools and the language model
+    location ~ ^/api/v1/assistant/conversations/[^/]+/messages$ {
+        proxy_pass http://banksphere_api;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Real-IP "";
+        proxy_set_header Forwarded "";
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 120s;
+        proxy_send_timeout 30s;
+        proxy_hide_header X-Powered-By;
+        add_header Cache-Control "no-store" always;
+        include /etc/nginx/snippets/security-headers.conf;
+    }
+
+    location /api/ {
+        proxy_pass http://banksphere_api;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        # nginx is the client-facing edge: OVERWRITE (never append) so a client can't spoof its address.
+        # The gateway trusts exactly one proxy hop (TRUST_PROXY=1) — this one.
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Real-IP "";
+        proxy_set_header Forwarded "";
+        proxy_connect_timeout 5s;
+        proxy_send_timeout 30s;
+        proxy_read_timeout 30s;
+        proxy_intercept_errors off;
+        proxy_hide_header X-Powered-By;
+        add_header Cache-Control "no-store" always;
+        include /etc/nginx/snippets/security-headers.conf;
+    }
+
+    # Content-hashed build output: cache forever
+    location /assets/ {
+        try_files $uri =404;
+        expires 1y;
+        add_header Cache-Control "public, max-age=31536000, immutable" always;
+        include /etc/nginx/snippets/security-headers.conf;
+    }
+
+    location = /robots.txt {
+        try_files $uri =404;
+    }
+
+    # Everything else is the app shell; never cache it so a deploy is picked up immediately
+    location / {
+        try_files $uri $uri/ /index.html;
+        add_header Cache-Control "no-cache" always;
+        include /etc/nginx/snippets/security-headers.conf;
+    }
+}

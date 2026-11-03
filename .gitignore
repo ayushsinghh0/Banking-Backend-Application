@@ -1,10 +1,25 @@
+# Dependencies and build output (backend and frontend)
 node_modules/
 dist/
 coverage/
+*.log
+*.tsbuildinfo
+
+# Secrets: only the examples are committed
 .env
 .env.*
 !.env.example
-services/*/generated/
-*.log
-scripts/.e2e-state.json
+
+# Backend
+backend/services/*/generated/
+backend/scripts/.e2e-state.json
+
+# Frontend test artefacts (screenshots that ship as documentation live in docs/screenshots)
+frontend/playwright-report/
+frontend/test-results/
+frontend/blob-report/
+frontend/e2e/.state/
+frontend/.vite/
+
+# Local tooling
 .claude/

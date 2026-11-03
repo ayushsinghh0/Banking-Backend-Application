@@ -1,0 +1,213 @@
+# BankSphere on Kubernetes: everything environment-neutral. Overlays (overlays/staging, overlays/production) add
+# the real images, sizes, host names, data-store addresses and the External Secrets / PodMonitor components.
+# Postgres (behind a PgBouncer-compatible pooler), Kafka and the three Redis instances are managed services
+# referenced by configuration and secrets; none runs in the cluster.
+#   kustomize build deploy/k8s/overlays/production      # render
+#   deploy/k8s/validate.sh                              # render + schema + hardening policy, every target
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: banksphere
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: banksphere
+    includeSelectors: false
+    includeTemplates: true
+
+resources:
+  - namespace.yaml
+  - apps/web.yaml
+  - apps/api-gateway.yaml
+  - apps/auth-service.yaml
+  - apps/customer-service.yaml
+  - apps/account-service.yaml
+  - apps/transaction-service.yaml
+  - apps/notification-service.yaml
+  - apps/fraud-service.yaml
+  - apps/payment-service.yaml
+  - apps/assistant-service.yaml
+  - apps/realtime-service.yaml
+  - jobs/migrate.yaml
+  - network/default-deny.yaml
+  - network/ingress-apps.yaml
+  - network/egress-apps.yaml
+  - network/egress-datastores.yaml
+  - network/egress-internet.yaml
+  - network/ingress-monitoring.yaml
+  - ingress/ingress.yaml
+
+patches:
+  - path: patches/workload-baseline.yaml
+    target:
+      kind: Deployment
+      labelSelector: banksphere.io/runtime
+  - path: patches/hpa-baseline.yaml
+    target:
+      kind: HorizontalPodAutoscaler
+  - path: patches/realtime-hpa.yaml
+
+# Non-secret configuration only. Anything holding a password, token or key comes from the Secrets the pods
+# reference by name (<service>-secrets, banksphere-jwt, banksphere-migrate-secrets), created by External
+# Secrets (components/external-secrets). The generated names carry a content hash, so a config change rolls
+# the Deployments that use it.
+configMapGenerator:
+  - name: banksphere-common
+    literals:
+      - NODE_ENV=production
+      - LOG_LEVEL=info
+      - TZ=UTC
+      # Requests reach every service through exactly one proxy that overwrites X-Forwarded-For (the web nginx
+      # in front of the gateway, the gateway in front of the services)
+      - TRUST_PROXY=1
+      # VPN / office networks staff may work from (set per overlay); staff tokens are refused anywhere else
+      - STAFF_ALLOWED_CIDRS=192.0.2.240/28
+      - KAFKA_ENABLED=true
+      - KAFKA_BROKERS=kafka.banksphere.invalid:9096
+      - KAFKA_SSL=true
+      - METRICS_PORT=9464
+      - JWT_ACCESS_EXPIRATION=15m
+  - name: web-config
+    literals:
+      - API_UPSTREAM=api-gateway:8000
+      # The ingress controller pods' CIDR, the only X-Forwarded-For the web nginx may trust (set per overlay).
+      # 127.0.0.1/32 trusts nobody: every client then looks like the controller, which breaks per-IP limits.
+      - TRUSTED_PROXY_CIDR=127.0.0.1/32
+      - RAZORPAY_CHECKOUT=off
+  - name: api-gateway-config
+    literals:
+      - PORT=8000
+      - SERVICE_NAME=api-gateway
+      # Same origin through the web app: no browser origin needs CORS
+      - CORS_ORIGINS=
+      - AUTH_SERVICE_URL=http://auth-service:8001
+      - CUSTOMER_SERVICE_URL=http://customer-service:8002
+      - ACCOUNT_SERVICE_URL=http://account-service:8003
+      - TRANSACTION_SERVICE_URL=http://transaction-service:8004
+      - NOTIFICATION_SERVICE_URL=http://notification-service:8005
+      - FRAUD_SERVICE_URL=http://fraud-service:8006
+      - PAYMENT_SERVICE_URL=http://payment-service:8007
+      - ASSISTANT_SERVICE_URL=http://assistant-service:8008
+      - REALTIME_SERVICE_URL=http://realtime-service:8009
+      - GATEWAY_RATE_LIMIT_PER_MINUTE=300
+      # Per replica: requests in flight (excluding streams) and open streams before 503 SERVER_BUSY
+      - GATEWAY_MAX_INFLIGHT=1024
+      - GATEWAY_MAX_STREAMS=5000
+  - name: auth-service-config
+    literals:
+      - PORT=8001
+      - SERVICE_NAME=auth-service
+      - KAFKA_CLIENT_ID=auth-service
+      - KAFKA_USERNAME=auth-svc
+      - STAFF_EMAIL_DOMAIN=banksphere.invalid
+      - APP_BASE_URL=https://app.banksphere.invalid
+      - JWT_REFRESH_EXPIRATION_DAYS=7
+      - AUTH_COOKIE_SECURE=true
+      - CREDENTIAL_STUFFING_THRESHOLD=20
+      - EMAIL_TRANSPORT=smtp
+      - SMTP_HOST=smtp.banksphere.invalid
+      - SMTP_PORT=587
+      - SMTP_SECURE=false
+      - SMTP_REQUIRE_TLS=true
+      - MAIL_FROM=BankSphere <no-reply@banksphere.invalid>
+  - name: customer-service-config
+    literals:
+      - PORT=8002
+      - SERVICE_NAME=customer-service
+  - name: account-service-config
+    literals:
+      - PORT=8003
+      - SERVICE_NAME=account-service
+      - KAFKA_CLIENT_ID=account-service
+      - KAFKA_USERNAME=account-svc
+      - LEDGER_SERVICE_URL=http://transaction-service:8004
+      - CUSTOMER_SERVICE_URL=http://customer-service:8002
+  - name: transaction-service-config
+    literals:
+      - PORT=8004
+      - SERVICE_NAME=transaction-service
+      - KAFKA_CLIENT_ID=transaction-service
+      - KAFKA_USERNAME=ledger-svc
+      # An authenticator must be a day old before it can authorise large transfers or instant payees
+      - MFA_FACTOR_MIN_AGE_HOURS=24
+  - name: notification-service-config
+    literals:
+      - PORT=8005
+      - SERVICE_NAME=notification-service
+      - KAFKA_CLIENT_ID=notification-service
+      - KAFKA_USERNAME=notification-svc
+      - SECURITY_ALERT_EMAIL=security-team@banksphere.invalid
+      - EMAIL_TRANSPORT=smtp
+      - SMTP_HOST=smtp.banksphere.invalid
+      - SMTP_PORT=587
+      - SMTP_SECURE=false
+      - SMTP_REQUIRE_TLS=true
+      - MAIL_FROM=BankSphere <no-reply@banksphere.invalid>
+  - name: fraud-service-config
+    literals:
+      - PORT=8006
+      - SERVICE_NAME=fraud-service
+      - KAFKA_CLIENT_ID=fraud-service
+      - KAFKA_USERNAME=fraud-svc
+  - name: payment-service-config
+    literals:
+      - PORT=8007
+      - SERVICE_NAME=payment-service
+      - KAFKA_CLIENT_ID=payment-service
+      - KAFKA_USERNAME=payment-svc
+      - LEDGER_SERVICE_URL=http://transaction-service:8004
+      - CUSTOMER_SERVICE_URL=http://customer-service:8002
+      # Must be HTTPS in production (payment-service refuses to start otherwise)
+      - RAZORPAY_API_BASE=https://api.razorpay.com
+      - TOPUP_MIN_PAISE=100
+      - TOPUP_MAX_PAISE=10000000
+      - TOPUP_DAILY_LIMIT_PAISE=20000000
+      - TOPUP_ORDER_TTL_MINUTES=30
+      - STEP_UP_MAX_AGE_SECONDS=300
+      - MFA_FACTOR_MIN_AGE_HOURS=24
+  - name: assistant-service-config
+    literals:
+      - PORT=8008
+      - SERVICE_NAME=assistant-service
+      # Any OpenAI-compatible endpoint; without LLM_API_KEY (assistant-service-secrets) the built-in assistant answers
+      - LLM_BASE_URL=https://api.openai.com/v1
+      - LLM_MODEL=gpt-4o-mini
+      # Read-only tools call the owning services with the customer's own token
+      - ACCOUNT_SERVICE_URL=http://account-service:8003
+      - TRANSACTION_SERVICE_URL=http://transaction-service:8004
+      - CUSTOMER_SERVICE_URL=http://customer-service:8002
+      - PAYMENT_SERVICE_URL=http://payment-service:8007
+  - name: realtime-service-config
+    literals:
+      - PORT=8009
+      - SERVICE_NAME=realtime-service
+      - KAFKA_CLIENT_ID=realtime-service
+      - KAFKA_USERNAME=realtime-svc
+
+# Placeholder tag so the base renders; every overlay points these at the registry and the release pipeline
+# pins each one by digest (kustomize edit set image ...@sha256:...)
+images:
+  - name: banksphere/web
+    newTag: unreleased
+  - name: banksphere/api-gateway
+    newTag: unreleased
+  - name: banksphere/auth-service
+    newTag: unreleased
+  - name: banksphere/customer-service
+    newTag: unreleased
+  - name: banksphere/account-service
+    newTag: unreleased
+  - name: banksphere/transaction-service
+    newTag: unreleased
+  - name: banksphere/notification-service
+    newTag: unreleased
+  - name: banksphere/fraud-service
+    newTag: unreleased
+  - name: banksphere/payment-service
+    newTag: unreleased
+  - name: banksphere/assistant-service
+    newTag: unreleased
+  - name: banksphere/realtime-service
+    newTag: unreleased
+  - name: banksphere/migrate
+    newTag: unreleased

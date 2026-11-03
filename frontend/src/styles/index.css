@@ -1,0 +1,189 @@
+@import '@fontsource-variable/inter/opsz.css';
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Design tokens (HSL channels).
+ *
+ * Light: white tiles on a soft neutral canvas, near-black ink for text and primary actions, one blue for
+ * links, focus and selection. Dark: true black canvas with raised graphite tiles. Colour is reserved for
+ * meaning (money in, warnings, errors); everything else is ink and grey. Every text pairing meets WCAG AA.
+ */
+@layer base {
+  :root {
+    --canvas: 240 11% 96%;
+    --background: 0 0% 100%;
+    --foreground: 240 3% 11%;
+    --card: 0 0% 100%;
+    --card-foreground: 240 3% 11%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 240 3% 11%;
+    --ink: 240 3% 11%;
+    --ink-foreground: 0 0% 100%;
+    --primary: 211 100% 40%;
+    --primary-foreground: 0 0% 100%;
+    --primary-soft: 211 100% 96%;
+    --secondary: 240 6% 93%;
+    --secondary-foreground: 240 3% 11%;
+    --muted: 240 5% 94%;
+    --muted-foreground: 240 2% 43%;
+    --accent: 240 5% 95%;
+    --accent-foreground: 240 3% 11%;
+    --destructive: 356 100% 41%;
+    --destructive-foreground: 0 0% 100%;
+    --destructive-soft: 356 100% 97%;
+    --success: 142 76% 27%;
+    --success-foreground: 0 0% 100%;
+    --success-soft: 140 55% 95%;
+    --warning: 28 100% 34%;
+    --warning-foreground: 0 0% 100%;
+    --warning-soft: 38 100% 94%;
+    --info: 211 100% 40%;
+    --info-soft: 211 100% 96%;
+    --border: 240 6% 90%;
+    --input: 240 5% 83%;
+    --ring: 211 100% 45%;
+    --segment: 0 0% 100%;
+    --shadow-color: 240 10% 10%;
+    /* Kept for components that still reference the old sidebar palette */
+    --sidebar: 240 11% 96%;
+    --sidebar-foreground: 240 3% 11%;
+    --sidebar-muted: 240 2% 43%;
+    --sidebar-active: 0 0% 100%;
+    --radius: 0.875rem;
+    color-scheme: light;
+  }
+
+  .dark {
+    --canvas: 0 0% 0%;
+    --background: 240 3% 7%;
+    --foreground: 240 11% 96%;
+    --card: 240 3% 11%;
+    --card-foreground: 240 11% 96%;
+    --popover: 240 3% 14%;
+    --popover-foreground: 240 11% 96%;
+    --ink: 240 11% 96%;
+    --ink-foreground: 240 3% 7%;
+    --primary: 211 100% 60%;
+    --primary-foreground: 215 100% 6%;
+    --primary-soft: 211 55% 16%;
+    --secondary: 240 3% 19%;
+    --secondary-foreground: 240 11% 96%;
+    --muted: 240 3% 17%;
+    --muted-foreground: 240 3% 64%;
+    --accent: 240 3% 16%;
+    --accent-foreground: 240 11% 96%;
+    --destructive: 3 100% 66%;
+    --destructive-foreground: 3 70% 8%;
+    --destructive-soft: 3 45% 15%;
+    --success: 135 58% 54%;
+    --success-foreground: 140 70% 7%;
+    --success-soft: 140 40% 13%;
+    --warning: 36 100% 56%;
+    --warning-foreground: 30 80% 8%;
+    --warning-soft: 36 45% 13%;
+    --info: 211 100% 64%;
+    --info-soft: 211 50% 16%;
+    --border: 240 3% 20%;
+    --input: 240 3% 28%;
+    --ring: 211 100% 60%;
+    --segment: 240 2% 38%;
+    --shadow-color: 0 0% 0%;
+    --sidebar: 0 0% 0%;
+    --sidebar-foreground: 240 11% 96%;
+    --sidebar-muted: 240 3% 64%;
+    --sidebar-active: 240 3% 11%;
+    color-scheme: dark;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+    -webkit-tap-highlight-color: transparent;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    @apply bg-canvas text-callout text-foreground antialiased;
+    font-optical-sizing: auto;
+    /* Open digits and a tailed "l" keep account numbers and amounts unambiguous */
+    font-feature-settings: 'cv05', 'ss01';
+  }
+
+  h1,
+  h2,
+  h3 {
+    text-wrap: balance;
+  }
+
+  ::selection {
+    background: hsl(var(--primary) / 0.2);
+  }
+
+  :focus-visible {
+    @apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-background;
+  }
+
+  /* Headings focused by the app after navigation (tabindex=-1) move the reading position, they aren't controls */
+  [tabindex='-1']:focus-visible {
+    @apply ring-0 ring-offset-0;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
+
+@layer components {
+  /* A screen's large title, as on iOS and macOS: tight, heavy and optically sized */
+  .large-title {
+    @apply text-[1.75rem] font-bold leading-[2.125rem] tracking-[-0.026em] sm:text-[2rem] sm:leading-[2.375rem];
+  }
+
+  /* The label above a group of rows ("Today", "Accounts") */
+  .group-label {
+    @apply text-footnote font-semibold text-muted-foreground;
+  }
+
+  /* The chevron of a native select (a plain class, so utility merging can never drop it) */
+  .select-chevron {
+    background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%238e8e93' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpath d='m7 10 5 5 5-5'/%3e%3c/svg%3e");
+    background-repeat: no-repeat;
+    background-position: right 0.85rem center;
+    background-size: 16px 16px;
+  }
+}
+
+@layer utilities {
+  .tnum {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: 'tnum', 'cv05', 'ss01';
+  }
+  .text-balance {
+    text-wrap: balance;
+  }
+  .text-pretty {
+    text-wrap: pretty;
+  }
+  .pb-safe {
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  .scrollbar-none {
+    scrollbar-width: none;
+  }
+  .scrollbar-none::-webkit-scrollbar {
+    display: none;
+  }
+}

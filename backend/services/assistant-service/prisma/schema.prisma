@@ -1,0 +1,71 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../generated/client"
+}
+
+enum MessageRole {
+  user
+  assistant
+}
+
+enum AssistantProvider {
+  llm
+  builtin
+}
+
+// complete: the answer finished; interrupted: the customer stopped it (or disconnected); failed: the provider broke mid-answer
+enum MessageStatus {
+  complete
+  interrupted
+  failed
+}
+
+// A chat thread. Always read and written scoped to its owner; deleted with its messages after the retention period.
+model Conversation {
+  id        String    @id @default(uuid())
+  ownerId   String    @map("owner_id")
+  title     String?   @db.VarChar(120)
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @default(now()) @map("updated_at")
+  messages  Message[]
+
+  @@index([ownerId, updatedAt(sort: Desc)])
+  @@index([updatedAt])
+  @@map("conversations")
+}
+
+// One turn. Assistant rows record how the answer was produced (provider, model, tools, tokens, latency), never
+// the tool data itself: cards are the structured blocks the customer was shown.
+model Message {
+  id               String             @id @default(uuid())
+  conversationId   String             @map("conversation_id")
+  role             MessageRole
+  content          String
+  cards            Json               @default("[]")
+  toolNames        String[]           @default([]) @map("tool_names")
+  promptTokens     Int                @default(0) @map("prompt_tokens")
+  completionTokens Int                @default(0) @map("completion_tokens")
+  provider         AssistantProvider?
+  model            String?            @db.VarChar(100)
+  latencyMs        Int?               @map("latency_ms")
+  status           MessageStatus      @default(complete)
+  createdAt        DateTime           @default(now()) @map("created_at")
+  conversation     Conversation       @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId, createdAt])
+  @@map("messages")
+}
+
+// Leader election for periodic jobs across replicas (see acquireJobLease in @banksphere/common)
+model JobLease {
+  name      String   @id
+  holder    String
+  expiresAt DateTime @map("expires_at")
+
+  @@map("job_leases")
+}
