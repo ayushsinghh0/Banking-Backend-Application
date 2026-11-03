@@ -123,7 +123,7 @@ export function createApp(deps: AssistantAppDeps) {
 }
 
 async function main(): Promise<void> {
-  dotenv.config();
+  dotenv.config({ quiet: true });
   assertNoPlaceholders(['DATABASE_URL', 'REDIS_URL', 'CACHE_REDIS_URL', 'JWT_VERIFY_KEYS', 'LLM_API_KEY']);
   // Everything is validated before anything starts: a bad value stops the service here
   const config = loadConfig();

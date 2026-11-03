@@ -96,7 +96,7 @@ function intervalMs(name: string, fallback: number, min: number): number {
 }
 
 async function main(): Promise<void> {
-  dotenv.config();
+  dotenv.config({ quiet: true });
   assertNoPlaceholders([
     'DATABASE_URL',
     'REDIS_URL',

@@ -41,7 +41,7 @@ export function createApp(options: SimulatorAppOptions) {
 }
 
 async function main(): Promise<void> {
-  dotenv.config();
+  dotenv.config({ quiet: true });
   const config = loadSimulatorConfig();
   const { app, webhooks } = createApp({ config });
   // The key id is public; the secrets never are. The webhook target host says where events will go.

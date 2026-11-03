@@ -237,7 +237,7 @@ export class SessionStore {
       return token;
     }
 
-    let code = '';
+    let code: string;
     try {
       code = ((await response.json()) as { error?: { code?: string } }).error?.code ?? '';
     } catch {

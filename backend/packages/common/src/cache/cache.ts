@@ -220,6 +220,7 @@ export class NoopCache implements CacheLike {
 export function createCache(options: CacheOptions, url = process.env.CACHE_REDIS_URL): { cache: CacheLike; redis: Redis | null } {
   if (!url) return { cache: new NoopCache(), redis: null };
   const redis = new Redis(url, {
+    protocol: 2, // RESP2 reply types, see connectRedis
     enableOfflineQueue: false,
     maxRetriesPerRequest: 1,
     connectTimeout: 2_000,

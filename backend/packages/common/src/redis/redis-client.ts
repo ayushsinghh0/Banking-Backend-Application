@@ -12,6 +12,7 @@ export class RedisService {
   public getClient(): Redis {
     if (!this.client) {
       this.client = new Redis(this.redisUrl, {
+        protocol: 2, // RESP2 reply types, see connectRedis
         maxRetriesPerRequest: 3,
         retryStrategy(times) {
           const delay = Math.min(times * 100, 3000);

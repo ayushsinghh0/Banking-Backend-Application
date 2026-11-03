@@ -82,6 +82,9 @@ export function assertNoPlaceholders(names: string[], env: NodeJS.ProcessEnv = p
  */
 export async function connectRedis(url = process.env.REDIS_URL || 'redis://localhost:6379'): Promise<Redis> {
   const redis = new Redis(url, {
+    // ioredis 6 defaults to RESP3; the code is written against the RESP2 reply types (strings for numbers,
+    // flat arrays for maps). Switching protocols is a migration of its own, not a dependency bump.
+    protocol: 2,
     lazyConnect: true,
     enableOfflineQueue: false,
     maxRetriesPerRequest: 1,

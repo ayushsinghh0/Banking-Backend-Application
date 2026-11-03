@@ -2,6 +2,8 @@
 # PR each, because they need reading. Security updates are not delayed by any of this (they bypass cooldown).
 # The cooldown waits out the first days of a release, when hijacked or broken versions are usually yanked.
 # Labels other than "dependencies" must exist in the repository, or Dependabot silently skips them.
+# A major that needs a planned migration is ignored under its ecosystem, with the reason; lift the entry when the
+# migration is scheduled. Dependabot closes the open PR of a newly ignored update on its next run.
 
 version: 2
 
@@ -21,6 +23,18 @@ updates:
     commit-message:
       prefix: "deps(backend)"
       prefix-development: "deps-dev(backend)"
+    ignore:
+      # TypeScript 7 is the native compiler: moduleResolution=node10 (every tsconfig) is gone and ts-jest pins <7
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
+      # Prisma 7 needs prisma.config.ts, driver adapters and a new generated-client layout in every service
+      - dependency-name: prisma
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@prisma/client"
+        update-types: ["version-update:semver-major"]
+      # Node typings follow the runtime major (NODE_VERSION in the workflows and the node:24 base image)
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
     groups:
       backend-production:
         dependency-type: production
@@ -44,6 +58,29 @@ updates:
     commit-message:
       prefix: "deps(frontend)"
       prefix-development: "deps-dev(frontend)"
+    ignore:
+      # React 19 moves together with react-dom, both @types packages and the testing library, in one migration
+      - dependency-name: react
+        update-types: ["version-update:semver-major"]
+      - dependency-name: react-dom
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@types/react"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@types/react-dom"
+        update-types: ["version-update:semver-major"]
+      # ESLint 10 waits for eslint-plugin-jsx-a11y to accept it; @eslint/js stays on ESLint's major
+      - dependency-name: eslint
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@eslint/js"
+        update-types: ["version-update:semver-major"]
+      # @vitejs/plugin-react 6 requires Vite 8: it moves with the Vite major
+      - dependency-name: "@vitejs/plugin-react"
+        update-types: ["version-update:semver-major"]
+      # Recharts 3 changed the custom tooltip API (BalanceChart, CashFlowChart); msw 3 changed the listen options
+      - dependency-name: recharts
+        update-types: ["version-update:semver-major"]
+      - dependency-name: msw
+        update-types: ["version-update:semver-major"]
     groups:
       frontend-production:
         dependency-type: production
@@ -66,6 +103,10 @@ updates:
     labels: [dependencies, docker]
     commit-message:
       prefix: "deps(docker)"
+    ignore:
+      # Node majors are chosen by hand (even-numbered LTS lines only), together with NODE_VERSION in the workflows
+      - dependency-name: node
+        update-types: ["version-update:semver-major"]
     groups:
       base-images:
         update-types: [minor, patch]
