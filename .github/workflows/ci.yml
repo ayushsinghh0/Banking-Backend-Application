@@ -141,8 +141,12 @@ jobs:
       # workflow would log in to the registry (packages: write, id-token: write), set push: true with
       # provenance: mode=max and sbom: true, sign the pushed digest, and pin the Kubernetes overlays to
       # steps.build.outputs.digest (kustomize edit set image <name>=<registry>/<image>@<digest>), never a tag.
+      # The GitHub Actions cache can evict a blob that the cache manifest still lists; BuildKit then fails the
+      # build with "failed to copy ... BlobNotFound". A failed cached build is retried once without the cache
+      # (which also rewrites it), so only a build that fails from a clean slate fails the job.
       - name: Build
         id: build
+        continue-on-error: true
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: ${{ matrix.context }}
@@ -151,6 +155,18 @@ jobs:
           tags: banksphere/${{ matrix.image }}:ci-${{ github.sha }}
           push: false
           cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,scope=${{ matrix.image }},mode=max
+      - name: Build (retry without the layer cache)
+        id: build-uncached
+        if: ${{ steps.build.outcome == 'failure' }}
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ matrix.context }}
+          target: ${{ matrix.target }}
+          build-args: ${{ matrix.service && format('SERVICE={0}', matrix.service) || '' }}
+          tags: banksphere/${{ matrix.image }}:ci-${{ github.sha }}
+          push: false
+          no-cache: true
           cache-to: type=gha,scope=${{ matrix.image }},mode=max
 
   # Single required check for branch protection (matrix job names change whenever an image is added)
